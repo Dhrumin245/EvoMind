@@ -1,0 +1,22 @@
+**AI Coding Guide**
+
+- Threading guard rails live at [main.py](main.py#L1-L36); keep these env caps (OMP/MKL/NUMEXPR/OPENBLAS) when adding new entrypoints to avoid Windows oversubscription.
+- Default run is multi-agent co-evolution; CLI wiring and config overrides sit in [main.py](main.py#L930-L1070). Use `python main.py --mode async --evolution-type multi` and `MAX_GENERATIONS=1` for quick loops; state auto-load toggles via `AUTO_LOAD_COEVOLUTION_STATE`.
+- Training loop seeds populations, runs async evaluation, updates hall-of-fame, and evolves via `EvolutionEngine` in [main.py](main.py#L930-L1035); stagnation bumps mutation rates before evolution happens.
+- Evaluation is deterministic: `AsyncDeterministicEvaluator` seeds every genome/opponent combo without time offsets, forces CPU, and uses thread pools in [async_evaluator.py](async_evaluator.py#L1-L120). Prefer this path over ad-hoc evaluators.
+- Single-agent deterministic env for tests/plots is `DeterministicVectorizedArena` with per-env seeds and reproducible resets in [deterministic_env.py](deterministic_env.py#L1-L120); avoid using deprecated `vector_env.py` (banner at [vector_env.py](vector_env.py#L1-L40)).
+- Multi-agent rollouts use `MultiAgentArena` with curriculum-driven configs, energy systems, and predator pack coordination in [arena_multi.py](arena_multi.py#L1-L160). Respect `num_prey_per_env`, `num_predators_per_env`, and `predator_pack_size` when crafting new evaluators.
+- Curriculum stages and defaults (rewards, penalties, predator counts, max_steps) are defined in [curriculum.py](curriculum.py#L1-L120); use `select_multi_agent_stage` or `get_stage_config` rather than hard-coding numbers.
+- Plasticity is central: `evaluate_multi_agent_pair` compares plastic vs non-plastic runs with identical seeds and adds plasticity bonuses in [main.py](main.py#L450-L520). Keep this check intact when changing fitness shaping.
+- Torch brains are cached per genome signature and gate plastic updates when |reward|≤0.05 in [torch_brain.py](torch_brain.py#L1-L80); reuse `get_cached_brain`/`genome.get_brain()` instead of rebuilding nets.
+- Predator behavior during evaluation routes through `PredatorPackBrain` for coordinated actions inside [main.py](main.py#L510-L520); ensure new predator policies still plug into this hook.
+- Config knobs for evaluation speed/accuracy (`use_threaded_eval`, `nonplastic_check_fraction`, batch sizes, opponents sampled) live in `EvolutionConfig` at [main.py](main.py#L38-L115); adjust here rather than scattering constants.
+- Checkpointing/hall-of-fame serialization uses JSON in [main.py](main.py#L700-L930); when extending state, update both save/load and seed registry writes (`seed_registry.json`).
+- Mutation/selection logic is in `EvolutionEngine` (see [evolution.py](evolution.py)), and populations carry role metadata in [population.py](population.py). Preserve role fields when spawning genomes.
+- Avoid using `VectorEnv`/`AsyncVectorEnv`; they emit DeprecationWarnings and are slower than `DeterministicVectorizedArena` as noted in [vector_env.py](vector_env.py#L1-L60).
+- Diagnostics (plastic norm plots, learning rule stats, strategy clustering) run every `plot_every` generations in [main.py](main.py#L980-L1040); guard expensive plotting when adding new diagnostics.
+- Reward shaping and novelty are baked into `MultiAgentArena` (food/capture scales, shaping coefficients, novelty grids) in [arena_multi.py](arena_multi.py) further down; align new rewards with these scales to keep fitness comparable.
+- Deterministic seeds for components come from `DeterministicSeedManager` in [deterministic_env.py](deterministic_env.py#L140-L220); register new seeded components instead of using `np.random` directly.
+- Brains store per-episode plasticity diagnostics; when adding learning rules, log via existing `PlasticLinear` hooks in [torch_brain.py](torch_brain.py) to keep plots consistent.
+- When writing tests or quick repros, favor small batches (`batch_size=1`, `envs_per_genome` low) and serial eval (`use_threaded_eval=False`) as noted in [main.py](main.py#L62-L90) to avoid BLAS thread contention.
+- Deprecated/sandbox scripts like [main_selfplay.py](main_selfplay.py) and [run_training.py](run_training.py) are thin; new work should target the async co-evolution path in [main.py](main.py#L930-L1070).

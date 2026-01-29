@@ -1,0 +1,44 @@
+{
+  "genome_id": "gen_0001",
+
+  "input": {
+    "size": 6,
+    "description": "agent sensory inputs"
+  },
+
+  "network": {
+    "layers": [
+      {
+        "type": "dense",
+        "units": 32,
+        "activation": "relu"
+      },
+      {
+        "type": "dense",
+        "units": 16,
+        "activation": "relu"
+      }
+    ],
+    "output_layer": {
+      "type": "dense",
+      "units": 4,
+      "activation": "softmax"
+    }
+  },
+
+  "learning": {
+    "optimizer": "adam",
+    "learning_rate": 0.001
+  },
+
+  "regularization": {
+    "dropout": 0.0,
+    "batch_norm": false
+  },
+
+  "constraints": {
+    "max_layers": 6,
+    "min_units": 4,
+    "max_units": 128
+  }
+}
