@@ -181,9 +181,10 @@ class AsyncDeterministicEvaluator:
         elif self.mode == EvaluationMode.CO_EVOLUTION:
             if opponent_genome is None:
                 raise ValueError("opponent_genome required for co-evaluation")
-            return self._evaluate_co_evolution(
+            fitness, metrics = self._evaluate_co_evolution(
                 genome, opponent_genome, seed, generation, genome_idx, opponent_idx
             )
+            return fitness
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
     
@@ -204,9 +205,10 @@ class AsyncDeterministicEvaluator:
         elif self.mode == EvaluationMode.CO_EVOLUTION:
             if opponent_genome is None:
                 raise ValueError("opponent_genome required for co-evaluation")
-            return self._evaluate_co_evolution(
+            fitness, _ = self._evaluate_co_evolution(
                 genome, opponent_genome, seed, generation, genome_idx, opponent_idx
             )
+            return fitness
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
     
@@ -319,7 +321,7 @@ class AsyncDeterministicEvaluator:
                               seed: int,
                               generation: int,
                               genome_idx: int,
-                              opponent_idx: Optional[int] = None) -> float:
+                              opponent_idx: Optional[int] = None) -> Tuple[float, Dict[str, Any]]:
         """
         Multi-agent co-evolution evaluation
         """
@@ -352,6 +354,8 @@ class AsyncDeterministicEvaluator:
         
         prey_state, pred_state = arena.reset()
         total_reward = 0.0
+        steps_run = 0
+        last_info: Dict[str, Any] = {}
 
         # Ensure brains are cached
         prey_brain = getattr(prey_genome, "brain", None)
@@ -366,6 +370,8 @@ class AsyncDeterministicEvaluator:
                 predator_brain.reset_episode_tracking()
 
         for step in range(self.max_steps):
+            steps_run = step + 1
+
             # Get actions based on role
             if role == "prey":
                 prey_actions = prey_genome.act_batch(prey_state)
@@ -381,6 +387,7 @@ class AsyncDeterministicEvaluator:
             (prey_state, pred_state), r_prey, r_pred, info = arena.step(
                 prey_actions, pred_actions
             )
+            last_info = info
 
             # Update plasticity with reward signal
             if role == "prey":
@@ -396,7 +403,18 @@ class AsyncDeterministicEvaluator:
 
             if np.any(info['env_done']):
                 break
-        return float(total_reward)
+
+        metrics: Dict[str, Any] = {
+            "role": role,
+            "seed": seed,
+            "generation": generation,
+            "genome_idx": genome_idx,
+            "opponent_idx": opponent_idx,
+            "steps_run": steps_run,
+            "episode_return": float(total_reward),
+            "env_done": bool(np.any(last_info.get("env_done", False))) if isinstance(last_info, dict) else False,
+        }
+        return float(total_reward), metrics
     
     async def evaluate_coevolution_pair_async(self,
                                              prey_genome,
@@ -784,4 +802,35 @@ class HybridEvaluator:
         
         arena.close()
         
+        # Store metrics in genomes for later retrieval
+        for i, (prey_genome, pred_genome) in enumerate(zip(prey_genomes, predator_genomes)):
+            if hasattr(prey_genome, 'last_eval_metrics'):
+                prey_genome.last_eval_metrics = {
+                    'fitness': prey_rewards[i],
+                    'energy_cost': 0.0,  # TODO: compute from arena info
+                    'learning_speed': 0.0,  # TODO: compute from plasticity diagnostics
+                    'stability': 0.0,  # TODO: compute from reward variance
+                    'task_success': prey_rewards[i] > 0,
+                    'episode_return': prey_rewards[i],
+                    'complexity_penalty': 0.0,
+                    'novelty': 0.0,
+                    'seed': batch_seed,
+                    'stage': 'coevolution',
+                    'opponent_id': getattr(pred_genome, 'genome_id', None)
+                }
+            if hasattr(pred_genome, 'last_eval_metrics'):
+                pred_genome.last_eval_metrics = {
+                    'fitness': predator_rewards[i],
+                    'energy_cost': 0.0,  # TODO: compute from arena info
+                    'learning_speed': 0.0,  # TODO: compute from plasticity diagnostics
+                    'stability': 0.0,  # TODO: compute from reward variance
+                    'task_success': predator_rewards[i] > 0,
+                    'episode_return': predator_rewards[i],
+                    'complexity_penalty': 0.0,
+                    'novelty': 0.0,
+                    'seed': batch_seed,
+                    'stage': 'coevolution',
+                    'opponent_id': getattr(prey_genome, 'genome_id', None)
+                }
+
         return prey_rewards.tolist(), predator_rewards.tolist()

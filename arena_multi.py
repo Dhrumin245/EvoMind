@@ -33,6 +33,14 @@ class ArenaConfig:
     food_energy: float = 20.0
     boundary_margin: int = 20
     max_steps: int = 80
+
+    # Noise configuration
+    observation_noise_level: float = 0.0
+    action_noise_level: float = 0.0
+    dynamics_noise_level: float = 0.0
+    noise_schedule_start: int = 0
+    noise_schedule_end: int = 1000
+    noise_schedule_type: str = 'linear'  # 'linear', 'step', 'exponential'
     
     # Prey configuration
     prey_config: AgentConfig = field(default_factory=lambda: AgentConfig(
@@ -222,27 +230,44 @@ class PredatorPackSystem:
 
 class DeterministicRNG:
     """Deterministic random number generator for reproducibility"""
-    
+
     def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.Generator(np.random.PCG64(seed)) if seed is not None else None
         self.global_rng = np.random.default_rng(seed)
-    
+
     def uniform(self, low: float | np.ndarray, high: float | np.ndarray, size: Tuple[int, ...],
                 deterministic: bool = True) -> np.ndarray:
         """Generate uniform random numbers"""
         if deterministic and self.rng is not None:
             return self.rng.uniform(low, high, size)
         return self.global_rng.uniform(low, high, size)
-    
+
     def random(self, size: Tuple[int, ...], deterministic: bool = True) -> np.ndarray:
         """Generate random numbers in [0, 1)"""
         return self.uniform(0.0, 1.0, size, deterministic)
-    
+
     def choice(self, a: int, size: Tuple[int, ...], deterministic: bool = True) -> np.ndarray:
         """Random choice"""
         if deterministic and self.rng is not None:
             return self.rng.choice(a, size)
         return self.global_rng.choice(a, size)
+
+
+class NoiseInjector:
+    """Systematic robustness testing"""
+
+    def __init__(self, rng: Optional[DeterministicRNG] = None):
+        self.rng = rng or DeterministicRNG()
+
+    def inject_observation_noise(self, obs, noise_level=0.1):
+        return obs + self.rng.random(obs.shape, deterministic=True) * noise_level
+
+    def inject_action_noise(self, actions, noise_level=0.05):
+        return actions + self.rng.random(actions.shape, deterministic=True) * noise_level
+
+    def inject_dynamics_noise(self, positions, noise_level=0.1):
+        noise = self.rng.random(positions.shape, deterministic=True) - 0.5  # -0.5 to 0.5
+        return noise * noise_level
 
 
 class MultiAgentArena:
@@ -287,7 +312,10 @@ class MultiAgentArena:
         # Setup RNG
         self.deterministic = deterministic
         self.rng = DeterministicRNG(seed)
-        
+
+        # Initialize noise injector
+        self.noise_injector = NoiseInjector(self.rng)
+
         # Initialize systems
         self.energy_system_prey = EnergySystem(self.arena_config.prey_config)
         self.energy_system_predator = EnergySystem(self.arena_config.predator_config)
@@ -367,24 +395,43 @@ class MultiAgentArena:
             'prey_starved': np.zeros(self.total_prey, dtype=np.int32),
             'steps_survived': np.zeros(batch_size, dtype=np.int32)
         }
+
+        # Metrics contract attributes
+        self.prey_alive = np.ones(self.total_prey, dtype=bool)
+        self.predator_captures = np.zeros(self.total_predators, dtype=np.int32)
+        self.prey_food_collected = np.zeros(self.total_prey, dtype=np.int32)
+        self.prey_energy_initial = self.arena_config.prey_config.energy_initial
+        self.predator_energy_initial = self.arena_config.predator_config.energy_initial
+        self.prey_energy = np.full(self.total_prey, self.prey_energy_initial, dtype=np.float32)
+        self.predator_energy = np.full(self.total_predators, self.predator_energy_initial, dtype=np.float32)
+        self.prey_config = self.arena_config.prey_config
+        self.predator_config = self.arena_config.predator_config
     
     def _create_arena_config(self, base_config: Dict[str, Any]) -> ArenaConfig:
         """Create arena configuration from base config"""
         config = ArenaConfig()
-        
+
         # Update from base config
         config.screen_width = base_config.get('screen_width', config.screen_width)
         config.screen_height = base_config.get('screen_height', config.screen_height)
         config.num_food = base_config.get('food_count', config.num_food)
         config.max_steps = base_config.get('max_steps', config.max_steps)
-        
+
+        # Update noise configuration
+        config.observation_noise_level = base_config.get('observation_noise_level', config.observation_noise_level)
+        config.action_noise_level = base_config.get('action_noise_level', config.action_noise_level)
+        config.dynamics_noise_level = base_config.get('dynamics_noise_level', config.dynamics_noise_level)
+        config.noise_schedule_start = base_config.get('noise_schedule_start', config.noise_schedule_start)
+        config.noise_schedule_end = base_config.get('noise_schedule_end', config.noise_schedule_end)
+        config.noise_schedule_type = base_config.get('noise_schedule_type', config.noise_schedule_type)
+
         # Update prey config
         if 'prey_speed' in base_config:
             config.prey_config.speed = base_config['prey_speed']
         if 'prey_energy' in base_config:
             config.prey_config.energy_max = base_config['prey_energy']
             config.prey_config.energy_initial = base_config['prey_energy']
-        
+
         # Update predator config
         if 'predator_speed' in base_config:
             config.predator_config.speed = base_config['predator_speed']
@@ -393,12 +440,12 @@ class MultiAgentArena:
             config.predator_config.energy_initial = base_config['predator_energy']
         if 'predator_vision' in base_config:
             config.predator_config.vision_range = base_config['predator_vision']
-        
+
         # Capture radius from config
         if 'capture_radius' in base_config:
             config.prey_config.capture_radius = base_config['capture_radius']
             config.predator_config.capture_radius = base_config['capture_radius']
-        
+
         return config
     
     def reset(self, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -1298,9 +1345,15 @@ class MultiAgentArena:
 
         return prey_observations, predator_observations
     
-    def _compile_info(self, prey_info: Dict, predator_info: Dict, 
+    def _compile_info(self, prey_info: Dict, predator_info: Dict,
                      env_done: np.ndarray) -> Dict[str, Any]:
         """Compile information dictionary"""
+        # Get success signals and metrics for the current episode
+        success_signals = self.get_episode_success_signals()
+
+        # Get success definition for current stage
+        success_definition = self.get_success_definition(self.stage.name if hasattr(self.stage, 'name') else str(self.stage))
+
         return {
             'step': self.step_count,
             'env_done': env_done.copy(),
@@ -1313,7 +1366,19 @@ class MultiAgentArena:
             'prey_energy': self.energy_system_prey.get_energy_normalized().copy(),
             'predator_energy': self.energy_system_predator.get_energy_normalized().copy(),
             'prey_info': prey_info,
-            'predator_info': predator_info
+            'predator_info': predator_info,
+            # Metrics contract additions
+            'success_signals': success_signals,
+            'success_definition': success_definition,
+            'energy_usage': {
+                'prey_energy_used': success_signals['prey_energy_used'],
+                'predator_energy_used': success_signals['predator_energy_used']
+            },
+            'novelty_hits': success_signals['novelty_hits'],
+            'adaptation_recovery': {
+                'prey_adaptation_recovery': success_signals['prey_adaptation_recovery'],
+                'predator_adaptation_recovery': success_signals['predator_adaptation_recovery']
+            }
         }
     
     def update_config(self, stage: Optional[CurriculumStage] = None, 
@@ -1492,3 +1557,124 @@ class MultiAgentArena:
     def close(self):
         """Cleanup resources (placeholder for compatibility)"""
         pass
+
+    def get_episode_success_signals(self) -> Dict[str, Any]:
+        """Get success signals and metrics for the current episode"""
+        # Calculate success signals
+        prey_alive = np.sum(self.prey_alive)
+        predator_captures = np.sum(self.predator_captures)
+        food_collected = np.sum(self.prey_food_collected)
+
+        # Energy usage summaries
+        prey_energy_used = np.sum(self.prey_energy_initial - self.prey_energy)
+        predator_energy_used = np.sum(self.predator_energy_initial - self.predator_energy)
+
+        # Novelty hit counts (simplified: number of unique behaviors)
+        # This is a placeholder - would need more sophisticated tracking
+        novelty_hits = 0
+
+        # Adaptation recovery score (how well agents recovered from energy depletion)
+        prey_recovery = np.mean(np.maximum(0, self.prey_energy - self.prey_config.energy_max * 0.1))
+        predator_recovery = np.mean(np.maximum(0, self.predator_energy - self.predator_config.energy_max * 0.1))
+
+        return {
+            'prey_alive': int(prey_alive),
+            'predator_captures': int(predator_captures),
+            'food_collected': int(food_collected),
+            'prey_energy_used': float(prey_energy_used),
+            'predator_energy_used': float(predator_energy_used),
+            'novelty_hits': int(novelty_hits),
+            'prey_adaptation_recovery': float(prey_recovery),
+            'predator_adaptation_recovery': float(predator_recovery)
+        }
+
+    def get_success_definition(self, stage: str) -> Dict[str, Any]:
+        """Get configurable per-episode success definition based on stage"""
+        stage_configs = {
+            'FORAGING': {
+                'prey_success': lambda signals: signals['food_collected'] > 0,
+                'predator_success': lambda signals: signals['predator_captures'] > 0,
+                'description': 'Basic survival and resource collection'
+            },
+            'PRECISION': {
+                'prey_success': lambda signals: signals['food_collected'] >= 2,
+                'predator_success': lambda signals: signals['predator_captures'] >= 1,
+                'description': 'Refined control and efficiency'
+            },
+            'SCARCITY': {
+                'prey_success': lambda signals: signals['food_collected'] >= 3 and signals['prey_alive'] > 0,
+                'predator_success': lambda signals: signals['predator_captures'] >= 1 and signals['predator_energy_used'] < 50,
+                'description': 'Coordination under resource constraints'
+            },
+            'THREAT': {
+                'prey_success': lambda signals: signals['prey_alive'] > 0 and signals['food_collected'] > 0,
+                'predator_success': lambda signals: signals['predator_captures'] >= 2,
+                'description': 'Direct competition and evasion'
+            },
+            'ADVERSARIAL': {
+                'prey_success': lambda signals: signals['prey_alive'] > 0,
+                'predator_success': lambda signals: signals['predator_captures'] >= 3,
+                'description': 'Advanced pack dynamics and strategy'
+            }
+        }
+
+        return stage_configs.get(stage, stage_configs['FORAGING'])
+
+    def get_robustness_metrics(self) -> Dict[str, Any]:
+        """Get robustness metrics for fitness evaluation"""
+        noise_level = self.get_current_noise_level(self.step_count)
+
+        # Calculate performance degradation under noise
+        base_performance = self.get_episode_success_signals()
+        robustness_score = 1.0 - (noise_level * 0.2)  # Reduce score by up to 20% under full noise
+
+        return {
+            'noise_level': float(noise_level),
+            'robustness_score': float(robustness_score),
+            'performance_under_noise': base_performance['food_collected'] * robustness_score,
+            'noise_penalty': float(noise_level * 0.1)
+        }
+
+    def get_current_noise_level(self, step: int) -> float:
+        """Get current noise level based on schedule"""
+        if step < self.arena_config.noise_schedule_start:
+            return 0.0
+        elif step >= self.arena_config.noise_schedule_end:
+            return 1.0
+        else:
+            progress = (step - self.arena_config.noise_schedule_start) / (self.arena_config.noise_schedule_end - self.arena_config.noise_schedule_start)
+            if self.arena_config.noise_schedule_type == 'linear':
+                return progress
+            elif self.arena_config.noise_schedule_type == 'step':
+                return 1.0 if progress > 0.5 else 0.0
+            elif self.arena_config.noise_schedule_type == 'exponential':
+                return progress ** 2
+            else:
+                return progress
+
+    def apply_noise_modes(self, observations: np.ndarray, actions: np.ndarray, positions: np.ndarray, step: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Apply noise to observations, actions, and dynamics"""
+        noise_level = self.get_current_noise_level(step)
+
+        obs_noise = self.arena_config.observation_noise_level * noise_level
+        action_noise = self.arena_config.action_noise_level * noise_level
+        dynamics_noise = self.arena_config.dynamics_noise_level * noise_level
+
+        noisy_obs = self.noise_injector.inject_observation_noise(observations, obs_noise)
+        noisy_actions = self.noise_injector.inject_action_noise(actions, action_noise)
+        noisy_positions = positions + self.noise_injector.inject_dynamics_noise(positions, dynamics_noise)
+
+        return noisy_obs, noisy_actions, noisy_positions
+
+    def get_episode_info(self) -> Dict[str, Any]:
+        """Get episode-level metrics for evaluation"""
+        # TODO: Implement comprehensive info collection for metrics contract
+        # Should include: success signals, energy usage summaries, novelty hit counts, adaptation recovery score
+        robustness_metrics = self.get_robustness_metrics()
+        return {
+            'prey_energy': np.zeros(self.num_prey_per_env * self.batch_size),
+            'predator_energy': np.zeros(self.num_predators_per_env * self.batch_size),
+            'env_done': np.zeros(self.batch_size, dtype=bool),
+            'robustness_metrics': robustness_metrics,
+            # TODO: Add success signals, novelty hits, adaptation recovery
+        }

@@ -325,6 +325,18 @@ class BenchmarkResult:
             'metadata': self.metadata,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'BenchmarkResult':
+        """Create from dictionary"""
+        return cls(
+            task_id=data['task_id'],
+            fitness=data['fitness'],
+            prey_fitness=data.get('prey_fitness'),
+            predator_fitness=data.get('predator_fitness'),
+            evaluation_time=data.get('evaluation_time', 0.0),
+            metadata=data.get('metadata', {})
+        )
+
 
 @dataclass
 class GeneralizationReport:
@@ -370,13 +382,20 @@ class GeneralizationReport:
 class MultiTaskEvaluator:
     """Evaluator that handles multi-task generalization assessment"""
 
-    def __init__(self, task_suite: TaskSuite, base_seed: int = 42):
+    def __init__(self, task_suite: TaskSuite, base_seed: int = 42,
+                 hall_of_fame_fraction: float = 0.7, recent_fraction: float = 0.3):
         self.task_suite = task_suite
         self.base_seed = base_seed
         self.rng = np.random.RandomState(base_seed)
+        self.hall_of_fame_fraction = hall_of_fame_fraction
+        self.recent_fraction = recent_fraction
 
     def evaluate_genome_on_task(self, genome, task: TaskConfig,
-                               num_opponents: int = 1, max_steps: int = 80) -> BenchmarkResult:
+                               num_opponents: int = 1, max_steps: int = 80,
+                               hall_of_fame_prey: Optional[List] = None,
+                               hall_of_fame_pred: Optional[List] = None,
+                               current_prey: Optional[List] = None,
+                               current_pred: Optional[List] = None) -> BenchmarkResult:
         """
         Evaluate a single genome on a specific task
         """
@@ -397,9 +416,12 @@ class MultiTaskEvaluator:
             seed=self.rng.randint(0, int(1e9)),  # Deterministic but varied seed
         )
 
-        # For now, evaluate against random opponents
-        # TODO: In full implementation, would evaluate against hall of fame or current population
-        opponent_genomes = self._create_random_opponents(genome, num_opponents, task)
+        # Sample opponents from hall of fame and current populations
+        opponent_genomes = self._sample_opponents(
+            genome, num_opponents, task,
+            hall_of_fame_prey or [], hall_of_fame_pred or [],
+            current_prey or [], current_pred or []
+        )
 
         total_fitness = 0.0
         prey_fitness = 0.0
@@ -478,8 +500,58 @@ class MultiTaskEvaluator:
 
         return opponents
 
+    def _sample_opponents(self, genome, num_opponents: int, task: TaskConfig,
+                         hall_of_fame_prey: List, hall_of_fame_pred: List,
+                         current_prey: List, current_pred: List):
+        """
+        Sample opponents from hall of fame and current populations using deterministic policy
+        """
+        from genome_prey import PreyGenome
+        from genome_predator import PredatorGenome
+
+        # Determine opponent type needed
+        is_prey_genome = isinstance(genome, PreyGenome)
+        opponent_hof = hall_of_fame_pred if is_prey_genome else hall_of_fame_prey
+        opponent_current = current_pred if is_prey_genome else current_prey
+
+        # If no populations available, fall back to random opponents
+        if not opponent_hof and not opponent_current:
+            return self._create_random_opponents(genome, num_opponents, task)
+
+        opponents = []
+
+        # Calculate sampling counts
+        hof_count = int(num_opponents * self.hall_of_fame_fraction)
+        recent_count = int(num_opponents * self.recent_fraction)
+        random_count = num_opponents - hof_count - recent_count
+
+        # Sample from hall of fame (deterministic by fitness ranking)
+        if hof_count > 0 and opponent_hof:
+            # Sort by fitness (highest first) and take top
+            sorted_hof = sorted(opponent_hof, key=lambda g: g.fitness, reverse=True)
+            hof_sample = sorted_hof[:min(hof_count, len(sorted_hof))]
+            opponents.extend(hof_sample)
+
+        # Sample from current population (deterministic by fitness ranking)
+        if recent_count > 0 and opponent_current:
+            # Sort by fitness (highest first) and take top
+            sorted_current = sorted(opponent_current, key=lambda g: g.fitness, reverse=True)
+            current_sample = sorted_current[:min(recent_count, len(sorted_current))]
+            opponents.extend(current_sample)
+
+        # Fill remaining with random opponents
+        if len(opponents) < num_opponents:
+            remaining = num_opponents - len(opponents)
+            random_opponents = self._create_random_opponents(genome, remaining, task)
+            opponents.extend(random_opponents)
+
+        # Trim if we have too many (shouldn't happen but safety check)
+        opponents = opponents[:num_opponents]
+
+        return opponents
+
     def _evaluate_pair(self, genome1, genome2, arena, max_steps: int) -> Tuple[float, float]:
-        """Evaluate a genome pair in the arena"""
+        """Evaluate a genome pair in the arena with stability monitoring and penalties"""
         # Reset arena
         prey_state, pred_state = arena.reset()
 
@@ -494,6 +566,10 @@ class MultiTaskEvaluator:
 
         total_prey_reward = 0.0
         total_predator_reward = 0.0
+
+        # Milestone 6: Collect stability diagnostics during evaluation
+        prey_stability_penalty = 0.0
+        predator_stability_penalty = 0.0
 
         for step in range(max_steps):
             # Get actions
@@ -511,7 +587,28 @@ class MultiTaskEvaluator:
             if np.any(info['env_done']):
                 break
 
-        return total_prey_reward, total_predator_reward
+        # Milestone 6: Apply stability penalties based on activation monitoring
+        prey_brain = getattr(prey_genome, 'brain', None)
+        if prey_brain is not None and hasattr(prey_brain, 'get_stability_diagnostics'):
+            prey_stability = prey_brain.get_stability_diagnostics()
+            if 'avg_saturation_fraction' in prey_stability:
+                saturation_penalty = float(prey_stability.get('avg_saturation_fraction', 0.0)) * 0.5  # Penalty for high saturation
+                dead_unit_penalty = float(prey_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3  # Penalty for dead units
+                prey_stability_penalty = saturation_penalty + dead_unit_penalty
+
+        predator_brain = getattr(predator_genome, 'brain', None)
+        if predator_brain is not None and hasattr(predator_brain, 'get_stability_diagnostics'):
+            predator_stability = predator_brain.get_stability_diagnostics()
+            if 'avg_saturation_fraction' in predator_stability:
+                saturation_penalty = float(predator_stability.get('avg_saturation_fraction', 0.0)) * 0.5
+                dead_unit_penalty = float(predator_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
+                predator_stability_penalty = saturation_penalty + dead_unit_penalty
+
+        # Apply penalties to rewards
+        final_prey_reward = total_prey_reward - prey_stability_penalty
+        final_predator_reward = total_predator_reward - predator_stability_penalty
+
+        return final_prey_reward, final_predator_reward
 
     def run_full_benchmark(self, genome, generation: int,
                           max_tasks: Optional[int] = None) -> GeneralizationReport:
@@ -540,7 +637,11 @@ class MultiTaskEvaluator:
             benchmark_results=benchmark_results
         )
 
-    def run_subset_evaluation(self, genome, num_tasks: int, generation: int) -> GeneralizationReport:
+    def run_subset_evaluation(self, genome, num_tasks: int, generation: int,
+                             hall_of_fame_prey: Optional[List] = None,
+                             hall_of_fame_pred: Optional[List] = None,
+                             current_prey: Optional[List] = None,
+                             current_pred: Optional[List] = None) -> GeneralizationReport:
         """
         Run evaluation on a sampled subset of tasks
         """
@@ -550,7 +651,13 @@ class MultiTaskEvaluator:
 
         benchmark_results = []
         for task in subset_tasks:
-            result = self.evaluate_genome_on_task(genome, task)
+            result = self.evaluate_genome_on_task(
+                genome, task,
+                hall_of_fame_prey=hall_of_fame_prey,
+                hall_of_fame_pred=hall_of_fame_pred,
+                current_prey=current_prey,
+                current_pred=current_pred
+            )
             benchmark_results.append(result)
 
         genome_id = getattr(genome, 'genome_id', f'genome_{id(genome)}')

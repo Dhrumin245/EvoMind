@@ -1,4 +1,5 @@
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,6 +9,212 @@ import json
 import hashlib
 import math
 import ast
+from dataclasses import dataclass, field
+from collections import defaultdict, deque
+
+
+@dataclass
+class Module:
+    """A modular building block that can be reused across genomes"""
+    module_id: str
+    genes: List[Any] = field(default_factory=list)  # Will be NeuralGene instances
+    input_dim: int = 0
+    output_dim: int = 0
+    module_type: str = "linear_block"  # "linear_block", "residual_block", "attention_block", etc.
+
+    def forward(self, x: np.ndarray, training: bool = False) -> np.ndarray:
+        """Forward pass through the module"""
+        if not self.genes:
+            return x
+
+        activations = [x]
+        for gene in self.genes:
+            current_input = activations[-1]
+
+            # Handle skip connections within module
+            if gene.skip_connection and gene.skip_target >= 0 and gene.skip_target < len(activations):
+                skip_input = activations[gene.skip_target]
+                if skip_input.shape[1] != gene.input_dim:
+                    if skip_input.shape[1] < gene.input_dim:
+                        pad_width = gene.input_dim - skip_input.shape[1]
+                        skip_input = np.pad(skip_input, ((0, 0), (0, pad_width)), mode='constant')
+                    else:
+                        skip_input = skip_input[:, :gene.input_dim]
+                current_input = gene.skip_gate * current_input + (1 - gene.skip_gate) * skip_input
+
+            output = gene.forward(current_input, training)
+            activations.append(output)
+
+        return activations[-1]
+
+    def copy(self) -> 'Module':
+        """Create a deep copy"""
+        return Module(
+            module_id=self.module_id,
+            genes=[gene.copy() for gene in self.genes],
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,
+            module_type=self.module_type
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert module to dictionary"""
+        return {
+            'module_id': self.module_id,
+            'genes': [gene.to_dict() for gene in self.genes],
+            'input_dim': self.input_dim,
+            'output_dim': self.output_dim,
+            'module_type': self.module_type
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Module':
+        """Create module from dictionary"""
+        return cls(
+            module_id=data['module_id'],
+            genes=[NeuralGene.from_dict(g) for g in data['genes']],
+            input_dim=data['input_dim'],
+            output_dim=data['output_dim'],
+            module_type=data.get('module_type', 'linear_block')
+        )
+
+
+@dataclass
+class Motif:
+    """A discovered architectural pattern that can be reused"""
+    motif_id: str
+    modules: List[Module] = field(default_factory=list)
+    connections: List[Tuple[int, int]] = field(default_factory=list)  # (from_module, to_module)
+    fitness_score: float = 0.0
+    usage_count: int = 0
+    discovery_generation: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert motif to dictionary"""
+        return {
+            'motif_id': self.motif_id,
+            'modules': [m.to_dict() for m in self.modules],
+            'connections': self.connections,
+            'fitness_score': self.fitness_score,
+            'usage_count': self.usage_count,
+            'discovery_generation': self.discovery_generation
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Motif':
+        """Create motif from dictionary"""
+        return cls(
+            motif_id=data['motif_id'],
+            modules=[Module.from_dict(m) for m in data['modules']],
+            connections=data['connections'],
+            fitness_score=data.get('fitness_score', 0.0),
+            usage_count=data.get('usage_count', 0),
+            discovery_generation=data.get('discovery_generation', 0)
+        )
+
+
+class MotifLibrary:
+    """Library of discovered motifs for reuse"""
+    def __init__(self, max_motifs: int = 50):
+        self.motifs: List[Motif] = []
+        self.max_motifs = max_motifs
+        self.motif_usage_stats: Dict[str, int] = defaultdict(int)
+
+    def add_motif(self, motif: Motif):
+        """Add a motif to the library"""
+        if len(self.motifs) >= self.max_motifs:
+            # Remove least used motif
+            least_used = min(self.motifs, key=lambda m: self.motif_usage_stats.get(m.motif_id, 0))
+            self.motifs.remove(least_used)
+            if least_used.motif_id in self.motif_usage_stats:
+                del self.motif_usage_stats[least_used.motif_id]
+
+        self.motifs.append(motif)
+
+    def get_random_motif(self) -> Optional[Motif]:
+        """Get a random motif weighted by fitness"""
+        if not self.motifs:
+            return None
+
+        # Weight by fitness score
+        weights = [max(0.1, m.fitness_score) for m in self.motifs]
+        total_weight = sum(weights)
+        if total_weight == 0:
+            return random.choice(self.motifs)
+
+        r = random.uniform(0, total_weight)
+        cumulative = 0
+        for motif, weight in zip(self.motifs, weights):
+            cumulative += weight
+            if r <= cumulative:
+                self.motif_usage_stats[motif.motif_id] += 1
+                return motif
+
+        return self.motifs[-1]
+
+    def discover_motifs(self, population: List['EvolvableGenome'], generation: int, min_fitness: float = 0.0):
+        """Discover new motifs from high-performing genomes"""
+        candidates = [g for g in population if g.fitness >= min_fitness]
+
+        for genome in candidates:
+            if len(genome.modules) >= 2:  # Need at least 2 modules for a motif
+                # Extract subgraph patterns
+                motifs = self._extract_motifs_from_genome(genome, generation)
+                for motif in motifs:
+                    self.add_motif(motif)
+
+    def _extract_motifs_from_genome(self, genome: 'EvolvableGenome', generation: int) -> List[Motif]:
+        """Extract architectural motifs from a genome"""
+        motifs = []
+
+        # Simple motif extraction: consecutive module pairs
+        for i in range(len(genome.modules) - 1):
+            module1 = genome.modules[i]
+            module2 = genome.modules[i + 1]
+
+            # Check if there's a connection between them
+            connection_exists = any(
+                conn[0] == i and conn[1] == i + 1
+                for conn in genome.module_connections
+            )
+
+            if connection_exists:
+                motif = Motif(
+                    motif_id=f"motif_{generation}_{len(motifs)}",
+                    modules=[module1.copy(), module2.copy()],
+                    connections=[(0, 1)],
+                    fitness_score=genome.fitness,
+                    discovery_generation=generation
+                )
+                motifs.append(motif)
+
+        return motifs
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert library to dictionary"""
+        return {
+            'motifs': [m.to_dict() for m in self.motifs],
+            'motif_usage_stats': dict(self.motif_usage_stats),
+            'max_motifs': self.max_motifs
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MotifLibrary':
+        """Create library from dictionary"""
+        library = cls(max_motifs=data.get('max_motifs', 50))
+        library.motifs = [Motif.from_dict(m) for m in data['motifs']]
+        library.motif_usage_stats = defaultdict(int, data.get('motif_usage_stats', {}))
+        return library
+
+
+@dataclass
+class GenomeMetadata:
+    """Metadata for genome lineage and evolution history"""
+    parent_ids: List[str] = field(default_factory=list)
+    birth_generation: int = 0
+    origin_population: str = "unknown"
+    mutation_history: List[Dict[str, Any]] = field(default_factory=list)
+    last_eval_metrics: Optional[Dict[str, Any]] = None
 
 
 class LearningRuleNet(nn.Module):
@@ -595,16 +802,79 @@ class NeuralGene:
         return self.from_dict(copy_data)
 
 
+class ConnectionGene:
+    """Individual synapse with its own learning rule"""
+    
+    def __init__(self, from_neuron: int, to_neuron: int):
+        self.from_neuron = from_neuron
+        self.to_neuron = to_neuron
+        self.weight = np.random.randn() * 0.01
+        self.learning_rule_params = {
+            'A': np.random.uniform(-0.1, 0.1),
+            'B': np.random.uniform(-0.1, 0.1),
+            'C': np.random.uniform(-0.1, 0.1),
+        }
+        self.enabled = True  # For sparse connection representation
+    
+    def update_plasticity(self, pre_activity: float, post_activity: float, reward: float, timestep: int):
+        """Per-connection plasticity update"""
+        # Simple learning rule: Δw = A * pre + B * post + C * reward
+        delta_w = (self.learning_rule_params['A'] * pre_activity + 
+                   self.learning_rule_params['B'] * post_activity + 
+                   self.learning_rule_params['C'] * reward)
+        self.weight += delta_w
+    
+    def mutate(self, weight_mutation_rate: float = 0.1, param_mutation_rate: float = 0.1, mutation_strength: float = 0.01):
+        """Connection-level mutation operators"""
+        # Mutate weight
+        if np.random.random() < weight_mutation_rate:
+            self.weight += np.random.randn() * mutation_strength
+        
+        # Mutate learning rule parameters
+        for key in self.learning_rule_params:
+            if np.random.random() < param_mutation_rate:
+                self.learning_rule_params[key] += np.random.uniform(-mutation_strength, mutation_strength)
+        
+        # Toggle enabled (sparse representation)
+        if np.random.random() < 0.01:  # Low probability to toggle
+            self.enabled = not self.enabled
+    
+    def copy(self) -> 'ConnectionGene':
+        """Create a deep copy"""
+        new_conn = ConnectionGene(self.from_neuron, self.to_neuron)
+        new_conn.weight = self.weight
+        new_conn.learning_rule_params = self.learning_rule_params.copy()
+        new_conn.enabled = self.enabled
+        return new_conn
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            'from_neuron': self.from_neuron,
+            'to_neuron': self.to_neuron,
+            'weight': self.weight,
+            'learning_rule_params': self.learning_rule_params,
+            'enabled': self.enabled
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ConnectionGene':
+        """Create from dictionary"""
+        conn = cls(data['from_neuron'], data['to_neuron'])
+        conn.weight = data['weight']
+        conn.learning_rule_params = data['learning_rule_params']
+        conn.enabled = data.get('enabled', True)
+        return conn
+
+
 class EvolvableGenome:
     """
-    Genome that encodes evolvable neural network architectures
+    Modular genome that encodes evolvable neural network architectures using reusable modules
     Supports:
-    - Variable number of layers
-    - Variable neurons per layer
-    - Evolvable activation functions
-    - Structural mutations (add/remove layers, neurons)
-    - Skip connections
-    - Various regularization techniques
+    - Module reuse and duplication
+    - Motif discovery and insertion
+    - DAG execution order for complex connectivity
+    - Automatic motif mining from high-performing genomes
     """
 
     def __init__(
@@ -612,26 +882,45 @@ class EvolvableGenome:
         genome_id: Optional[str] = None,
         input_size: int = 6,
         output_size: int = 4,
-        min_layers: int = 1,
-        max_layers: int = 8,
+        min_modules: int = 1,
+        max_modules: int = 8,
+        min_layers: Optional[int] = None,  # Backward-compatible alias for min_modules
+        max_layers: Optional[int] = None,  # Backward-compatible alias for max_modules
         min_neurons: int = 4,
         max_neurons: int = 128,
-        init_layers: int = 2,
+        init_modules: int = 2,
         init_neurons: int = 16,
         seed: Optional[int] = None,
         weights=None,
         plasticity=None,
-        meta=None
+        meta=None,
+        motif_library: Optional['MotifLibrary'] = None
     ):
+        # Backward compatibility: map legacy layer args to module args
+        if min_layers is not None:
+            min_modules = min_layers
+        if max_layers is not None:
+            max_modules = max_layers
+
         self.genome_id = genome_id or f"gen_{random.randint(0, 9999):04d}"
         self.input_size = input_size
         self.output_size = output_size
-        self.min_layers = min_layers
-        self.max_layers = max_layers
+        self.min_modules = min_modules
+        self.max_modules = max_modules
         self.min_neurons = min_neurons
         self.max_neurons = max_neurons
 
+        # Legacy attributes for backward compatibility
+        self.min_layers = min_modules
+        self.max_layers = max_modules
+
+        # Modular architecture: modules and connections
+        self.modules: List[Module] = []
+        self.module_connections: List[Tuple[int, int]] = []  # (from_module_idx, to_module_idx)
+
+        # Legacy support: maintain genes for backward compatibility
         self.genes: List[NeuralGene] = []
+
         self.fitness = 0.0
         self.norm_fitness = 0.0
         self.age = 0  # Generation age
@@ -652,30 +941,25 @@ class EvolvableGenome:
         self.learning_rule_net: Optional[LearningRuleNet] = None
         self.learning_rule: Optional[Dict[str, float]] = None
         self.plastic_diagnostics: Optional[Dict[str, Any]] = None
+        self.metadata: GenomeMetadata = GenomeMetadata()
         self._gpu_compiled: bool = False
         self._gpu_layers: List[Dict[str, Any]] = []
         self._torch_brain: Optional[Any] = None
         self._signature_cache: Optional[str] = None
         self.layers: List[Dict[str, Any]] = []
 
+        # Motif library for reuse
+        self.motif_library = motif_library or MotifLibrary()
+
         # Initialize architecture
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
 
-        self._initialize_architecture(init_layers, init_neurons)
+        self._initialize_modular_architecture(init_modules, init_neurons)
 
-        # Create self.layers by reshaping weights into matrices and biases
-        self.layers = []
-        for gene in self.genes:
-            layer_dict = {
-                'weights': gene.weights,
-                'bias': gene.bias,
-                'activation': gene.activation,
-                'input_dim': gene.input_dim,
-                'output_dim': gene.output_dim
-            }
-            self.layers.append(layer_dict)
+        # Create self.layers by flattening modules into genes for compatibility
+        self._flatten_modules_to_genes()
 
         # Initialize META genes
         if meta is None:
@@ -689,6 +973,284 @@ class EvolvableGenome:
 
         # Initialize LearningRuleNet instead of static dict
         self.learning_rule_net = LearningRuleNet(input_dim=self.input_size, output_dim=self.output_size, hidden_dim=16)
+
+    def _initialize_modular_architecture(self, num_modules: int, neurons_per_module: int):
+        """Initialize modular architecture with reusable building blocks"""
+        num_modules = max(self.min_modules, min(num_modules, self.max_modules))
+        neurons_per_module = max(self.min_neurons, min(neurons_per_module, self.max_neurons))
+
+        # Create initial modules
+        prev_dim = self.input_size
+        for i in range(num_modules):
+            # Last module outputs to final layer
+            if i == num_modules - 1:
+                output_dim = self.output_size
+                module_type = "output_block"
+            else:
+                output_dim = neurons_per_module
+                module_type = random.choice(["linear_block", "residual_block", "attention_block"])
+
+            # Create module with 1-3 genes
+            num_genes = random.randint(1, 3)
+            genes = []
+            current_dim = prev_dim
+
+            for j in range(num_genes):
+                if j == num_genes - 1:
+                    # Last gene in module
+                    gene_output = output_dim
+                    activation = "linear" if i == num_modules - 1 else random.choice(list(ActivationFunction.ACTIVATIONS.keys()))
+                else:
+                    gene_output = neurons_per_module
+                    activation = random.choice(list(ActivationFunction.ACTIVATIONS.keys()))
+
+                gene = NeuralGene(
+                    gene_id=f"module_{i}_gene_{j}",
+                    input_dim=current_dim,
+                    output_dim=gene_output,
+                    activation=activation,
+                    use_bias=True,
+                    dropout_rate=random.uniform(0.0, 0.2),
+                    normalization_type=random.choice(["none", "layernorm"]),
+                    plasticity=np.random.uniform(-0.1, 0.1, (gene_output, current_dim)).astype(np.float32)
+                )
+                gene.initialize_weights(method="he_normal", scale=0.1)
+                genes.append(gene)
+                current_dim = gene_output
+
+            module = Module(
+                module_id=f"module_{i}",
+                genes=genes,
+                input_dim=prev_dim,
+                output_dim=output_dim,
+                module_type=module_type
+            )
+            self.modules.append(module)
+            prev_dim = output_dim
+
+        # Create connections (simple chain for now)
+        for i in range(len(self.modules) - 1):
+            self.module_connections.append((i, i + 1))
+
+    def _flatten_modules_to_genes(self):
+        """Flatten modular architecture into linear genes for backward compatibility"""
+        self.genes = []
+        for module in self.modules:
+            self.genes.extend(module.genes)
+
+    def mutate_modules(self) -> bool:
+        """Mutate the modular architecture"""
+        mutated = False
+
+        # Module-level mutations
+        if random.random() < 0.1:  # 10% chance for module mutations
+            mutation_type = random.choice(['add_module', 'remove_module', 'duplicate_module', 'insert_motif'])
+
+            if mutation_type == 'add_module' and len(self.modules) < self.max_modules:
+                self._add_module()
+                mutated = True
+            elif mutation_type == 'remove_module' and len(self.modules) > self.min_modules:
+                self._remove_module()
+                mutated = True
+            elif mutation_type == 'duplicate_module':
+                self._duplicate_module()
+                mutated = True
+            elif mutation_type == 'insert_motif':
+                self._insert_motif()
+                mutated = True
+
+        # Mutate individual modules
+        for module in self.modules:
+            if random.random() < 0.3:  # 30% chance per module
+                self._mutate_module(module)
+                mutated = True
+
+        if mutated:
+            self._flatten_modules_to_genes()
+            self.invalidate_caches()
+
+        return mutated
+
+    def _add_module(self):
+        """Add a new module at random position"""
+        if len(self.modules) >= self.max_modules:
+            return
+
+        pos = random.randint(0, len(self.modules))
+        input_dim = self.input_size if pos == 0 else self.modules[pos - 1].output_dim
+        output_dim = self.output_size if pos == len(self.modules) else self.modules[pos].input_dim
+
+        # Create new module
+        genes = []
+        current_dim = input_dim
+        num_genes = random.randint(1, 2)
+
+        for j in range(num_genes):
+            gene_output = output_dim if j == num_genes - 1 else random.randint(self.min_neurons, self.max_neurons)
+            gene = NeuralGene(
+                gene_id=f"new_module_{len(self.modules)}_gene_{j}",
+                input_dim=current_dim,
+                output_dim=gene_output,
+                activation=random.choice(list(ActivationFunction.ACTIVATIONS.keys())),
+                use_bias=True,
+                plasticity=np.random.uniform(-0.1, 0.1, (gene_output, current_dim)).astype(np.float32)
+            )
+            gene.initialize_weights(method="he_normal", scale=0.1)
+            genes.append(gene)
+            current_dim = gene_output
+
+        new_module = Module(
+            module_id=f"new_module_{len(self.modules)}",
+            genes=genes,
+            input_dim=input_dim,
+            output_dim=output_dim,
+            module_type=random.choice(["linear_block", "residual_block"])
+        )
+
+        self.modules.insert(pos, new_module)
+
+        # Update connections
+        self.module_connections = []
+        for i in range(len(self.modules) - 1):
+            self.module_connections.append((i, i + 1))
+
+    def _remove_module(self):
+        """Remove a random module"""
+        if len(self.modules) <= self.min_modules:
+            return
+
+        pos = random.randint(0, len(self.modules) - 1)
+        self.modules.pop(pos)
+
+        # Update connections
+        self.module_connections = []
+        for i in range(len(self.modules) - 1):
+            self.module_connections.append((i, i + 1))
+
+    def _duplicate_module(self):
+        """Duplicate a random module"""
+        if not self.modules:
+            return
+
+        source_idx = random.randint(0, len(self.modules) - 1)
+        source_module = self.modules[source_idx]
+
+        # Create duplicate with new ID
+        duplicate = source_module.copy()
+        duplicate.module_id = f"duplicate_{source_module.module_id}"
+
+        # Insert after source
+        pos = source_idx + 1
+        self.modules.insert(pos, duplicate)
+
+        # Update connections
+        self.module_connections = []
+        for i in range(len(self.modules) - 1):
+            self.module_connections.append((i, i + 1))
+
+    def _insert_motif(self):
+        """Insert a motif from the library"""
+        motif = self.motif_library.get_random_motif()
+        if motif is None:
+            return
+
+        # Insert motif modules
+        insert_pos = random.randint(0, len(self.modules))
+        for i, module in enumerate(motif.modules):
+            new_module = module.copy()
+            new_module.module_id = f"motif_{motif.motif_id}_module_{i}"
+            self.modules.insert(insert_pos + i, new_module)
+
+        # Add motif connections
+        offset = insert_pos
+        for from_idx, to_idx in motif.connections:
+            self.module_connections.append((offset + from_idx, offset + to_idx))
+
+        # Reconnect the chain
+        self._rebuild_connections()
+
+    def _mutate_module(self, module: Module):
+        """Mutate a single module"""
+        # Add/remove genes within module
+        if random.random() < 0.2 and len(module.genes) < 4:  # Add gene
+            pos = random.randint(0, len(module.genes))
+            input_dim = module.input_dim if pos == 0 else module.genes[pos - 1].output_dim
+            output_dim = module.output_dim if pos == len(module.genes) else module.genes[pos].input_dim
+
+            gene = NeuralGene(
+                gene_id=f"{module.module_id}_new_gene_{len(module.genes)}",
+                input_dim=input_dim,
+                output_dim=output_dim,
+                activation=random.choice(list(ActivationFunction.ACTIVATIONS.keys())),
+                use_bias=True,
+                plasticity=np.random.uniform(-0.1, 0.1, (output_dim, input_dim)).astype(np.float32)
+            )
+            gene.initialize_weights(method="he_normal", scale=0.1)
+            module.genes.insert(pos, gene)
+
+        elif random.random() < 0.1 and len(module.genes) > 1:  # Remove gene
+            pos = random.randint(0, len(module.genes) - 1)
+            module.genes.pop(pos)
+
+        # Mutate genes within module
+        for gene in module.genes:
+            gene.mutate(weight_mutation_rate=0.1, architecture_mutation=False)
+
+    def _rebuild_connections(self):
+        """Rebuild module connections to ensure DAG"""
+        # Simple chain for now - can be extended for more complex topologies
+        self.module_connections = []
+        for i in range(len(self.modules) - 1):
+            self.module_connections.append((i, i + 1))
+
+    def get_execution_order(self) -> List[int]:
+        """Get topological execution order for modules (handles DAG)"""
+        # For now, simple chain execution
+        return list(range(len(self.modules)))
+
+    def forward_modular(self, x: np.ndarray, training: bool = False) -> np.ndarray:
+        """Forward pass through modular architecture"""
+        if not self.modules:
+            return x
+
+        # Get execution order
+        order = self.get_execution_order()
+
+        # Track module outputs
+        module_outputs = {}
+
+        for module_idx in order:
+            module = self.modules[module_idx]
+
+            # Get inputs from predecessors
+            if module_idx == 0:
+                # First module gets network input
+                module_input = x
+            else:
+                # Combine inputs from predecessors
+                predecessors = [idx for idx, conn in enumerate(self.module_connections) if conn[1] == module_idx]
+                if predecessors:
+                    # For simplicity, concatenate inputs (can be extended)
+                    inputs = [module_outputs[conn[0]] for conn in self.module_connections if conn[1] == module_idx]
+                    module_input = np.concatenate(inputs, axis=-1) if len(inputs) > 1 else inputs[0]
+                else:
+                    module_input = x  # Fallback
+
+            # Forward through module
+            output = module.forward(module_input, training)
+            module_outputs[module_idx] = output
+
+        # Return final output
+        return module_outputs[len(self.modules) - 1]
+
+    def record_mutation(self, event: Dict[str, Any]):
+        """Record a mutation event in the genome's history"""
+        self.metadata.mutation_history.append(event)
+
+    def set_parents(self, parent_ids: List[str], generation: int):
+        """Set parent IDs and birth generation for lineage tracking"""
+        self.metadata.parent_ids = parent_ids
+        self.metadata.birth_generation = generation
 
     def record_episode_learning_curve(self,
                                     initial_fitness: float,
@@ -1153,9 +1715,22 @@ class EvolvableGenome:
         """
         mutated = False
 
+        # Record mutation event
+        mutation_event = {
+            'generation': self.age,
+            'timestamp': time.time(),
+            'type': 'mutation',
+            'details': {}
+        }
+
         # Anneal plasticity mutation rate: start high to encourage exploration, decay with age
         plasticity_mutation_rate = self._plasticity_mutation_rate()
-        
+
+        # Milestone 5: Module-level mutations (architecture creativity)
+        if self.mutate_modules():
+            mutated = True
+            mutation_event['details']['modular'] = True
+
         # Weight mutations
         architecture_mutation = random.random() < architecture_mutation_rate
         for gene in self.genes:
@@ -1172,31 +1747,37 @@ class EvolvableGenome:
         if random.random() < 0.1:  # 10% chance to mutate learning rule net
             assert self.learning_rule_net is not None, "Learning rule net not initialized"
             self.learning_rule_net.mutate(mutation_rate=0.1, mutation_strength=0.1)
+            mutation_event['details']['learning_rule_net'] = True
 
         # Structural mutations (add/remove layers)
         if random.random() < layer_mutation_rate:
             mutation_type = random.choice(['add_layer', 'remove_layer', 'swap_layers'])
-            
+
             if mutation_type == 'add_layer' and len(self.genes) < max_layers:
                 self._add_layer()
                 mutated = True
+                mutation_event['details']['structural'] = 'add_layer'
             elif mutation_type == 'remove_layer' and len(self.genes) > min_layers:
                 self._remove_layer()
                 mutated = True
+                mutation_event['details']['structural'] = 'remove_layer'
             elif mutation_type == 'swap_layers' and len(self.genes) > 1:
                 self._swap_layers()
                 mutated = True
-        
+                mutation_event['details']['structural'] = 'swap_layers'
+
         # Connection mutations (skip connections)
         if random.random() < architecture_mutation_rate:
             self._mutate_connections()
             mutated = True
-        
-        # Update gene dimensions if architecture mutated
+            mutation_event['details']['connections'] = True
+
+        # Record mutation if any changes occurred
         if mutated:
+            self.record_mutation(mutation_event)
             self._update_gene_dimensions()
             self.invalidate_caches()
-        
+
         return mutated
 
     def _plasticity_mutation_rate(self) -> float:
@@ -1493,8 +2074,8 @@ class EvolvableGenome:
             genome_id=child_id,
             input_size=arch_parent.input_size,
             output_size=arch_parent.output_size,
-            min_layers=arch_parent.min_layers,
-            max_layers=arch_parent.max_layers,
+            min_modules=arch_parent.min_modules,
+            max_modules=arch_parent.max_modules,
             min_neurons=arch_parent.min_neurons,
             max_neurons=arch_parent.max_neurons,
         )
@@ -1577,8 +2158,8 @@ class EvolvableGenome:
             genome_id=f"{self.genome_id}_copy",
             input_size=self.input_size,
             output_size=self.output_size,
-            min_layers=self.min_layers,
-            max_layers=self.max_layers,
+            min_modules=self.min_modules,
+            max_modules=self.max_modules,
             min_neurons=self.min_neurons,
             max_neurons=self.max_neurons,
         )
@@ -1613,7 +2194,14 @@ class EvolvableGenome:
             'genes': [gene.to_dict() for gene in self.genes],
             'meta': self.meta,
             'learning_rule': self.learning_rule,
-            'learning_rule_net': self.learning_rule_net.to_numpy_dict()
+            'learning_rule_net': self.learning_rule_net.to_numpy_dict(),
+            'metadata': {
+                'parent_ids': self.metadata.parent_ids,
+                'birth_generation': self.metadata.birth_generation,
+                'origin_population': self.metadata.origin_population,
+                'mutation_history': self.metadata.mutation_history,
+                'last_eval_metrics': self.metadata.last_eval_metrics
+            }
         }
     
     @classmethod
@@ -1653,6 +2241,15 @@ class EvolvableGenome:
         else:
             # Backward compatibility: create new LearningRuleNet
             genome.learning_rule_net = LearningRuleNet(input_dim=genome.input_size, output_dim=genome.output_size, hidden_dim=16)
+
+        # Load metadata if present
+        if 'metadata' in data:
+            metadata_data = data['metadata']
+            genome.metadata.parent_ids = metadata_data.get('parent_ids', [])
+            genome.metadata.birth_generation = metadata_data.get('birth_generation', 0)
+            genome.metadata.origin_population = metadata_data.get('origin_population', 'unknown')
+            genome.metadata.mutation_history = metadata_data.get('mutation_history', [])
+            genome.metadata.last_eval_metrics = metadata_data.get('last_eval_metrics')
 
         return genome
     

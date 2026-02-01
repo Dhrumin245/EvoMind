@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import logging
+from collections import deque
 from typing import List, Dict, Any, Optional
 from genome import EvolvableGenome
 from diagnostics.plasticity_timing import PlasticityTimingLogger
@@ -393,6 +395,11 @@ class PlasticLinear(torch.nn.Module):
         # DIAGNOSTIC 2: Plastic Weight Activation Timing
         self.plastic_delta_logs = []  # List of ||ΔW|| per timestep
 
+        # Milestone 6: Stability monitoring and adaptive controls
+        self.drift_budget = 1.0  # Per-layer drift budget
+        self.observed_drift = 0.0  # Running average of observed drift
+        self.adaptive_clamp = 0.01  # Adaptive clamp based on observed drift
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -489,6 +496,166 @@ class PlasticLinear(torch.nn.Module):
             pass
 
 
+class PlasticityRegularizer:
+    """Prevent runaway plasticity with multiple safeguards"""
+    def __init__(self, max_delta=0.5, saturation_threshold=0.9):
+        self.max_delta = max_delta
+        self.saturation_threshold = saturation_threshold
+        self.plasticity_history = deque(maxlen=100)
+
+    def regulate(self, delta_w, current_w):
+        # 1. Clip delta magnitude
+        delta_w = torch.clamp(delta_w, -self.max_delta, self.max_delta)
+
+        # 2. Check saturation
+        saturation = (torch.abs(current_w) > self.saturation_threshold).float().mean()
+        if saturation > 0.8:
+            delta_w *= 0.1  # Reduce plasticity if saturated
+
+        # 3. Adaptive dampening based on history
+        self.plasticity_history.append(torch.abs(delta_w).mean().item())
+        if len(self.plasticity_history) > 10:
+            recent_trend = np.mean(list(self.plasticity_history)[-10:])
+            if recent_trend > self.max_delta * 0.5:
+                delta_w *= 0.5  # Dampen if trending high
+
+        return delta_w
+
+
+class ActivationMonitor:
+    """Real-time activation health monitoring"""
+    def __init__(self):
+        self.saturation_thresholds = {
+            'tanh': 0.95,
+            'sigmoid': 0.95,
+            'relu': 1000.0
+        }
+
+    def check_layer(self, activations, activation_fn):
+        # Dead neurons (always zero)
+        dead_ratio = (torch.abs(activations) < 1e-6).float().mean()
+
+        # Saturated neurons (at limits)
+        threshold = self.saturation_thresholds.get(activation_fn, 0.95)
+        saturated_ratio = (torch.abs(activations) > threshold).float().mean()
+
+        return {
+            'dead_ratio': dead_ratio.item(),
+            'saturated_ratio': saturated_ratio.item(),
+            'mean_activation': activations.mean().item(),
+            'std_activation': activations.std().item()
+        }
+
+
+class CollapseDetector:
+    """Detect and prevent network collapse"""
+    def __init__(self):
+        self.collapse_indicators = []
+        self.collapse_history = []  # Track collapse events over time
+        self.recovery_metrics = {
+            'total_collapses': 0,
+            'successful_recoveries': 0,
+            'average_recovery_time': 0.0
+        }
+
+    def check_collapse(self, brain):
+        indicators = []
+
+        # Check gradient flow
+        grad_norm = sum(p.grad.norm() for p in brain.parameters() if p.grad is not None)
+        if grad_norm < 1e-8:
+            indicators.append('gradient_vanishing')
+
+        # Check output diversity
+        with torch.no_grad():
+            # Sample a few random inputs to check output variance
+            sample_inputs = torch.randn(10, brain.input_size, device=next(brain.parameters()).device)
+            outputs = brain(sample_inputs)
+            output_std = outputs.std(dim=0).mean().item()
+            if output_std < 1e-6:
+                indicators.append('output_collapse')
+
+        # Check weight explosion
+        total_weight_norm = sum(p.norm() for p in brain.parameters())
+        if total_weight_norm > 100.0:  # Arbitrary threshold
+            indicators.append('weight_explosion')
+
+        # Check for dead layers using activation stats
+        if hasattr(brain, 'activation_stats') and brain.activation_stats:
+            dead_layers = sum(1 for stats in brain.activation_stats if stats['dead_ratio'] > 0.8)
+            if dead_layers > len(brain.activation_stats) * 0.5:
+                indicators.append('layer_death')
+
+        # Check for saturation
+        if hasattr(brain, 'activation_stats') and brain.activation_stats:
+            saturated_layers = sum(1 for stats in brain.activation_stats if stats['saturated_ratio'] > 0.8)
+            if saturated_layers > len(brain.activation_stats) * 0.5:
+                indicators.append('activation_saturation')
+
+        self.collapse_indicators = indicators
+        is_collapsed = len(indicators) > 0
+
+        if is_collapsed:
+            self.collapse_history.append({
+                'timestep': len(self.collapse_history),
+                'indicators': indicators.copy(),
+                'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                'output_std': output_std,
+                'weight_norm': total_weight_norm.item() if isinstance(total_weight_norm, torch.Tensor) else total_weight_norm
+            })
+            self.recovery_metrics['total_collapses'] += 1
+            brain.logger.warning(f"Network collapse detected: {indicators}")
+
+        return is_collapsed, indicators
+
+    def auto_fix(self, brain, indicators):
+        """Automatic intervention"""
+        recovery_start = len(self.collapse_history) - 1
+
+        if 'gradient_vanishing' in indicators:
+            # Re-initialize problematic layers
+            for layer in brain.layers:
+                if isinstance(layer, PlasticLinear):
+                    layer.reset_parameters()
+                    layer.reset()
+            brain.logger.info("Re-initialized layers due to gradient vanishing")
+
+        if 'weight_explosion' in indicators:
+            # Scale down weights
+            for param in brain.parameters():
+                param.data *= 0.1
+            brain.logger.info("Scaled down weights due to explosion")
+
+        if 'output_collapse' in indicators or 'layer_death' in indicators:
+            # Add noise to weights
+            for param in brain.parameters():
+                noise = torch.randn_like(param) * 0.01
+                param.data += noise
+            brain.logger.info("Added noise to weights due to output collapse")
+
+        if 'activation_saturation' in indicators:
+            # Adjust meta parameters if available
+            if hasattr(brain, 'meta'):
+                brain.meta['reward_gain'] *= 0.9
+                brain.meta['plastic_lr'] *= 0.9
+            brain.logger.info("Reduced learning rates due to activation saturation")
+
+        # Check recovery after fix
+        is_still_collapsed, _ = self.check_collapse(brain)
+        if not is_still_collapsed:
+            recovery_time = len(self.collapse_history) - recovery_start
+            self.recovery_metrics['successful_recoveries'] += 1
+            self.recovery_metrics['average_recovery_time'] = (
+                (self.recovery_metrics['average_recovery_time'] * (self.recovery_metrics['successful_recoveries'] - 1) + recovery_time)
+                / self.recovery_metrics['successful_recoveries']
+            )
+            brain.logger.info(f"Recovery successful in {recovery_time} checks")
+
+    def get_recovery_metrics(self):
+        """Get recovery metrics"""
+        return self.recovery_metrics.copy()
+
+
 class TorchBrain(nn.Module):
     """
     PyTorch neural network compiler that builds networks from genomes
@@ -517,6 +684,18 @@ class TorchBrain(nn.Module):
         self.skip_connections: List[tuple[int, int]] = []  # List of (from_layer, to_layer) tuples
         self.layer_types: List[str] = []
 
+        # Milestone 6: Activation monitoring hooks
+        self.activation_stats: List[Dict[str, float]] = []  # Per-layer activation statistics
+        self.layer_saturation_fractions: List[float] = []  # Fraction of saturated activations per layer
+        self.layer_dead_unit_fractions: List[float] = []  # Fraction of dead units per layer
+
+        # Activation monitor
+        self.activation_monitor = ActivationMonitor()
+        self.logger = logging.getLogger('TorchBrain')
+
+        # Collapse prevention system
+        self.collapse_detector = CollapseDetector()
+
         # Build network if genome is provided
         if genome is not None:
             self.build_from_genome(genome)
@@ -526,79 +705,47 @@ class TorchBrain(nn.Module):
         self.genome = genome
         self.input_size = genome.input_size
         self.output_size = genome.output_size
-        
+
         # Clear existing components
         self.layers = nn.ModuleList()
         self.activations = []
         self.skip_connections = []
         self.layer_types = []
-        
+
+        # Milestone 5: Check if genome has modular architecture
+        if hasattr(genome, 'modules') and genome.modules:
+            # Build modular architecture
+            self._build_modular_architecture(genome)
+        else:
+            # Build legacy linear architecture
+            self._build_linear_architecture(genome)
+
+        # Compile forward graph
+        self._compile_forward_graph()
+
+    def _build_modular_architecture(self, genome: EvolvableGenome):
+        """Build PyTorch network from modular genome architecture"""
+        # Create module layers
+        self.module_layers: nn.ModuleList = nn.ModuleList()
+        self.module_connections = genome.module_connections.copy()
+        self.execution_order = genome.get_execution_order()
+
+        for module in genome.modules:
+            # Create a sequential module for each genome module
+            module_seq = nn.Sequential()
+
+            for gene in module.genes:
+                layer = self._create_layer_from_gene(gene)
+                module_seq.append(layer)
+
+            self.module_layers.append(module_seq)
+
+    def _build_linear_architecture(self, genome: EvolvableGenome):
+        """Build legacy linear architecture from genome genes"""
         # Build each layer from genome genes
         for i, gene in enumerate(genome.genes):
-            layer = None
+            layer = self._create_layer_from_gene(gene)
             layer_type = gene.layer_type
-
-            if layer_type == "linear":
-                # Create plastic linear layer
-                layer = PlasticLinear(
-                    input_dim=gene.input_dim,
-                    output_dim=gene.output_dim,
-                    use_bias=gene.use_bias,
-                    learning_rule_net=gene.learning_rule_net
-                )
-
-                # Copy weights from genome (stored as out x in)
-                if gene.weights is not None:
-                    layer.base_weight.data.copy_(torch.tensor(gene.weights, dtype=torch.float32))
-                    if gene.bias is not None and layer.bias is not None:
-                        layer.bias.data.copy_(torch.tensor(gene.bias, dtype=torch.float32))
-
-                # Seed plastic weight buffer from genome plasticity gene (Hebbian strength)
-                if gene.plasticity is not None:
-                    layer.plastic_weight.copy_(torch.tensor(gene.plasticity, dtype=torch.float32))
-
-            elif layer_type == "mlp_block":
-                # Create MLP block
-                layer = MLPBlock(
-                    input_dim=gene.input_dim,
-                    output_dim=gene.output_dim,
-                    hidden_dim=max(gene.input_dim, gene.output_dim),
-                    num_layers=2
-                )
-
-            elif layer_type == "res_block":
-                # Create residual block
-                layer = ResBlock(
-                    input_dim=gene.input_dim,
-                    output_dim=gene.output_dim,
-                    hidden_dim=max(gene.input_dim, gene.output_dim)
-                )
-
-            elif layer_type == "gru":
-                # Create GRU block
-                layer = GRUBlock(
-                    input_dim=gene.input_dim,
-                    hidden_dim=gene.output_dim,
-                    memory_size=gene.memory_size
-                )
-
-            elif layer_type == "attention_block":
-                # Create attention block
-                layer = AttentionBlock(
-                    input_dim=gene.input_dim,
-                    output_dim=gene.output_dim,
-                    memory_size=gene.memory_size
-                )
-
-            else:
-                # Fallback to plastic linear
-                layer = PlasticLinear(
-                    input_dim=gene.input_dim,
-                    output_dim=gene.output_dim,
-                    use_bias=gene.use_bias,
-                    learning_rule_net=gene.learning_rule_net
-                )
-                layer_type = "linear"
 
             self.layers.append(layer)
             self.layer_types.append(layer_type)
@@ -609,7 +756,7 @@ class TorchBrain(nn.Module):
             # Store skip connection if present
             if gene.skip_connection and gene.skip_target >= 0:
                 self.skip_connections.append((gene.skip_target, i))
-        
+
         # Create batch normalization layers if needed
         self.batch_norms: List[Optional[DynamicBatchNorm]] = []
         self.layer_norms: List[Optional[DynamicLayerNorm]] = []
@@ -645,9 +792,73 @@ class TorchBrain(nn.Module):
                 self.dropouts.append(nn.Dropout(gene.dropout_rate))
             else:
                 self.dropouts.append(None)
-        
-        # Compile forward graph
-        self._compile_forward_graph()
+
+    def _create_layer_from_gene(self, gene) -> nn.Module:
+        """Create a PyTorch layer from a NeuralGene"""
+        layer_type = gene.layer_type
+
+        if layer_type == "linear":
+            # Create plastic linear layer
+            layer = PlasticLinear(
+                input_dim=gene.input_dim,
+                output_dim=gene.output_dim,
+                use_bias=gene.use_bias,
+                learning_rule_net=gene.learning_rule_net
+            )
+
+            # Copy weights from genome (stored as out x in)
+            if gene.weights is not None:
+                layer.base_weight.data.copy_(torch.tensor(gene.weights, dtype=torch.float32))
+                if gene.bias is not None and layer.bias is not None:
+                    layer.bias.data.copy_(torch.tensor(gene.bias, dtype=torch.float32))
+
+            # Seed plastic weight buffer from genome plasticity gene (Hebbian strength)
+            if gene.plasticity is not None:
+                layer.plastic_weight.copy_(torch.tensor(gene.plasticity, dtype=torch.float32))
+
+        elif layer_type == "mlp_block":
+            # Create MLP block
+            layer = MLPBlock(
+                input_dim=gene.input_dim,
+                output_dim=gene.output_dim,
+                hidden_dim=max(gene.input_dim, gene.output_dim),
+                num_layers=2
+            )
+
+        elif layer_type == "res_block":
+            # Create residual block
+            layer = ResBlock(
+                input_dim=gene.input_dim,
+                output_dim=gene.output_dim,
+                hidden_dim=max(gene.input_dim, gene.output_dim)
+            )
+
+        elif layer_type == "gru":
+            # Create GRU block
+            layer = GRUBlock(
+                input_dim=gene.input_dim,
+                hidden_dim=gene.output_dim,
+                memory_size=gene.memory_size
+            )
+
+        elif layer_type == "attention_block":
+            # Create attention block
+            layer = AttentionBlock(
+                input_dim=gene.input_dim,
+                output_dim=gene.output_dim,
+                memory_size=gene.memory_size
+            )
+
+        else:
+            # Fallback to plastic linear
+            layer = PlasticLinear(
+                input_dim=gene.input_dim,
+                output_dim=gene.output_dim,
+                use_bias=gene.use_bias,
+                learning_rule_net=gene.learning_rule_net
+            )
+
+        return layer
     
     def _compile_forward_graph(self):
         """Compile forward pass graph for efficient execution"""
@@ -688,19 +899,35 @@ class TorchBrain(nn.Module):
             'cos': torch.cos,
         }
         return activation_map.get(activation_name, torch.tanh)
-    
+
+    def _monitor_activation_stats(self, activations: torch.Tensor, layer_idx: int, activation_name: str):
+        """Monitor activation statistics for health diagnostics"""
+        stats = self.activation_monitor.check_layer(activations, activation_name)
+        self.activation_stats.append(stats)
+
+        # Log warnings on threshold violations
+        if stats['dead_ratio'] > 0.5:
+            self.logger.warning(f"Layer {layer_idx}: High dead neuron ratio ({stats['dead_ratio']:.3f})")
+        if stats['saturated_ratio'] > 0.5:
+            self.logger.warning(f"Layer {layer_idx}: High saturation ratio ({stats['saturated_ratio']:.3f})")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the compiled network"""
         if not self.layers:
             raise ValueError("TorchBrain has no layers. Call build_from_genome first.")
-        
+
+        # Reset activation monitoring for this forward pass
+        self.activation_stats = []
+        self.layer_saturation_fractions = []
+        self.layer_dead_unit_fractions = []
+
         # Store activations for skip connections
         activations = [x]  # Store input as activation 0
-        
+
         for op in self.forward_ops:
             layer_idx = op['layer_idx']
             current_input = activations[-1]
-            
+
             # Apply skip connections if any
             for skip_from, skip_to in self.skip_connections:
                 if skip_to == layer_idx and skip_from + 1 < len(activations):
@@ -714,10 +941,10 @@ class TorchBrain(nn.Module):
                         else:
                             skip_input = skip_input[:, :current_input.shape[1]]
                     current_input = current_input + skip_input
-            
+
             # Linear layer
             x = self.layers[layer_idx](current_input)  # type: ignore
-            
+
             # Batch normalization
             if op['has_bn'] and self.batch_norms[layer_idx] is not None:
                 x = self.batch_norms[layer_idx](x)
@@ -730,12 +957,15 @@ class TorchBrain(nn.Module):
             activation_fn = self.get_activation_fn(op['activation'])
             x = activation_fn(x)  # type: ignore
 
+            # Milestone 6: Monitor activation statistics
+            self._monitor_activation_stats(x, layer_idx, op['activation'])
+
             # Dropout (only during training)
             if op['has_dropout'] and self.training:
                 x = F.dropout(x, p=op['dropout_rate'])
-            
+
             activations.append(x)
-        
+
         return activations[-1]
     
     def act(self, state: np.ndarray) -> int:
@@ -1045,6 +1275,13 @@ class TorchBrain(nn.Module):
     def plot_meta_gene_selection_pressure(self, filename="diagnostics/meta_gene_selection_pressure.png"):
         """Plot DIAGNOSTIC 5: Meta-gene Selection Pressure - Meta-gene entropy vs generation"""
         MetaGeneEntropyLogger.plot_meta_gene_entropy(filename)
+
+    def check_and_fix_collapse(self):
+        """Check for network collapse and apply automatic fixes if detected"""
+        is_collapsed, indicators = self.collapse_detector.check_collapse(self)
+        if is_collapsed:
+            self.collapse_detector.auto_fix(self, indicators)
+        return is_collapsed, indicators
 
 class ParallelTorchBrain(nn.Module):
     """
