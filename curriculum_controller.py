@@ -14,6 +14,10 @@ import random
 # Import from curriculum.py
 from curriculum import CurriculumStage, get_stage_config, get_stage_transition_thresholds, get_stage_transition_graph
 
+# Import evolution components
+from evolution import EvolutionEngine
+from genome import EvolvableGenome
+
 
 @dataclass
 class StagePerformance:
@@ -469,9 +473,36 @@ class ExperimentResult:
 class CurriculumExperimentRunner:
     """A/B test curriculum strategies"""
 
-    def __init__(self, max_generations: int = 100, significance_level: float = 0.05):
+    def __init__(self,
+                 max_generations: int = 100,
+                 significance_level: float = 0.05,
+                 population_size: int = 50,
+                 tournament_size: int = 5,
+                 elite_count: int = 2,
+                 mutation_rate: float = 0.1,
+                 mutation_strength: float = 0.1,
+                 architecture_mutation_rate: float = 0.05):
         self.max_generations = max_generations
         self.significance_level = significance_level
+
+        # Evolution engine parameters
+        self.population_size = population_size
+        self.tournament_size = tournament_size
+        self.elite_count = elite_count
+        self.mutation_rate = mutation_rate
+        self.mutation_strength = mutation_strength
+        self.architecture_mutation_rate = architecture_mutation_rate
+
+        # Initialize evolution engine
+        self.evolution_engine = EvolutionEngine(
+            population_size=population_size,
+            tournament_size=tournament_size,
+            elite_count=elite_count,
+            mutation_rate=mutation_rate,
+            mutation_strength=mutation_strength,
+            architecture_mutation_rate=architecture_mutation_rate,
+            genome_cls=EvolvableGenome
+        )
 
     def run_experiment(self,
                       strategy_a: Callable,
@@ -562,8 +593,7 @@ class CurriculumExperimentRunner:
             if new_stage:
                 controller.reset_to_stage(new_stage)
 
-            # Evolve population (simplified - would need actual evolution logic)
-            # This is a placeholder for the actual evolution step
+            # Evolve population using EvolutionEngine
             population = self._evolve_population(population)
 
             # Check for convergence

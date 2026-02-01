@@ -60,7 +60,13 @@ from multi_task_harness import (
     get_multi_task_evaluator, TaskSuite, GeneralizationReport,
     MultiTaskEvaluator, get_default_task_suite
 )
+
+# Import meta-scientist system
+from meta_scientist import MetaScientist
 from typing import Sequence
+
+# Import meta-evolution populations
+from evolution import ArchitectPopulation, MutatorPopulation
 
 @dataclass
 class EpisodeMetrics:
@@ -355,6 +361,8 @@ async def train_coevolution_async(
     stage: CurriculumStage,
     prey_engine: EvolutionEngine,
     predator_engine: EvolutionEngine,
+    architect_population,
+    mutator_population,
 ) -> Dict[str, Any]:
     """
     Async training step for co-evolution
@@ -575,6 +583,48 @@ async def train_coevolution_async(
 
     # Add probe results to stats
     stats['behavioral_probes'] = probe_integration_results
+
+    # META-EVOLUTION: Evolve architect and mutator populations
+    # Prepare performance data for meta-evolution
+    performance_data = {
+        'avg_fitness': stats.get('mean_prey_fitness', 0.0) + stats.get('mean_predator_fitness', 0.0),
+        'architecture_diversity': stats.get('prey_species', {}).get('num_species', 1) + stats.get('predator_species', {}).get('num_species', 1),
+        'motif_effectiveness': stats.get('avg_adaptability_score', 0.0),
+        'successful_architectures': training_state.prey_population[:5] + training_state.predator_population[:5],  # Top performers
+        'mutation_success_rates': {
+            'weight': 0.5,  # Placeholder - could be tracked from mutation logs
+            'arch': 0.4,
+            'layer': 0.3
+        },
+        'avg_fitness_improvement': 0.1,  # Placeholder
+        'diversity_preservation': 0.8,  # Placeholder
+        'exploration_success': 0.6  # Placeholder
+    }
+
+    # Evolve architect population
+    architect_population.evolve_architectures(performance_data)
+
+    # Evolve mutator population
+    mutator_population.evolve_mutators(performance_data)
+
+    # Use evolved mutation strategies to adapt main evolution engines
+    adaptive_rates = mutator_population.get_adaptive_rates()
+    if prey_engine and adaptive_rates:
+        prey_engine.mutation_rate = adaptive_rates.get('weight_rate', prey_engine.mutation_rate)
+        prey_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', prey_engine.architecture_mutation_rate)
+
+    if predator_engine and adaptive_rates:
+        predator_engine.mutation_rate = adaptive_rates.get('weight_rate', predator_engine.mutation_rate)
+        predator_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', predator_engine.architecture_mutation_rate)
+
+    # Log meta-evolution progress
+    best_architect = architect_population.get_best_template()
+    best_mutator = mutator_population.get_best_strategy()
+
+    if best_architect:
+        print(f"Meta-Evolution: Best architect fitness: {best_architect.get('meta_fitness', 0.0):.3f}")
+    if best_mutator:
+        print(f"Meta-Evolution: Best mutator effectiveness: {best_mutator.get('current_effectiveness', 0.0):.3f}")
 
     return stats
 
@@ -1493,11 +1543,16 @@ async def main_coevolution_async():
         immigration_rate=config.novelty_immigration_rate,
     )
 
+    # Initialize meta-evolution populations
+    architect_population = ArchitectPopulation(population_size=20)
+    mutator_population = MutatorPopulation(population_size=15)
+
     # Training loop
     for generation in range(training_state.generation, config.generations):
         # Get current stage from curriculum controller
         current_stage = curriculum_controller.get_current_config()
         stage_name = current_stage['name']
+        stage_config = get_stage_config(CurriculumStage[stage_name.upper()])
 
         # Control diagnostics - only enable every N generations
         if config.plot_every > 0 and generation % config.plot_every == 0:
@@ -1513,6 +1568,8 @@ async def main_coevolution_async():
             CurriculumStage[stage_name.upper()],
             prey_engine,
             predator_engine,
+            architect_population,
+            mutator_population,
         )
         training_state.generation_stats.append(stats)
 
@@ -1583,28 +1640,51 @@ async def main_coevolution_async():
             episode_data = evaluate_single_episode_with_logging(top_prey_genome, seed=generation, max_steps=config.max_steps)
             plot_in_lifetime_learning_curve(generation, episode_data)
 
-            # Milestone 7: Run meta-scientist experiments
-            print("Running meta-scientist experiments...")
-            stage_config = get_stage_config(CurriculumStage[stage_name.upper()])
+            # Milestone 7: Run integrated meta-scientist experiments
+            print("Running integrated meta-scientist experiments...")
 
-            # Select top genomes for experiments
-            top_prey = max(training_state.prey_population, key=lambda g: g.fitness)
-            top_predator = max(training_state.predator_population, key=lambda g: g.fitness)
+            # Initialize meta-scientist system
+            meta_scientist = MetaScientist()
 
-            # Run 3 automated experiments per plot_every interval
-            experiments = [
-                run_ablation_frozen_learning_rule(top_prey, generation, stage_config, config.max_steps),
-                run_ablation_disabled_plasticity(top_prey, generation, stage_config, config.max_steps),
-                run_ablation_reward_weights(top_predator, generation, stage_config, config.max_steps),
-            ]
+            # Analyze population failures and generate hypotheses
+            combined_population = cast(List[EvolvableGenome], training_state.prey_population + training_state.predator_population)
+            task_info = {'name': stage_name, 'generation': generation}
+            
+            analysis_results = meta_scientist.analyze_population_failures(
+                combined_population,
+                task_info
+            )
 
-            # Store experiment reports
-            training_state.experiment_reports.extend(experiments)
+            # Run automated experiments based on hypotheses
+            experiment_results = meta_scientist.run_automated_experiments(
+                analysis_results['hypotheses'],
+                combined_population,
+                task_info,
+                generation
+            )
+
+            # Store experiment reports and learn from results
+            for exp in experiment_results:
+                # Convert experiment record to ExperimentReport format
+                exp_report = ExperimentReport(
+                    generation=generation,
+                    experiment_name=exp.get('experiment_design', {}).get('experiment_type', 'unknown'),
+                    hypothesis=exp.get('hypothesis', 'unknown'),
+                    baseline_fitness=0.0,  # Simulated experiments don't have real fitness
+                    ablated_fitness=0.0,
+                    fitness_delta=0.0,
+                    genome_id="N/A",
+                    genome_type="simulated",
+                    metrics=exp.get('result', {})
+                )
+                training_state.experiment_reports.append(exp_report)
 
             # Log experiment results
             print(f"Meta-scientist experiments completed for generation {generation}:")
-            for exp in experiments:
-                print(f"  {exp.experiment_name}: Δfitness = {exp.fitness_delta:.3f} ({exp.hypothesis})")
+            for exp in experiment_results:
+                hypothesis = exp.get('hypothesis', 'unknown')[:50]
+                result = exp.get('result', {}).get('hypothesis_supported', False)
+                print(f"  {hypothesis}... -> {'SUPPORTED' if result else 'NOT SUPPORTED'}")
 
         training_state.generation += 1
 

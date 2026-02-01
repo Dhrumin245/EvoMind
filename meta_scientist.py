@@ -1,6 +1,9 @@
 import numpy as np
 from scipy import stats
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Sequence
+from failure_analyzer import FailureAnalyzer
+from knowledge_base import KnowledgeBase
+from genome import EvolvableGenome
 
 class HypothesisEngine:
     """Generate testable hypotheses about learning"""
@@ -268,3 +271,297 @@ class ExperimentDesigner:
         effect_size = mean_diff / pooled_std if pooled_std > 0 else 0
 
         return float(np.asarray(p_value).item()), float(np.asarray(effect_size).item())
+
+
+class MetaScientist:
+    """Orchestrates the complete meta-scientific pipeline"""
+
+    def __init__(self, knowledge_base_path: str = "meta_scientist_kb.db"):
+        self.failure_analyzer = FailureAnalyzer()
+        self.hypothesis_engine = HypothesisEngine()
+        self.experiment_designer = ExperimentDesigner()
+        self.knowledge_base = KnowledgeBase(knowledge_base_path)
+        self.experiment_history = []
+
+    def analyze_population_failures(self, population: Sequence[Any], task_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze failures across a population and generate insights
+
+        Args:
+            population: List of genomes to analyze
+            task_info: Information about the current task/environment
+
+        Returns:
+            Analysis results with diagnoses, hypotheses, and recommendations
+        """
+        print("Meta-Scientist: Analyzing population failures...")
+
+        # Diagnose failures for each genome
+        failure_data = []
+        for genome in population:
+            diagnosis = self.failure_analyzer.diagnose_failure(genome, task_info)
+            failure_data.append({
+                'genome_id': genome.genome_id,
+                'fitness': genome.fitness,
+                'diagnosis': diagnosis
+            })
+
+        # Get population statistics
+        population_stats = self._compute_population_stats(population)
+
+        # Generate hypotheses from failure patterns
+        hypotheses = self.hypothesis_engine.generate_hypothesis(failure_data, population_stats)
+
+        # Get systemic failure patterns
+        systemic_fixes = self.failure_analyzer.suggest_systemic_fixes()
+
+        return {
+            'failure_data': failure_data,
+            'population_stats': population_stats,
+            'hypotheses': hypotheses,
+            'systemic_fixes': systemic_fixes,
+            'total_failures': len([f for f in failure_data if f['diagnosis']['total_severity'] > 0.5])
+        }
+
+    def run_automated_experiments(self, hypotheses: List[Dict[str, Any]], population: Sequence[Any],
+                                task_info: Dict[str, Any], generation: int) -> List[Dict[str, Any]]:
+        """
+        Run automated experiments to test hypotheses
+
+        Args:
+            hypotheses: List of hypotheses to test
+            population: Current population for baseline
+            task_info: Task information
+            generation: Current generation number
+
+        Returns:
+            List of experiment results
+        """
+        print(f"Meta-Scientist: Running {len(hypotheses)} automated experiments...")
+
+        experiment_results = []
+
+        # Limit to top 3 hypotheses to avoid excessive computation
+        for hypothesis in hypotheses[:3]:
+            try:
+                # Design experiment
+                experiment_design = self.experiment_designer.design_experiment(hypothesis['statement'])
+
+                # Run experiment (currently simulated)
+                result = self.experiment_designer.run_experiment(experiment_design)
+
+                # Store result
+                experiment_record = {
+                    'generation': generation,
+                    'hypothesis': hypothesis['statement'],
+                    'hypothesis_confidence': hypothesis['confidence'],
+                    'experiment_design': experiment_design,
+                    'result': result,
+                    'timestamp': np.datetime64('now'),
+                    'task_info': task_info
+                }
+
+                experiment_results.append(experiment_record)
+                self.experiment_history.append(experiment_record)
+
+                # Store in knowledge base
+                self._store_experiment_in_kb(experiment_record)
+
+                print(f"  Experiment completed: {hypothesis['statement'][:50]}... -> {'SUPPORTED' if result['hypothesis_supported'] else 'NOT SUPPORTED'}")
+
+            except Exception as e:
+                print(f"  Experiment failed for hypothesis '{hypothesis['statement']}': {e}")
+                continue
+
+        return experiment_results
+
+    def learn_from_experiments(self, experiment_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Extract knowledge and principles from experiment results
+
+        Args:
+            experiment_results: Results from recent experiments
+
+        Returns:
+            Learning outcomes and new principles
+        """
+        print("Meta-Scientist: Learning from experiment results...")
+
+        learning_outcomes = {
+            'new_principles': [],
+            'theory_updates': [],
+            'strategy_recommendations': []
+        }
+
+        # Extract principles from successful experiments
+        successful_experiments = [exp for exp in experiment_results if exp['result']['hypothesis_supported']]
+
+        if successful_experiments:
+            principle = self.knowledge_base.extract_principle(successful_experiments)
+            if principle:
+                learning_outcomes['new_principles'].append(principle)
+                print(f"  New principle extracted: {principle.rule[:50]}...")
+
+        # Update hypothesis confidence based on results
+        for exp in experiment_results:
+            hypothesis = exp['hypothesis']
+            supported = exp['result']['hypothesis_supported']
+
+            # Find matching theory and update confidence
+            theories = self.knowledge_base.query(hypothesis)
+            for theory_result in theories:
+                if theory_result['type'] == 'theory':
+                    theory = theory_result['content']
+                    if supported:
+                        # Increase confidence for supported hypotheses
+                        theory.confidence = min(1.0, theory.confidence + 0.1)
+                        theory.validation_count += 1
+                    else:
+                        # Add as counter-example
+                        self.knowledge_base.add_counter_example(
+                            theory.statement,
+                            {
+                                'experiment': exp,
+                                'reason': 'hypothesis_not_supported',
+                                'evidence': exp['result']
+                            }
+                        )
+                    self.knowledge_base.save()
+
+        return learning_outcomes
+
+    def generate_recommendations(self, analysis_results: Dict[str, Any], experiment_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Generate actionable recommendations for the evolution system
+
+        Args:
+            analysis_results: Results from failure analysis
+            experiment_results: Results from experiments
+
+        Returns:
+            Recommendations for system improvement
+        """
+        recommendations = {
+            'immediate_fixes': [],
+            'systemic_changes': [],
+            'research_directions': []
+        }
+
+        # Immediate fixes from failure analysis
+        for fix in analysis_results.get('systemic_fixes', []):
+            recommendations['immediate_fixes'].append(fix)
+
+        # Systemic changes from successful experiments
+        successful_experiments = [exp for exp in experiment_results if exp['result']['hypothesis_supported']]
+        for exp in successful_experiments:
+            if exp['result']['effect_size'] > 0.5:  # Large effect
+                recommendations['systemic_changes'].append({
+                    'change_type': 'parameter_adjustment',
+                    'description': f"Implement changes suggested by: {exp['hypothesis']}",
+                    'expected_impact': exp['result']['effect_size'],
+                    'confidence': exp['result']['confidence']
+                })
+
+        # Research directions from failed experiments
+        failed_experiments = [exp for exp in experiment_results if not exp['result']['hypothesis_supported']]
+        if failed_experiments:
+            recommendations['research_directions'].append({
+                'direction': 'investigate_alternative_hypotheses',
+                'description': f"Test alternative explanations for {len(failed_experiments)} rejected hypotheses",
+                'priority': 'medium'
+            })
+
+        return recommendations
+
+    def get_meta_scientific_report(self, generation: int) -> Dict[str, Any]:
+        """
+        Generate a comprehensive meta-scientific report
+
+        Args:
+            generation: Current generation
+
+        Returns:
+            Complete report on meta-scientific activities
+        """
+        kb_stats = self.knowledge_base.get_statistics()
+
+        return {
+            'generation': generation,
+            'experiments_conducted': len(self.experiment_history),
+            'knowledge_base_stats': kb_stats,
+            'recent_hypotheses': len([h for h in self.experiment_history if h['generation'] == generation]),
+            'learning_efficiency': self._calculate_learning_efficiency()
+        }
+
+    def _compute_population_stats(self, population: Sequence[Any]) -> Dict[str, Any]:
+        """Compute statistics about the current population"""
+        if not population:
+            return {}
+
+        fitnesses = [g.fitness for g in population]
+        ages = [getattr(g, 'age', 0) for g in population]
+
+        return {
+            'population_size': len(population),
+            'mean_fitness': float(np.mean(fitnesses)),
+            'std_fitness': float(np.std(fitnesses)),
+            'min_fitness': float(np.min(fitnesses)),
+            'max_fitness': float(np.max(fitnesses)),
+            'mean_age': float(np.mean(ages)),
+            'diversity_score': self._calculate_diversity(population)
+        }
+
+    def _calculate_diversity(self, population: Sequence[Any]) -> float:
+        """Calculate population diversity based on genome parameters"""
+        if len(population) < 2:
+            return 0.0
+
+        # Simple diversity based on meta-parameters
+        meta_params = []
+        for genome in population:
+            meta = getattr(genome, 'meta', {})
+            meta_params.append([
+                meta.get('reward_gain', 1.0),
+                meta.get('plastic_lr', 1.0),
+                meta.get('reward_bias', 0.0)
+            ])
+
+        # Calculate average pairwise distance
+        distances = []
+        for i in range(len(meta_params)):
+            for j in range(i+1, len(meta_params)):
+                dist = np.linalg.norm(np.array(meta_params[i]) - np.array(meta_params[j]))
+                distances.append(dist)
+
+        return float(np.mean(distances)) if distances else 0.0
+
+    def _store_experiment_in_kb(self, experiment_record: Dict[str, Any]):
+        """Store experiment result in knowledge base"""
+        # Create a theory if hypothesis was supported
+        if experiment_record['result']['hypothesis_supported']:
+            theory_data = {
+                'statement': experiment_record['hypothesis'],
+                'evidence': {
+                    'experiment_result': experiment_record['result'],
+                    'generation': experiment_record['generation'],
+                    'task_info': experiment_record['task_info']
+                },
+                'confidence': experiment_record['result']['confidence'],
+                'domain': experiment_record['task_info'].get('domain', 'evolution')
+            }
+
+            try:
+                self.knowledge_base.add_theory(theory_data)
+            except Exception as e:
+                print(f"Failed to store theory in KB: {e}")
+
+    def _calculate_learning_efficiency(self) -> float:
+        """Calculate how efficiently the meta-scientist is learning"""
+        if not self.experiment_history:
+            return 0.0
+
+        # Efficiency based on ratio of supported hypotheses
+        supported = sum(1 for exp in self.experiment_history if exp['result']['hypothesis_supported'])
+        total = len(self.experiment_history)
+
+        return supported / total if total > 0 else 0.0
