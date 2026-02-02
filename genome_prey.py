@@ -13,7 +13,7 @@ class PreyGenome(Genome):
         return cls(
             input_size=input_size,
             output_size=output_size,
-            init_layers=3,
+            init_modules=3,
             init_neurons=12
         )
 

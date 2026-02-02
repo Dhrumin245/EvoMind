@@ -13,7 +13,7 @@ class PredatorGenome(Genome):
         return cls(
             input_size=input_size,
             output_size=output_size,
-            init_layers=4,
+            init_modules=4,
             init_neurons=16
         )
 

@@ -58,11 +58,13 @@ from genome import Genome as EvolvableGenome
 # Import multi-task generalization harness
 from multi_task_harness import (
     get_multi_task_evaluator, TaskSuite, GeneralizationReport,
-    MultiTaskEvaluator, get_default_task_suite
+    MultiTaskEvaluator, get_default_task_suite, TaskType, BenchmarkResult
 )
 
 # Import meta-scientist system
 from meta_scientist import MetaScientist
+from task_generator import DiagnosticTaskGenerator
+from meta_optimizer import EvolutionModifier
 from typing import Sequence
 
 # Import meta-evolution populations
@@ -209,6 +211,39 @@ def select_multi_agent_stage(generation: int, config: EvolutionConfig) -> Curric
     else:
         return CurriculumStage.ADVERSARIAL  # Advanced pack dynamics
 
+def _select_primary_failure_diagnosis(failure_data: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not failure_data:
+        return None
+
+    return max(
+        failure_data,
+        key=lambda f: f.get('diagnosis', {}).get('total_severity', 0.0)
+    ).get('diagnosis')
+
+def _map_target_capability_to_task_types(target_capability: Optional[str]) -> List[TaskType]:
+    mapping = {
+        'architectural_capacity': [TaskType.ARENA_CONFIG, TaskType.CURRICULUM_STAGE],
+        'learning_plasticity': [TaskType.CURRICULUM_STAGE],
+        'exploration_balance': [TaskType.FOOD_DISTRIBUTION],
+        'temporal_credit_assignment': [TaskType.PREDATOR_PREY_RATIO],
+        'learning_stability': [TaskType.SENSOR_NOISE, TaskType.ENERGY_DYNAMICS],
+        'generalization_ability': [TaskType.ARENA_CONFIG, TaskType.SENSOR_NOISE],
+    }
+    return mapping.get(target_capability or '', [TaskType.CURRICULUM_STAGE])
+
+def _build_targeted_task_suite(target_capability: Optional[str], generation: int, max_tasks: int = 6) -> TaskSuite:
+    base_suite = get_default_task_suite()
+    task_types = _map_target_capability_to_task_types(target_capability)
+
+    tasks = [task for task in base_suite.tasks if task.task_type in task_types]
+    if not tasks:
+        tasks = base_suite.sample_tasks(max_tasks, seed=generation)
+
+    if len(tasks) > max_tasks:
+        tasks = tasks[:max_tasks]
+
+    return TaskSuite(tasks=tasks, base_seed=base_suite.base_seed)
+
 def evaluate_population_parallel(
     population,
     opponents,
@@ -245,7 +280,7 @@ def evaluate_population_parallel(
         for opp_idx in opp_indices:
             opponent = opponents[opp_idx]
             if is_prey_evaluation:
-                fitness, _ = evaluate_multi_agent_pair(
+                (prey_result, _) = evaluate_multi_agent_pair(
                     genome,
                     opponent,
                     arena,
@@ -253,8 +288,9 @@ def evaluate_population_parallel(
                     max_steps,
                     do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
                 )
+                fitness = prey_result[0]
             else:
-                _, fitness = evaluate_multi_agent_pair(
+                (_, pred_result) = evaluate_multi_agent_pair(
                     opponent,
                     genome,
                     arena,
@@ -262,6 +298,7 @@ def evaluate_population_parallel(
                     max_steps,
                     do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
                 )
+                fitness = pred_result[0]
             genome_fitnesses.append(fitness)
 
         avg_fitness = float(np.mean(genome_fitnesses)) if genome_fitnesses else 0.0
@@ -312,8 +349,14 @@ def evaluate_population_serial(
         ppo_trainer = PPOTrainer(ppo_config)
 
     for genome in population:
+        # Ensure TorchBrain is built before any PPO usage
+        brain = genome.get_brain()
+        if hasattr(brain, "layers") and len(brain.layers) == 0:
+            brain.build_from_genome(genome)
+        brain_ready = hasattr(brain, "layers") and len(brain.layers) > 0
+
         # PPO inner-loop training before evaluation
-        if enable_ppo_inner_loop and ppo_trainer is not None:
+        if enable_ppo_inner_loop and ppo_trainer is not None and brain_ready:
             print(f"  Training genome {genome.genome_id} with PPO for {ppo_training_steps} steps...")
 
             # Create environment function for PPO training
@@ -321,15 +364,17 @@ def evaluate_population_serial(
                 return arena  # Use the same arena instance
 
             # Train with PPO
-            training_stats = ppo_trainer.train(genome.brain, env_fn, num_steps=ppo_training_steps)
+            training_stats = ppo_trainer.train(brain, env_fn, num_steps=ppo_training_steps)
             print(f"    PPO training completed: final reward {training_stats['final_reward']:.2f}")
+        elif enable_ppo_inner_loop and ppo_trainer is not None and not brain_ready:
+            print(f"  Skipping PPO for genome {genome.genome_id} (brain has no layers)")
 
         opp_indices = np.random.choice(len(opponents), size=num_opponents, replace=False)
         genome_fitnesses = []
         for opp_idx in opp_indices:
             opponent = opponents[opp_idx]
             if is_prey_evaluation:
-                fitness, _ = evaluate_multi_agent_pair(
+                (prey_result, _) = evaluate_multi_agent_pair(
                     genome,
                     opponent,
                     arena,
@@ -337,8 +382,9 @@ def evaluate_population_serial(
                     max_steps,
                     do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
                 )
+                fitness = prey_result[0]
             else:
-                _, fitness = evaluate_multi_agent_pair(
+                (_, pred_result) = evaluate_multi_agent_pair(
                     opponent,
                     genome,
                     arena,
@@ -346,6 +392,7 @@ def evaluate_population_serial(
                     max_steps,
                     do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
                 )
+                fitness = pred_result[0]
             genome_fitnesses.append(fitness)
 
         avg_fitness = float(np.mean(genome_fitnesses)) if genome_fitnesses else 0.0
@@ -1374,6 +1421,7 @@ def save_coevolution_state(training_state: TrainingState, filename: str = "coevo
         'best_predator_fitness_history': training_state.best_predator_fitness_history,
         'generation_stats': training_state.generation_stats,
         'experiment_reports': [exp.__dict__ for exp in training_state.experiment_reports],
+        'generalization_reports': [r.to_dict() for r in training_state.generalization_reports],
     }
 
     # Save prey population
@@ -1436,10 +1484,23 @@ def load_coevolution_state(filename: str = "coevolution_state.json") -> Training
     training_state.best_prey_fitness_history = state['best_prey_fitness_history']
     training_state.best_predator_fitness_history = state['best_predator_fitness_history']
     training_state.generation_stats = state['generation_stats']
-    training_state.generalization_reports = [
-        r if isinstance(r, GeneralizationReport) else GeneralizationReport(**r)
-        for r in state.get('generalization_reports', [])
-    ]
+    training_state.generalization_reports = []
+    for r in state.get('generalization_reports', []):
+        if isinstance(r, GeneralizationReport):
+            training_state.generalization_reports.append(r)
+            continue
+
+        benchmark_results = [
+            b if isinstance(b, BenchmarkResult) else BenchmarkResult.from_dict(b)
+            for b in r.get('benchmark_results', [])
+        ]
+        training_state.generalization_reports.append(
+            GeneralizationReport(
+                generation=r.get('generation', training_state.generation),
+                genome_id=r.get('genome_id', 'unknown'),
+                benchmark_results=benchmark_results,
+            )
+        )
     
     print(f"Co-evolution state loaded: {filename}")
     print(f"Generation: {training_state.generation}")
@@ -1547,6 +1608,11 @@ async def main_coevolution_async():
     architect_population = ArchitectPopulation(population_size=20)
     mutator_population = MutatorPopulation(population_size=15)
 
+    # Initialize meta-scientist systems
+    meta_scientist = MetaScientist()
+    evolution_modifier = EvolutionModifier()
+    diagnostic_task_generator = DiagnosticTaskGenerator()
+
     # Training loop
     for generation in range(training_state.generation, config.generations):
         # Get current stage from curriculum controller
@@ -1643,9 +1709,6 @@ async def main_coevolution_async():
             # Milestone 7: Run integrated meta-scientist experiments
             print("Running integrated meta-scientist experiments...")
 
-            # Initialize meta-scientist system
-            meta_scientist = MetaScientist()
-
             # Analyze population failures and generate hypotheses
             combined_population = cast(List[EvolvableGenome], training_state.prey_population + training_state.predator_population)
             task_info = {'name': stage_name, 'generation': generation}
@@ -1655,6 +1718,44 @@ async def main_coevolution_async():
                 task_info
             )
 
+            # Build diagnostic task suite based on primary failure mode
+            worst_diagnosis = _select_primary_failure_diagnosis(analysis_results.get('failure_data', []))
+            if worst_diagnosis:
+                diagnostic_tasks = diagnostic_task_generator.generate_task_suite(
+                    worst_diagnosis.get('diagnosis', worst_diagnosis)
+                )
+                target_capability = diagnostic_tasks[0].target_capability if diagnostic_tasks else None
+
+                diagnostic_suite = _build_targeted_task_suite(target_capability, generation, max_tasks=6)
+                diagnostic_evaluator = MultiTaskEvaluator(diagnostic_suite, base_seed=config.base_seed)
+
+                diagnostic_report = diagnostic_evaluator.run_subset_evaluation(
+                    top_prey_genome,
+                    num_tasks=min(6, len(diagnostic_suite.tasks)),
+                    generation=generation,
+                    hall_of_fame_prey=training_state.prey_hall_of_fame,
+                    hall_of_fame_pred=training_state.predator_hall_of_fame,
+                    current_prey=training_state.prey_population,
+                    current_pred=training_state.predator_population,
+                )
+                training_state.generalization_reports.append(diagnostic_report)
+
+                stage_candidates = [
+                    r for r in diagnostic_report.benchmark_results
+                    if r.metadata.get('task_type') == TaskType.CURRICULUM_STAGE.value
+                ]
+                if stage_candidates:
+                    worst_stage = min(stage_candidates, key=lambda r: r.fitness)
+                    stage_name_candidate = worst_stage.metadata.get('curriculum_stage')
+                    if stage_name_candidate and population_stats['mean'] > 0:
+                        threshold = population_stats['mean'] * 0.5
+                        if worst_stage.fitness < threshold:
+                            print(
+                                f"[Curriculum] Diagnostic focus: {stage_name_candidate} "
+                                f"(fitness {worst_stage.fitness:.2f} < {threshold:.2f})"
+                            )
+                            curriculum_controller.reset_to_stage(CurriculumStage[stage_name_candidate])
+
             # Run automated experiments based on hypotheses
             experiment_results = meta_scientist.run_automated_experiments(
                 analysis_results['hypotheses'],
@@ -1662,6 +1763,36 @@ async def main_coevolution_async():
                 task_info,
                 generation
             )
+
+            # Learn from experiments and update knowledge base
+            meta_scientist.learn_from_experiments(experiment_results)
+
+            # Apply meta-optimizer changes to evolution engines
+            if experiment_results:
+                experiment_payload = {
+                    'experiments': [
+                        {
+                            'fitness': exp.get('result', {}).get('effect_size', 0.0),
+                            'parameters': {
+                                'mutation_rate': prey_engine.mutation_rate,
+                                'mutation_strength': prey_engine.mutation_strength,
+                                'selection_pressure': getattr(prey_engine.selector, 'selection_pressure', 1.0),
+                                'novelty_weight': getattr(prey_engine, 'novelty_weight', 0.5),
+                            }
+                        }
+                        for exp in experiment_results
+                    ]
+                }
+
+                modifications = evolution_modifier.optimize_evolution(experiment_payload)
+
+                for mod in modifications:
+                    if hasattr(prey_engine, mod['parameter']):
+                        setattr(prey_engine, mod['parameter'], mod['new_value'])
+                    if hasattr(predator_engine, mod['parameter']):
+                        setattr(predator_engine, mod['parameter'], mod['new_value'])
+                    if hasattr(config, mod['parameter']):
+                        setattr(config, mod['parameter'], mod['new_value'])
 
             # Store experiment reports and learn from results
             for exp in experiment_results:

@@ -716,6 +716,9 @@ class TorchBrain(nn.Module):
         if hasattr(genome, 'modules') and genome.modules:
             # Build modular architecture
             self._build_modular_architecture(genome)
+            # Fallback: also build linear layers for forward compatibility
+            if not self.layers:
+                self._build_linear_architecture(genome)
         else:
             # Build legacy linear architecture
             self._build_linear_architecture(genome)

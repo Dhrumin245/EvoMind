@@ -450,6 +450,7 @@ class MultiTaskEvaluator:
                 'task_type': task.task_type.value,
                 'num_opponents': num_opponents,
                 'arena_config': arena_config,
+                'curriculum_stage': task.curriculum_stage.name,
             }
         )
 
