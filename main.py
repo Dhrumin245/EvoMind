@@ -9,6 +9,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import warnings
+import logging
 import numpy as np
 import asyncio
 import json
@@ -149,8 +150,10 @@ class EvolutionConfig:
     # Weight used by fitness shaping (currently EpisodeMetrics.novelty is a stub)
     novelty_weight: float = 0.2
     # PPO inner-loop training
+    # WARNING: PPO contradicts NeuroGenesis - evolution should discover learning rules, not gradients
+    # Only enable if using PPO as a teacher/baseline, NOT for modifying genome weights
     ppo_training_steps: int = 100  # Number of PPO training steps per genome
-    enable_ppo_inner_loop: bool = True  # Enable/disable PPO training before evaluation
+    enable_ppo_inner_loop: bool = False  # DISABLED: Gradient-based learning conflicts with evolved plasticity
     
     def __post_init__(self):
         """Validate configuration"""
@@ -357,7 +360,7 @@ def evaluate_population_serial(
 
         # PPO inner-loop training before evaluation
         if enable_ppo_inner_loop and ppo_trainer is not None and brain_ready:
-            print(f"  Training genome {genome.genome_id} with PPO for {ppo_training_steps} steps...")
+            print(f"  Training genome {genome.genome_id} (gen {genome.age}) with PPO for {ppo_training_steps} steps...", flush=True)
 
             # Create environment function for PPO training
             def env_fn():
@@ -365,9 +368,9 @@ def evaluate_population_serial(
 
             # Train with PPO
             training_stats = ppo_trainer.train(brain, env_fn, num_steps=ppo_training_steps)
-            print(f"    PPO training completed: final reward {training_stats['final_reward']:.2f}")
+            print(f"    PPO training completed: final reward {training_stats['final_reward']:.2f}", flush=True)
         elif enable_ppo_inner_loop and ppo_trainer is not None and not brain_ready:
-            print(f"  Skipping PPO for genome {genome.genome_id} (brain has no layers)")
+            print(f"  Skipping PPO for genome {genome.genome_id} (brain has no layers)", flush=True)
 
         opp_indices = np.random.choice(len(opponents), size=num_opponents, replace=False)
         genome_fitnesses = []
@@ -414,9 +417,9 @@ async def train_coevolution_async(
     """
     Async training step for co-evolution
     """
-    print(f"\n Generation {generation} - Stage: {stage.name}")
-    print(f" Prey Population: {len(training_state.prey_population)}")
-    print(f" Predator Population: {len(training_state.predator_population)}")
+    print(f"\n Generation {generation} - Stage: {stage.name}", flush=True)
+    print(f" Prey Population: {len(training_state.prey_population)}", flush=True)
+    print(f" Predator Population: {len(training_state.predator_population)}", flush=True)
     
     # Get stage configuration
     stage_config = get_stage_config(stage)
@@ -615,6 +618,26 @@ async def train_coevolution_async(
         stats['prey_novelty'] = {'mean': 0.0, 'max': 0.0, 'p95': 0.0, 'archive': {'size': 0, 'avg_fitness': 0.0, 'generations_covered': 0}}
         stats['predator_novelty'] = {'mean': 0.0, 'max': 0.0, 'p95': 0.0, 'archive': {'size': 0, 'avg_fitness': 0.0, 'generations_covered': 0}}
     
+    # Calculate neural health metrics across population
+    total_dead_layers = 0
+    total_saturated_layers = 0
+    genomes_with_issues = 0
+    for genome in combined_population:
+        if hasattr(genome, 'brain') and hasattr(genome.brain, 'activation_stats'):
+            for stat in genome.brain.activation_stats:
+                if stat.get('dead_ratio', 0) > 0.5:
+                    total_dead_layers += 1
+                if stat.get('saturated_ratio', 0) > 0.5:
+                    total_saturated_layers += 1
+            if genome.brain.activation_stats:
+                genomes_with_issues += 1
+    
+    stats['neural_health'] = {
+        'dead_layers': total_dead_layers,
+        'saturated_layers': total_saturated_layers,
+        'genomes_analyzed': genomes_with_issues
+    }
+    
     # Log generation
     log_coevolution_generation(stats)
 
@@ -622,10 +645,12 @@ async def train_coevolution_async(
     from behavioral_probes import BehavioralProbe
     # Create properly typed list for behavioral probes
     evolvable_genomes: List[EvolvableGenome] = list(combined_population)
+    # Only save probe reports at checkpoint intervals to avoid file system spam
+    save_probe_reports = (generation % training_state.config.plot_every == 0) if training_state.config.plot_every > 0 else False
     probe_integration_results = BehavioralProbe.integrate_with_evaluation_pipeline(
         evolvable_genomes,
         generation=generation,
-        save_reports=True
+        save_reports=save_probe_reports
     )
 
     # Add probe results to stats
@@ -975,6 +1000,7 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
 
 def log_coevolution_generation(stats: Dict[str, Any]):
     """Log co-evolution generation statistics with metrics decomposition"""
+    logger = logging.getLogger('coevolution')
     print(f"{'='*80}")
     print(f"Generation {stats['generation']:04d} - {stats['stage']}")
     print(f"{'-'*80}")
@@ -988,6 +1014,13 @@ def log_coevolution_generation(stats: Dict[str, Any]):
         print(f"Adaptability: {stats['avg_adaptability_score']:.3f} | Meta Effectiveness: {stats['avg_meta_effectiveness']:.3f}")
     if 'mean_plastic_norm' in stats:
         print(f"Plastic Norms: Mean {stats['mean_plastic_norm']:.4f} | Max {stats['max_plastic_norm']:.4f} | 95th {stats['p95_plastic_norm']:.4f}")
+
+    # Neural health summary (replaces per-layer spam)
+    neural_health = stats.get('neural_health')
+    if neural_health and neural_health.get('genomes_analyzed', 0) > 0:
+        dead = neural_health['dead_layers']
+        saturated = neural_health['saturated_layers']
+        print(f"Neural Health: {dead} dead layers, {saturated} saturated (evolutionary pressure active)")
 
     # Milestone 4: speciation + novelty summary
     prey_species = stats.get('prey_species')
@@ -1510,6 +1543,15 @@ def load_coevolution_state(filename: str = "coevolution_state.json") -> Training
 
 async def main_coevolution_async():
     """Main async co-evolution training loop with adaptive curriculum"""
+    # Configure logging for immediate visibility
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()  # Output to console
+        ]
+    )
+
     print("Starting Co-Evolution Training with Adaptive Curriculum")
     print("=" * 60)
 

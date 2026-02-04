@@ -908,11 +908,14 @@ class TorchBrain(nn.Module):
         stats = self.activation_monitor.check_layer(activations, activation_name)
         self.activation_stats.append(stats)
 
-        # Log warnings on threshold violations
-        if stats['dead_ratio'] > 0.5:
-            self.logger.warning(f"Layer {layer_idx}: High dead neuron ratio ({stats['dead_ratio']:.3f})")
-        if stats['saturated_ratio'] > 0.5:
-            self.logger.warning(f"Layer {layer_idx}: High saturation ratio ({stats['saturated_ratio']:.3f})")
+        # SILENCED: Per-layer warnings spam the terminal and hide generation summaries
+        # Dead/saturated neurons are now handled via fitness penalties in compute_fitness_from_metrics()
+        # Evolution will naturally select against these pathologies
+        # Uncomment for debugging specific genomes:
+        # if stats['dead_ratio'] > 0.5:
+        #     self.logger.warning(f"Layer {layer_idx}: High dead neuron ratio ({stats['dead_ratio']:.3f})")
+        # if stats['saturated_ratio'] > 0.5:
+        #     self.logger.warning(f"Layer {layer_idx}: High saturation ratio ({stats['saturated_ratio']:.3f})")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the compiled network"""
