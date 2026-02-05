@@ -547,6 +547,131 @@ class ActivationMonitor:
         }
 
 
+class NeuralHealthController:
+    """Neural Health Controller - turns dead neurons into evolutionary pressure"""
+
+    def __init__(self):
+        self.dead_neuron_threshold = 0.1  # 10% dead neurons triggers intervention
+        self.saturation_threshold = 0.5   # 50% saturation triggers intervention
+        self.health_history = []  # Track health over episodes
+        self.mutation_triggers = {
+            'skip_connection': False,
+            'activation_mutation': False,
+            'layer_reinit': False,
+            'architecture_change': False
+        }
+
+    def assess_network_health(self, brain: "TorchBrain") -> Dict[str, Any]:
+        """Assess overall neural health of the network"""
+        if not hasattr(brain, 'activation_stats') or not brain.activation_stats:
+            return {'healthy': True, 'dead_layers': 0, 'saturated_layers': 0}
+
+        dead_layers = 0
+        saturated_layers = 0
+        total_dead_ratio = 0.0
+        total_saturated_ratio = 0.0
+
+        for stats in brain.activation_stats:
+            if stats.get('dead_ratio', 0) > self.dead_neuron_threshold:
+                dead_layers += 1
+            if stats.get('saturated_ratio', 0) > self.saturation_threshold:
+                saturated_layers += 1
+            total_dead_ratio += stats.get('dead_ratio', 0)
+            total_saturated_ratio += stats.get('saturated_ratio', 0)
+
+        avg_dead_ratio = total_dead_ratio / len(brain.activation_stats) if brain.activation_stats else 0
+        avg_saturated_ratio = total_saturated_ratio / len(brain.activation_stats) if brain.activation_stats else 0
+
+        # Determine if network needs intervention
+        needs_intervention = (
+            dead_layers > 0 or
+            saturated_layers > len(brain.activation_stats) * 0.3 or
+            avg_dead_ratio > 0.05 or
+            avg_saturated_ratio > 0.3
+        )
+
+        health_score = 1.0 - min(1.0, (avg_dead_ratio * 2.0 + avg_saturated_ratio))
+
+        health_data = {
+            'healthy': not needs_intervention,
+            'health_score': health_score,
+            'dead_layers': dead_layers,
+            'saturated_layers': saturated_layers,
+            'avg_dead_ratio': avg_dead_ratio,
+            'avg_saturated_ratio': avg_saturated_ratio,
+            'needs_intervention': needs_intervention
+        }
+
+        self.health_history.append(health_data)
+
+        # Keep only recent history
+        if len(self.health_history) > 10:
+            self.health_history = self.health_history[-10:]
+
+        return health_data
+
+    def get_fitness_penalty(self, brain: "TorchBrain") -> float:
+        """Calculate fitness penalty based on neural health"""
+        health_data = self.assess_network_health(brain)
+
+        if health_data['healthy']:
+            return 0.0
+
+        # Heavy penalty for dead neurons (multiplicative)
+        dead_penalty = 1.0
+        if health_data['dead_layers'] > 0:
+            dead_penalty = 0.5 ** health_data['dead_layers']  # Exponential decay
+
+        # Penalty for saturation
+        saturation_penalty = max(0.0, health_data['avg_saturated_ratio'] - 0.2) * 0.1
+
+        # Overall health score penalty
+        health_penalty = (1.0 - health_data['health_score']) * 0.2
+
+        total_penalty = dead_penalty * (1.0 - saturation_penalty - health_penalty)
+
+        return max(0.1, total_penalty)  # Minimum fitness floor
+
+    def trigger_mutations(self, brain: "TorchBrain", genome) -> Dict[str, bool]:
+        """Determine which mutations to trigger based on neural health"""
+        health_data = self.assess_network_health(brain)
+
+        # Reset triggers
+        self.mutation_triggers = {k: False for k in self.mutation_triggers}
+
+        if not health_data['needs_intervention']:
+            return self.mutation_triggers
+
+        # Trigger mutations based on specific issues
+        if health_data['dead_layers'] > 0:
+            self.mutation_triggers['skip_connection'] = True
+            self.mutation_triggers['layer_reinit'] = True
+
+        if health_data['saturated_layers'] > len(brain.activation_stats) * 0.5:
+            self.mutation_triggers['activation_mutation'] = True
+
+        if health_data['avg_dead_ratio'] > 0.2:
+            self.mutation_triggers['architecture_change'] = True
+
+        return self.mutation_triggers
+
+    def get_health_summary(self, brain: "TorchBrain") -> str:
+        """Get human-readable health summary"""
+        health_data = self.assess_network_health(brain)
+
+        if health_data['healthy']:
+            return "Neural health: Good"
+
+        issues = []
+        if health_data['dead_layers'] > 0:
+            issues.append(f"{health_data['dead_layers']} dead layers")
+        if health_data['saturated_layers'] > 0:
+            issues.append(f"{health_data['saturated_layers']} saturated layers")
+
+        health_pct = health_data['health_score'] * 100
+        return f"Neural health: {health_pct:.1f}% ({', '.join(issues)})"
+
+
 class CollapseDetector:
     """Detect and prevent network collapse"""
     def __init__(self):

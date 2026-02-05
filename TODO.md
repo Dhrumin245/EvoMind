@@ -1,38 +1,52 @@
-# Architect & Mutator Populations Integration
+# NeuroGenesis PPO Conflict Fix - Implementation Plan
 
-## Task Overview
+## Current Status
 
-Integrate ArchitectPopulation and MutatorPopulation classes into the main evolution loop in main.py to enable meta-evolution alongside prey and predator populations.
+- PPO is already disabled in main.py (enable_ppo_inner_loop = False)
+- Dead neuron warnings are silenced in torch_brain.py
+- Basic fitness penalties exist for dead units
 
-## Completed Tasks
+## Required Changes
 
-- [x] Added import for ArchitectPopulation and MutatorPopulation from evolution module
-- [x] Initialized architect_population (size=20) and mutator_population (size=15) in main_coevolution_async()
-- [x] Added meta-evolution logic in train_coevolution_async() function:
-  - Prepare performance data for meta-evolution
-  - Call evolve_architectures() and evolve_mutators() methods
-  - Use evolved mutation strategies to adapt main evolution engines
-  - Log meta-evolution progress
-- [x] Verified syntax correctness with py_compile
+### 1. Add Neural Health Controller to TorchBrain
 
-## Integration Details
+- [ ] Create NeuralHealthController class in torch_brain.py
+- [ ] Detect dead neurons per layer (activation ratio < 1e-6)
+- [ ] Detect saturated neurons per layer
+- [ ] Track neural health metrics across episodes
+- [ ] Trigger architecture mutations when health is poor
 
-- **ArchitectPopulation**: Evolves architecture patterns that can influence genome creation/mutations
-- **MutatorPopulation**: Evolves mutation strategies that adapt mutation rates in main evolution engines
-- **Performance Data**: Feeds generation stats (fitness, diversity, adaptability) to meta-evolution
-- **Adaptive Rates**: Uses evolved strategies to dynamically adjust mutation rates in prey/predator engines
+### 2. Enhance Fitness Computation
 
-## Next Steps
+- [ ] Modify compute_fitness_from_metrics in main.py
+- [ ] Add heavy penalties for dead neurons (multiplicative penalty)
+- [ ] Add penalties for saturated neurons
+- [ ] Make dead neurons strongly reduce fitness to create evolutionary pressure
 
-- [ ] Test integration by running a short training session to ensure no runtime errors
-- [ ] Monitor meta-evolution progress logs during training
-- [ ] Verify that mutation rates are being adapted based on meta-evolution results
-- [ ] Consider adding meta-evolution metrics to training statistics and plots
+### 3. Stabilize Plasticity Updates
 
-## Files Modified
+- [ ] Review PlasticLinear.apply_plasticity in torch_brain.py
+- [ ] Ensure plasticity doesn't conflict with base weights
+- [ ] Add stability monitoring and adaptive clamping
+- [ ] Prevent runaway plasticity that causes dead neurons
 
-- main.py: Added imports, initialization, and integration logic
+### 4. Add Architecture Mutation Triggers
 
-## Status
+- [ ] When dead neurons detected, trigger mutations:
+  - [ ] Skip connection insertion
+  - [ ] Activation function mutation
+  - [ ] Layer reinitialization
+- [ ] Make mutations more aggressive for unhealthy networks
 
-✅ Integration implemented and syntax verified. Ready for testing.
+### 5. Update Logging and Monitoring
+
+- [ ] Replace silenced warnings with evolutionary health summaries
+- [ ] Log neural health metrics per generation
+- [ ] Track recovery from dead neuron states
+
+## Testing
+
+- [ ] Verify dead neurons are penalized in fitness
+- [ ] Check that unhealthy networks mutate more aggressively
+- [ ] Ensure plasticity updates don't cause dead neurons
+- [ ] Confirm no PPO conflicts remain

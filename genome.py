@@ -1203,6 +1203,147 @@ class EvolvableGenome:
         for i in range(len(self.modules) - 1):
             self.module_connections.append((i, i + 1))
 
+    def repair_dead_layers(self, dead_layer_indices: List[int]):
+        """
+        Architectural repair mechanisms: Death → mutation, not just penalty
+
+        Args:
+            dead_layer_indices: List of gene indices that are dead
+        """
+        if not dead_layer_indices:
+            return
+
+        # Apply different repair strategies based on dead layer patterns
+        for gene_idx in dead_layer_indices:
+            if gene_idx >= len(self.genes):
+                continue
+
+            gene = self.genes[gene_idx]
+
+            # Strategy 1: Mutate activation function (most common fix)
+            if random.random() < 0.6:
+                old_activation = gene.activation
+                gene.activation = ActivationFunction.get_random_activation()
+                # Avoid getting stuck in the same activation
+                while gene.activation == old_activation and random.random() < 0.8:
+                    gene.activation = ActivationFunction.get_random_activation()
+
+            # Strategy 2: Insert skip connection to bypass dead layer
+            elif random.random() < 0.3 and gene_idx > 0:
+                # Add skip connection from earlier layer
+                skip_target = random.randint(0, gene_idx - 1)
+                gene.skip_connection = True
+                gene.skip_target = skip_target
+                gene.skip_gate = random.uniform(0.3, 0.7)  # Learned gate
+
+            # Strategy 3: Split layer (add intermediate representation)
+            elif random.random() < 0.2 and len(self.genes) < self.max_layers:
+                self._split_layer(gene_idx)
+
+            # Strategy 4: Prune and reconnect (remove dead subgraph)
+            elif random.random() < 0.1:
+                self._prune_dead_subgraph(gene_idx)
+
+        # Update dimensions and caches after repairs
+        self._update_gene_dimensions()
+        self.invalidate_caches()
+
+    def _split_layer(self, gene_idx: int):
+        """Split a dead layer into two smaller layers"""
+        if gene_idx >= len(self.genes) or len(self.genes) >= self.max_layers:
+            return
+
+        gene = self.genes[gene_idx]
+
+        # Create intermediate dimension
+        intermediate_dim = max(self.min_neurons,
+                              min(self.max_neurons,
+                                  (gene.input_dim + gene.output_dim) // 2))
+
+        # Create two new genes to replace the dead one
+        gene1 = NeuralGene(
+            gene_id=f"{gene.gene_id}_split1",
+            input_dim=gene.input_dim,
+            output_dim=intermediate_dim,
+            activation=ActivationFunction.get_random_activation(),
+            use_bias=True,
+            plasticity=np.random.uniform(-0.1, 0.1, (intermediate_dim, gene.input_dim)).astype(np.float32)
+        )
+        gene1.initialize_weights(method="he_normal", scale=0.1)
+
+        gene2 = NeuralGene(
+            gene_id=f"{gene.gene_id}_split2",
+            input_dim=intermediate_dim,
+            output_dim=gene.output_dim,
+            activation=gene.activation,  # Keep original activation for output layer
+            use_bias=True,
+            plasticity=np.random.uniform(-0.1, 0.1, (gene.output_dim, intermediate_dim)).astype(np.float32)
+        )
+        gene2.initialize_weights(method="he_normal", scale=0.1)
+
+        # Replace the dead gene with the two new genes
+        self.genes[gene_idx:gene_idx+1] = [gene1, gene2]
+
+        # Update gene IDs
+        for i, g in enumerate(self.genes):
+            g.gene_id = f"layer_{i}"
+
+    def _prune_dead_subgraph(self, start_gene_idx: int):
+        """Prune dead subgraph starting from given gene"""
+        if start_gene_idx >= len(self.genes) - 1:  # Don't prune output layer
+            return
+
+        # Find connected dead genes (simplified: just remove this gene and reconnect)
+        if len(self.genes) <= self.min_layers:
+            return
+
+        # Remove the dead gene
+        removed_gene = self.genes.pop(start_gene_idx)
+
+        # Update skip targets for remaining genes
+        for gene in self.genes:
+            if gene.skip_connection:
+                if gene.skip_target == start_gene_idx:
+                    gene.skip_connection = False
+                    gene.skip_target = -1
+                elif gene.skip_target > start_gene_idx:
+                    gene.skip_target -= 1
+
+        # Update gene IDs
+        for i, gene in enumerate(self.genes):
+            gene.gene_id = f"layer_{i}"
+
+    def repair_saturated_layers(self, saturated_layer_indices: List[int]):
+        """
+        Repair saturated layers (opposite of dead layers)
+
+        Args:
+            saturated_layer_indices: List of gene indices that are saturated
+        """
+        for gene_idx in saturated_layer_indices:
+            if gene_idx >= len(self.genes):
+                continue
+
+            gene = self.genes[gene_idx]
+
+            # Strategy 1: Change to more stable activation
+            if random.random() < 0.5:
+                stable_activations = ['tanh', 'sigmoid', 'elu', 'selu']
+                if gene.activation not in stable_activations:
+                    gene.activation = random.choice(stable_activations)
+
+            # Strategy 2: Add regularization (dropout)
+            elif random.random() < 0.3:
+                gene.dropout_rate = min(0.5, gene.dropout_rate + 0.1)
+
+            # Strategy 3: Add batch normalization
+            elif random.random() < 0.2 and not gene.batch_norm:
+                gene.batch_norm = True
+                gene.bn_gamma = np.ones(gene.output_dim, dtype=np.float32)
+                gene.bn_beta = np.zeros(gene.output_dim, dtype=np.float32)
+                gene.bn_running_mean = np.zeros(gene.output_dim, dtype=np.float32)
+                gene.bn_running_var = np.ones(gene.output_dim, dtype=np.float32)
+
     def get_execution_order(self) -> List[int]:
         """Get topological execution order for modules (handles DAG)"""
         # For now, simple chain execution

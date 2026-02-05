@@ -55,6 +55,7 @@ from ppo_trainer import PPOTrainer, PPOConfig
 from genome_prey import PreyGenome
 from genome_predator import PredatorGenome, PredatorPackBrain
 from genome import Genome as EvolvableGenome
+from torch_brain import TorchBrain
 
 # Import multi-task generalization harness
 from multi_task_harness import (
@@ -149,11 +150,10 @@ class EvolutionConfig:
 
     # Weight used by fitness shaping (currently EpisodeMetrics.novelty is a stub)
     novelty_weight: float = 0.2
-    # PPO inner-loop training
-    # WARNING: PPO contradicts NeuroGenesis - evolution should discover learning rules, not gradients
-    # Only enable if using PPO as a teacher/baseline, NOT for modifying genome weights
+    # PPO inner-loop training - DISABLED: Contradicts NeuroGenesis philosophy
+    # PPO belongs ONLY as a teacher for curriculum shaping, not lifetime learning
     ppo_training_steps: int = 100  # Number of PPO training steps per genome
-    enable_ppo_inner_loop: bool = False  # DISABLED: Gradient-based learning conflicts with evolved plasticity
+    enable_ppo_inner_loop: bool = False  # PERMANENTLY DISABLED: Evolution discovers learning rules, not gradients
     
     def __post_init__(self):
         """Validate configuration"""
@@ -332,45 +332,25 @@ def evaluate_population_serial(
     num_opponents,
     is_prey_evaluation,
     nonplastic_check_fraction: float,
-    enable_ppo_inner_loop: bool = True,
-    ppo_training_steps: int = 100,
 ):
     """Serial evaluation that reuses a single arena instance.
 
     This is typically fastest and most stable on Windows because:
     - NumPy/PyTorch already use native threads internally
     - Opponent brains are mutated during rollouts (thread sharing is unsafe)
+
+    NOTE: PPO is PERMANENTLY DISABLED - contradicts NeuroGenesis philosophy.
+    Lifetime learning happens via evolved plasticity rules, not gradients.
     """
     fitnesses: List[float] = []
     if len(population) == 0 or len(opponents) == 0 or num_opponents <= 0:
         return fitnesses
 
-    # Initialize PPO trainer if needed
-    ppo_trainer = None
-    if enable_ppo_inner_loop:
-        ppo_config = PPOConfig(num_steps=ppo_training_steps)
-        ppo_trainer = PPOTrainer(ppo_config)
-
     for genome in population:
-        # Ensure TorchBrain is built before any PPO usage
+        # Ensure TorchBrain is built for plasticity
         brain = genome.get_brain()
         if hasattr(brain, "layers") and len(brain.layers) == 0:
             brain.build_from_genome(genome)
-        brain_ready = hasattr(brain, "layers") and len(brain.layers) > 0
-
-        # PPO inner-loop training before evaluation
-        if enable_ppo_inner_loop and ppo_trainer is not None and brain_ready:
-            print(f"  Training genome {genome.genome_id} (gen {genome.age}) with PPO for {ppo_training_steps} steps...", flush=True)
-
-            # Create environment function for PPO training
-            def env_fn():
-                return arena  # Use the same arena instance
-
-            # Train with PPO
-            training_stats = ppo_trainer.train(brain, env_fn, num_steps=ppo_training_steps)
-            print(f"    PPO training completed: final reward {training_stats['final_reward']:.2f}", flush=True)
-        elif enable_ppo_inner_loop and ppo_trainer is not None and not brain_ready:
-            print(f"  Skipping PPO for genome {genome.genome_id} (brain has no layers)", flush=True)
 
         opp_indices = np.random.choice(len(opponents), size=num_opponents, replace=False)
         genome_fitnesses = []
@@ -640,6 +620,8 @@ async def train_coevolution_async(
     
     # Log generation
     log_coevolution_generation(stats)
+    if evaluator is not None:
+        evaluator.log_seed_coverage(generation)
 
     # Integrate behavioral probes for comprehensive evaluation
     from behavioral_probes import BehavioralProbe
@@ -763,8 +745,8 @@ def _to_numpy(x):
     """Convert torch tensors or other array-likes to numpy arrays."""
     return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
 
-def compute_fitness_from_metrics(metrics: EpisodeMetrics) -> float:
-    """Compute scalar fitness from metrics decomposition"""
+def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[TorchBrain]" = None) -> float:
+    """Compute scalar fitness from metrics decomposition with neural health penalties"""
     # Weighted combination of metrics for fitness
     # Primary: episode return (main objective)
     # Secondary: success bonus, learning speed, stability penalty, energy efficiency
@@ -795,6 +777,13 @@ def compute_fitness_from_metrics(metrics: EpisodeMetrics) -> float:
         fitness -= float(metrics.saturation_penalty)
     if metrics.dead_unit_penalty is not None:
         fitness -= float(metrics.dead_unit_penalty)
+
+    # NEURAL HEALTH CONTROLLER: Apply heavy penalties for dead neurons
+    # This turns dead neurons into evolutionary pressure rather than runtime errors
+    if brain is not None and hasattr(brain, 'neural_health_controller'):
+        torch_brain = cast(TorchBrain, brain)
+        health_penalty = torch_brain.neural_health_controller.get_fitness_penalty(torch_brain)  # type: ignore[attr-defined]
+        fitness *= health_penalty  # Multiplicative penalty for dead neurons
 
     return float(fitness)
 

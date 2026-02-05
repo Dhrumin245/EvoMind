@@ -980,15 +980,23 @@ class GenomeDistance:
         self.param_weight = param_weight
 
     def calculate_distance(self, genome1: EvolvableGenome, genome2: EvolvableGenome) -> float:
-        """Calculate overall distance between two genomes"""
+        """Calculate overall distance between two genomes with topology-aware and plasticity-aware speciation"""
         arch_dist = self._architecture_distance(genome1, genome2)
         behavior_dist = self._behavior_distance(genome1, genome2)
         param_dist = self._parameter_distance(genome1, genome2)
 
+        # Add topology-aware distance (structural connectivity patterns)
+        topology_dist = self._topology_distance(genome1, genome2)
+
+        # Add plasticity-aware distance (learning rule and meta-parameter differences)
+        plasticity_dist = self._plasticity_distance(genome1, genome2)
+
         total_distance = (
             self.architecture_weight * arch_dist +
             self.behavior_weight * behavior_dist +
-            self.param_weight * param_dist
+            self.param_weight * param_dist +
+            0.1 * topology_dist +  # Weight for topology awareness
+            0.15 * plasticity_dist  # Weight for plasticity awareness
         )
 
         return float(total_distance)
@@ -1080,6 +1088,79 @@ class GenomeDistance:
             param_dist += min(rule_diff / 10.0, 1.0) * 0.5
 
         return float(param_dist)
+
+    def _topology_distance(self, genome1: EvolvableGenome, genome2: EvolvableGenome) -> float:
+        """Calculate topology-aware distance (structural connectivity patterns)"""
+        # Compare skip connections and module connections
+        topology_dist = 0.0
+
+        # Compare skip connection patterns
+        skip1 = [getattr(g, 'skip_connection', False) for g in genome1.genes]
+        skip2 = [getattr(g, 'skip_connection', False) for g in genome2.genes]
+
+        min_len = min(len(skip1), len(skip2))
+        if min_len > 0:
+            skip_diff = sum(s1 != s2 for s1, s2 in zip(skip1[:min_len], skip2[:min_len]))
+            topology_dist += skip_diff / min_len * 0.5
+
+        # Compare module connections if they exist
+        if hasattr(genome1, 'module_connections') and hasattr(genome2, 'module_connections'):
+            conn1 = getattr(genome1, 'module_connections', [])
+            conn2 = getattr(genome2, 'module_connections', [])
+
+            if conn1 and conn2:
+                # Simple connection count difference
+                conn_diff = abs(len(conn1) - len(conn2))
+                max_conn = max(len(conn1), len(conn2))
+                topology_dist += min(conn_diff / max(max_conn, 1), 1.0) * 0.5
+
+        return float(topology_dist)
+
+    def _plasticity_distance(self, genome1: EvolvableGenome, genome2: EvolvableGenome) -> float:
+        """Calculate plasticity-aware distance (learning rule and meta-parameter differences)"""
+        plasticity_dist = 0.0
+
+        # Compare meta-parameters
+        meta1 = getattr(genome1, 'meta', {})
+        meta2 = getattr(genome2, 'meta', {})
+
+        meta_keys = set(meta1.keys()) | set(meta2.keys())
+        meta_diffs = []
+
+        for key in meta_keys:
+            val1 = meta1.get(key, 0.0)
+            val2 = meta2.get(key, 0.0)
+            if abs(val1 + val2) > 1e-6:  # Avoid division by zero
+                diff = abs(val1 - val2) / (abs(val1 + val2) / 2.0)  # Relative difference
+                meta_diffs.append(diff)
+
+        if meta_diffs:
+            plasticity_dist += np.mean(meta_diffs) * 0.6
+
+        # Compare learning rule networks if they exist
+        lr1 = getattr(genome1, 'learning_rule_net', None)
+        lr2 = getattr(genome2, 'learning_rule_net', None)
+
+        if lr1 is not None and lr2 is not None and hasattr(lr1, 'get_parameters_as_dict') and hasattr(lr2, 'get_parameters_as_dict'):
+            try:
+                params1 = lr1.get_parameters_as_dict()
+                params2 = lr2.get_parameters_as_dict()
+
+                rule_diffs = []
+                for key in set(params1.keys()) | set(params2.keys()):
+                    val1 = params1.get(key, 0.0)
+                    val2 = params2.get(key, 0.0)
+                    if abs(val1 + val2) > 1e-6:
+                        diff = abs(val1 - val2) / (abs(val1 + val2) / 2.0)
+                        rule_diffs.append(diff)
+
+                if rule_diffs:
+                    plasticity_dist += np.mean(rule_diffs) * 0.4
+            except Exception:
+                # If parameter extraction fails, skip learning rule comparison
+                pass
+
+        return float(min(plasticity_dist, 1.0))
 
 
 @dataclass

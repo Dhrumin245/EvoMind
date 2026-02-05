@@ -1,6 +1,7 @@
 """Asynchronous evaluator with deterministic seeds"""
 import asyncio
 import concurrent.futures
+import logging
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any, cast
 from deterministic_env import DeterministicSeedManager
@@ -552,6 +553,52 @@ class AsyncDeterministicEvaluator:
     def get_seed_info(self) -> Dict:
         """Get seed information"""
         return self.seed_manager.get_seed_registry()
+
+    def summarize_seed_coverage(self, generation: int, max_examples: int = 5) -> Dict[str, Any]:
+        """Summarize deterministic seed coverage for a generation."""
+        registry = self.seed_manager.get_seed_registry()
+        prefix = f"g{generation}_"
+        seeds = [seed for key, seed in registry.items() if key.startswith(prefix)]
+        if not seeds:
+            return {
+                "generation": generation,
+                "total": 0,
+                "unique": 0,
+                "min": None,
+                "max": None,
+                "examples": [],
+            }
+
+        unique_seeds = sorted(set(seeds))
+        return {
+            "generation": generation,
+            "total": len(seeds),
+            "unique": len(unique_seeds),
+            "min": min(seeds),
+            "max": max(seeds),
+            "examples": unique_seeds[:max_examples],
+        }
+
+    def log_seed_coverage(self, generation: int, max_examples: int = 5) -> None:
+        """Log seed coverage summary for a generation at INFO level."""
+        summary = self.summarize_seed_coverage(generation, max_examples=max_examples)
+        logger = logging.getLogger("seed_coverage")
+        if summary["total"] == 0:
+            logger.info("Seed coverage gen %d: none recorded", generation)
+            return
+
+        examples = ", ".join(str(s) for s in summary["examples"])
+        if summary["unique"] > len(summary["examples"]):
+            examples = f"{examples}, ..." if examples else "..."
+        logger.info(
+            "Seed coverage gen %d: %d evals, %d unique (min=%d, max=%d) examples=[%s]",
+            generation,
+            summary["total"],
+            summary["unique"],
+            summary["min"],
+            summary["max"],
+            examples,
+        )
     
     def close(self):
         """Cleanup resources"""

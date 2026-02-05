@@ -731,3 +731,78 @@ class CurriculumExperimentRunner:
             'statistically_significant': is_significant,
             'confidence_level': 1.0 - p_value
         }
+
+    def curriculum_reasoning(self, failure_analysis: Dict[str, Any], current_stage: CurriculumStage) -> Dict[str, Any]:
+        """
+        Curriculum reasoning: not thresholds, but intelligent adaptation
+        "Agents fail due to saturation" → "Introduce sparse sensory tasks"
+        "Isolate obstacle avoidance"
+
+        Args:
+            failure_analysis: Analysis of why agents are failing
+            current_stage: Current curriculum stage
+
+        Returns:
+            Dict with reasoning and recommended curriculum adjustments
+        """
+        reasoning = {
+            'failure_root_causes': [],
+            'recommended_actions': [],
+            'curriculum_adjustments': {},
+            'confidence': 0.0
+        }
+
+        # Analyze failure patterns
+        saturation_indicators = failure_analysis.get('saturation_indicators', {})
+        plasticity_issues = failure_analysis.get('plasticity_issues', {})
+        architectural_problems = failure_analysis.get('architectural_problems', {})
+
+        # Root cause analysis
+        if saturation_indicators.get('gradient_saturation', False):
+            reasoning['failure_root_causes'].append('gradient_saturation')
+            reasoning['recommended_actions'].append('introduce_sparse_sensory_tasks')
+            reasoning['curriculum_adjustments']['sensory_sparsity'] = 0.7
+            reasoning['curriculum_adjustments']['task_complexity'] = 'reduce'
+
+        if plasticity_issues.get('dead_layers', []) or architectural_problems.get('layer_collapse', False):
+            reasoning['failure_root_causes'].append('architectural_collapse')
+            reasoning['recommended_actions'].append('isolate_obstacle_avoidance')
+            reasoning['curriculum_adjustments']['task_type'] = 'obstacle_avoidance_only'
+            reasoning['curriculum_adjustments']['environment_complexity'] = 'minimal'
+
+        if saturation_indicators.get('meta_parameter_saturation', False):
+            reasoning['failure_root_causes'].append('meta_parameter_saturation')
+            reasoning['recommended_actions'].append('introduce_meta_learning_pause')
+            reasoning['curriculum_adjustments']['meta_learning_enabled'] = False
+            reasoning['curriculum_adjustments']['plasticity_freeze'] = True
+
+        if plasticity_issues.get('oscillating_plasticity', False):
+            reasoning['failure_root_causes'].append('plasticity_instability')
+            reasoning['recommended_actions'].append('stabilize_learning_rules')
+            reasoning['curriculum_adjustments']['learning_rule_regularization'] = 0.8
+            reasoning['curriculum_adjustments']['plasticity_bounds'] = 'tighten'
+
+        # Determine confidence based on evidence strength
+        evidence_count = len(reasoning['failure_root_causes'])
+        reasoning['confidence'] = min(evidence_count * 0.3, 1.0)
+
+        # Generate specific curriculum transitions
+        if reasoning['confidence'] > 0.5:
+            reasoning['curriculum_adjustments']['transition_reasoning'] = self._generate_transition_reasoning(
+                reasoning['failure_root_causes'], current_stage
+            )
+
+        return reasoning
+
+    def _generate_transition_reasoning(self, root_causes: List[str], current_stage: CurriculumStage) -> str:
+        """Generate human-readable reasoning for curriculum transitions"""
+        if 'gradient_saturation' in root_causes:
+            return "Agents showing gradient saturation - introducing sparse sensory tasks to encourage efficient feature learning"
+        elif 'architectural_collapse' in root_causes:
+            return "Architectural collapse detected - isolating obstacle avoidance to rebuild fundamental navigation skills"
+        elif 'meta_parameter_saturation' in root_causes:
+            return "Meta-parameters saturated - pausing meta-learning to allow weight consolidation"
+        elif 'plasticity_instability' in root_causes:
+            return "Plasticity oscillating - tightening learning rule bounds for stability"
+        else:
+            return "Multiple failure patterns detected - applying conservative curriculum adjustments"

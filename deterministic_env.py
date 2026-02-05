@@ -3,6 +3,7 @@ Deterministic environment implementations with seed control
 """
 import numpy as np
 import random
+import logging
 from typing import Optional, Dict, Any, Tuple, List
 import torch
 import matplotlib.pyplot as plt
@@ -66,7 +67,10 @@ class DeterministicVectorizedArena:
             self.shock_step = 300
             self.step_count = 0
 
-        print(f"DeterministicVectorizedArena initialized with seed={seed}")
+        logging.getLogger(__name__).debug(
+            "DeterministicVectorizedArena initialized with seed=%s",
+            seed,
+        )
     
     def reset(self) -> np.ndarray:
         """Reset all environments deterministically"""
