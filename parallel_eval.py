@@ -102,7 +102,7 @@ class BatchedGenomeEvaluator:
             actions_np = actions.cpu().numpy()
             
             # Step all environments
-            states_np, rewards_np, dones_np, infos = arena.step(actions_np)
+            states_np, rewards_np, dones_np = arena.step(actions_np)
             
             # Convert to tensors
             states_tensor = torch.from_numpy(states_np).float().to(self.device)
@@ -226,7 +226,7 @@ class BatchedGenomeEvaluator:
                 actions = genome.act_batch(states)
                 
                 # Step environment
-                states, rewards, dones, _ = arena.step(actions)
+                states, rewards, dones = arena.step(actions)
                 
                 # Update active mask
                 active = active & (~dones)
