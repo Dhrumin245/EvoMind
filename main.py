@@ -49,8 +49,8 @@ from curriculum.curriculum_controller import CurriculumController
 from evolution.evolution import EvolutionEngine
 from core.async_evaluator import AsyncDeterministicEvaluator
 # Import prey and predator genomes
-from genome_prey import PreyGenome
-from genome_predator import PredatorGenome, PredatorPackBrain
+from genomes.genome_prey import PreyGenome
+from genomes.genome_predator import PredatorGenome, PredatorPackBrain
 from core.genome import Genome as EvolvableGenome
 from core.torch_brain import TorchBrain
 
