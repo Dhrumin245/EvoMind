@@ -328,8 +328,8 @@ class AsyncDeterministicEvaluator:
         """
         # Import multi-agent modules inside the process/thread
         from environments.arena_multi import MultiAgentArena
-        from genome_prey import PreyGenome
-        from genome_predator import PredatorGenome
+        from genomes.genome_prey import PreyGenome
+        from genomes.genome_predator import PredatorGenome
         
         # Determine roles
         if isinstance(genome, PreyGenome) and isinstance(opponent_genome, PredatorGenome):
