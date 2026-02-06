@@ -26,7 +26,6 @@ try:
     import torch
 
     # In serial evaluation, allowing a few Torch threads can be faster.
-    # (We still cap MKL/OMP above to keep note-worthy slowdowns away.)
     cpu_count = os.cpu_count() or 4
     torch_threads = max(1, min(4, cpu_count))
     torch.set_num_threads(torch_threads)
@@ -42,35 +41,32 @@ os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame.pkgdata")
 
 # Import multi-agent modules
-from arena_multi import MultiAgentArena
-from self_play import evaluate_self_play, evolve_population
+from environments.arena_multi import MultiAgentArena
 
 # Import other modules
-from curriculum import CurriculumStage, get_stage_config
-from curriculum_controller import CurriculumController
-from evolution import EvolutionEngine
-from async_evaluator import AsyncDeterministicEvaluator
-from ppo_trainer import PPOTrainer, PPOConfig
+from curriculum.curriculum import CurriculumStage, get_stage_config
+from curriculum.curriculum_controller import CurriculumController
+from evolution.evolution import EvolutionEngine
+from core.async_evaluator import AsyncDeterministicEvaluator
 # Import prey and predator genomes
 from genome_prey import PreyGenome
 from genome_predator import PredatorGenome, PredatorPackBrain
-from genome import Genome as EvolvableGenome
-from torch_brain import TorchBrain
+from core.genome import Genome as EvolvableGenome
+from core.torch_brain import TorchBrain
 
 # Import multi-task generalization harness
-from multi_task_harness import (
+from meta.multi_task_harness import (
     get_multi_task_evaluator, TaskSuite, GeneralizationReport,
     MultiTaskEvaluator, get_default_task_suite, TaskType, BenchmarkResult
 )
 
 # Import meta-scientist system
-from meta_scientist import MetaScientist
-from task_generator import DiagnosticTaskGenerator
-from meta_optimizer import EvolutionModifier
-from typing import Sequence
+from meta.meta_scientist import MetaScientist
+from curriculum.task_generator import DiagnosticTaskGenerator
+from meta.meta_optimizer import EvolutionModifier
 
 # Import meta-evolution populations
-from evolution import ArchitectPopulation, MutatorPopulation
+from evolution.evolution import ArchitectPopulation, MutatorPopulation
 
 @dataclass
 class EpisodeMetrics:
@@ -151,7 +147,6 @@ class EvolutionConfig:
     # Weight used by fitness shaping (currently EpisodeMetrics.novelty is a stub)
     novelty_weight: float = 0.2
     # PPO inner-loop training - DISABLED: Contradicts NeuroGenesis philosophy
-    # PPO belongs ONLY as a teacher for curriculum shaping, not lifetime learning
     ppo_training_steps: int = 100  # Number of PPO training steps per genome
     enable_ppo_inner_loop: bool = False  # PERMANENTLY DISABLED: Evolution discovers learning rules, not gradients
     
@@ -493,7 +488,7 @@ async def train_coevolution_async(
     meta_bias = [g.meta["reward_bias"] for g in combined_population]
 
     # Log plastic weight norms per generation (sample once, not per update)
-    from torch_brain import PlasticLinear
+    from core.torch_brain import PlasticLinear
     # Only collect from the last evaluation to avoid O(steps × layers × population) growth
     plastic_norms = PlasticLinear.plastic_norms.copy()
     PlasticLinear.plastic_norms.clear()  # Clear for next generation
@@ -508,7 +503,6 @@ async def train_coevolution_async(
         max_plastic_norm = 0.0
         p95_plastic_norm = 0.0
 
-    # Calculate META-3.2 metrics: adaptability scores and meta-parameter effectiveness
     adaptability_scores = []
     meta_effectiveness_scores = []
 
@@ -516,7 +510,6 @@ async def train_coevolution_async(
         if hasattr(genome, 'plastic_diagnostics') and genome.plastic_diagnostics:
             plastic_usage = genome.plastic_diagnostics.get('mean_final_plastic_delta', 0.0)
 
-            # Calculate adaptability score (same logic as in evolution.py)
             if plastic_usage > 0:
                 plasticity_efficiency = 1.0 - abs(plastic_usage - 0.3) / 0.3
                 plasticity_efficiency = max(0.0, plasticity_efficiency)
@@ -571,7 +564,7 @@ async def train_coevolution_async(
         'config': stage_config
     }
 
-    # Speciation + novelty logging (Milestone 4)
+    # Speciation + novelty logging
     try:
         prey_species = prey_engine.compute_species_stats(cast(Any, training_state.prey_population), generation)
         predator_species = predator_engine.compute_species_stats(cast(Any, training_state.predator_population), generation)
@@ -624,7 +617,7 @@ async def train_coevolution_async(
         evaluator.log_seed_coverage(generation)
 
     # Integrate behavioral probes for comprehensive evaluation
-    from behavioral_probes import BehavioralProbe
+    from evaluation.behavioral_probes import BehavioralProbe
     # Create properly typed list for behavioral probes
     evolvable_genomes: List[EvolvableGenome] = list(combined_population)
     # Only save probe reports at checkpoint intervals to avoid file system spam
@@ -682,8 +675,6 @@ async def train_coevolution_async(
 
     return stats
 
-
-
 def evaluate_multi_agent_pair(
     prey_genome,
     predator_genome,
@@ -693,7 +684,7 @@ def evaluate_multi_agent_pair(
     do_nonplastic_compare: bool = True,
 ):
     """
-    Evaluate a single prey-predator pair in multi-agent arena with META-4 PRESSURE INJECTION
+    Evaluate a single prey-predator pair in multi-agent arena with PRESSURE INJECTION
     Returns: (prey_fitness, prey_metrics), (predator_fitness, predator_metrics)
     Enforces Condition A: Plastic agents outperform non-plastic agents within single lifetime
     """
@@ -771,7 +762,6 @@ def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[Torch
     # Novelty bonus
     fitness += metrics.novelty * 0.2
 
-    # Milestone 6: Add stability penalties to fitness shaping
     # Penalize networks with high saturation or dead units
     if metrics.saturation_penalty is not None:
         fitness -= float(metrics.saturation_penalty)
@@ -868,8 +858,8 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
         learning_speed=prey_learning_speed,
         stability=float(np.std(prey_rewards)) if prey_rewards else 0.0,
         energy_cost=prey_energy_cost,
-        complexity_penalty=0.0,  # TODO: implement complexity measure
-        novelty=0.0,  # TODO: compute novelty score
+        complexity_penalty=0.0,  # implement complexity measure
+        novelty=0.0,  # compute novelty score
         seed=seed or 0,
         stage=stage_name,
         opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None
@@ -933,8 +923,6 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
         # Use rewards directly (no pressure injection multiplier)
         prey_reward = _to_numpy(r_prey)
         pred_reward = _to_numpy(r_pred)
-
-        # NO PLASTICITY UPDATES - this is the key difference
 
         prey_total_reward += float(np.sum(prey_reward))
         predator_total_reward += float(np.sum(pred_reward))
@@ -1011,7 +999,7 @@ def log_coevolution_generation(stats: Dict[str, Any]):
         saturated = neural_health['saturated_layers']
         print(f"Neural Health: {dead} dead layers, {saturated} saturated (evolutionary pressure active)")
 
-    # Milestone 4: speciation + novelty summary
+    # speciation + novelty summary
     prey_species = stats.get('prey_species')
     predator_species = stats.get('predator_species')
     if isinstance(prey_species, dict) and isinstance(predator_species, dict):
@@ -1082,7 +1070,7 @@ def plot_plastic_norm_evolution(generation_stats: List[Dict[str, Any]]):
     # Plot mean plastic norm
     ax.plot(generations, mean_norms, 'b-', linewidth=2, label='Mean Plastic Norm', alpha=0.8)
 
-    # Plot max plastic norm (optional)
+    # Plot max plastic norm
     ax.plot(generations, max_norms, 'r--', linewidth=1.5, label='Max Plastic Norm', alpha=0.7)
 
     ax.set_title('Plastic Weight Norm Evolution')
@@ -1177,8 +1165,9 @@ def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome],
     print(f"Strategy clustering plot saved: strategy_clustering_gen_{generation:04d}.png")
 
 def evaluate_single_episode_with_logging(genome, seed: int, max_steps: int = 50) -> Dict[str, List[float]]:
+
     """Evaluate a single episode for a genome and log episode data for plotting"""
-    from deterministic_env import DeterministicVectorizedArena
+    from environments.deterministic_env import DeterministicVectorizedArena
 
     # Reset episode tracking
     if hasattr(genome, "brain"):
@@ -1270,7 +1259,7 @@ def plot_in_lifetime_learning_curve(generation: int, episode_data: Dict[str, Lis
 
     print(f"In-lifetime learning curve plot saved: in_lifetime_learning_curve_gen_{generation:04d}.png")
 
-# Milestone 7: Meta-scientist experiment runners
+# Meta-scientist experiment runners
 def run_ablation_frozen_learning_rule(genome, generation: int, stage_config, max_steps: int) -> ExperimentReport:
     """Run ablation experiment with frozen learning rule network"""
     # Create a copy of the genome with frozen learning rule
@@ -1674,7 +1663,7 @@ async def main_coevolution_async():
         training_state.update_hall_of_fame()
 
         # Compute diversity score from population
-        from population import Population
+        from core.population import Population
         combined_population = Population(size=0)
         combined_population.genomes = training_state.prey_population + training_state.predator_population
         diversity_score = combined_population.get_diversity_score()
