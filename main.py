@@ -3,11 +3,11 @@ import os
 
 # Configure threadpools BEFORE importing NumPy/Torch.
 # This prevents CPU oversubscription and huge slowdowns on Windows.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1") 
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-
+import torch
 import warnings
 import logging
 import numpy as np
@@ -1567,7 +1567,7 @@ async def main_coevolution_async():
     evaluator = AsyncDeterministicEvaluator(
         base_seed=config.base_seed,
         num_workers=config.num_workers,
-        use_gpu=False,
+        use_gpu=torch.cuda.is_available(),
         envs_per_genome=config.envs_per_genome,
         max_steps=config.max_steps
     )

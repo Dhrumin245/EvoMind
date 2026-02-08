@@ -8,6 +8,8 @@ from environments.deterministic_env import DeterministicVectorizedArena
 from curriculum.curriculum import CurriculumStage, get_stage_config
 import json
 import time
+from pathlib import Path
+
 
 
 @dataclass
@@ -950,7 +952,12 @@ class BehavioralProbe:
             ]
         }
 
-        with open(filename, 'w') as f:
+        base_dir = Path("artifacts/probes") / f"gen_{report.generation:04d}"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        filepath = base_dir / filename
+
+        with open(filepath, 'w') as f:
             json.dump(report_dict, f, indent=2, default=str)
 
     @staticmethod
@@ -959,13 +966,40 @@ class BehavioralProbe:
                                          save_reports: bool = True) -> Dict[str, Any]:
         """Integrate behavioral probes into the evaluation pipeline"""
         probe_reports = []
+        selected_genome_ids = set()
+
+        # Limit probe report saving to top K, novelty outliers (middle), failures, and random sample
+        if save_reports and genomes:
+            K = min(10, len(genomes) // 4)  # Adaptive K based on population size
+            sorted_genomes = sorted(genomes, key=lambda g: g.fitness, reverse=True)
+            selected_indices = set()
+
+            # Top K genomes
+            selected_indices.update(range(K))
+
+            # Bottom K genomes (failures)
+            selected_indices.update(range(len(genomes) - K, len(genomes)))
+
+            # Middle K genomes (novelty outliers proxy)
+            middle_start = len(genomes) // 2 - K // 2
+            middle_end = middle_start + K
+            selected_indices.update(range(max(0, middle_start), min(len(genomes), middle_end)))
+
+            # Random sample (5%)
+            random_sample_size = max(1, int(0.05 * len(genomes)))
+            random_indices = np.random.choice(len(genomes), size=random_sample_size, replace=False)
+            selected_indices.update(random_indices)
+
+            # Map back to original order
+            genome_to_index = {genome: i for i, genome in enumerate(genomes)}
+            selected_genome_ids = {genomes[i].genome_id for i in selected_indices}
 
         for genome in genomes:
             try:
                 report = BehavioralProbe.run_diagnostic_suite(genome, generation)
                 probe_reports.append(report)
 
-                if save_reports:
+                if save_reports and genome.genome_id in selected_genome_ids:
                     filename = f"probe_report_gen_{generation}_{genome.genome_id}.json"
                     BehavioralProbe.save_probe_report(report, filename)
 

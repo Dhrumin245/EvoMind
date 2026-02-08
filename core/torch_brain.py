@@ -796,6 +796,7 @@ class TorchBrain(nn.Module):
         # Track inference compilation state
         self._compiled_for_inference: bool = False
         self._compiled_device: Optional[str] = None
+        self.device = torch.device('cpu')
 
         # META parameters from genome
         self.meta = genome.meta if genome else {

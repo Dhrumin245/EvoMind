@@ -56,7 +56,6 @@ class AsyncDeterministicEvaluator:
         self.envs_per_genome = config.envs_per_genome
         self.max_steps = config.max_steps
         self.use_gpu = config.use_gpu
-        self.use_gpu = False  # Force CPU for async
         self.mode = config.mode
         
         # Seed manager - NO TIME-BASED OFFSETS
