@@ -1,6 +1,6 @@
 import numpy as np
-import torch
 import random
+import torch
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from core.genome import EvolvableGenome
@@ -9,8 +9,13 @@ from curriculum.curriculum import CurriculumStage, get_stage_config
 import json
 import time
 from pathlib import Path
+import threading
+import queue
 
 
+
+# Probe budget configuration
+PROBE_BUDGET = 10  # per generation
 
 @dataclass
 class ProbeResult:
@@ -33,9 +38,60 @@ class ProbeReport:
     summary_scores: Dict[str, float]
     behavioral_profile: Dict[str, Any]
 
-
 class BehavioralProbe:
     """Isolated skill testing for evolved neural networks"""
+
+    # Asynchronous logging queue
+    _log_queue = queue.Queue()
+    _log_thread = None
+    _stop_event = threading.Event()
+
+    @staticmethod
+    def start_async_logging():
+        """Start the background logging thread"""
+        if BehavioralProbe._log_thread is not None and BehavioralProbe._log_thread.is_alive():
+            return  # Already running
+
+        BehavioralProbe._stop_event.clear()
+        BehavioralProbe._log_thread = threading.Thread(target=BehavioralProbe._background_logger, daemon=True)
+        BehavioralProbe._log_thread.start()
+
+    @staticmethod
+    def stop_async_logging():
+        """Stop the background logging thread"""
+        if BehavioralProbe._log_thread is not None:
+            BehavioralProbe._stop_event.set()
+            BehavioralProbe._log_queue.put(None)  # Sentinel to wake up thread
+            BehavioralProbe._log_thread.join(timeout=5.0)
+            BehavioralProbe._log_thread = None
+
+    @staticmethod
+    def _background_logger():
+        """Background thread that writes probe reports to disk"""
+        while not BehavioralProbe._stop_event.is_set():
+            try:
+                # Get next report from queue with timeout
+                report_data = BehavioralProbe._log_queue.get(timeout=1.0)
+                if report_data is None:  # Sentinel value
+                    break
+
+                # Unpack the report data
+                report, filename = report_data
+
+                # Save the report (same logic as before)
+                base_dir = Path("artifacts/probes") / f"gen_{report['generation']:04d}"
+                base_dir.mkdir(parents=True, exist_ok=True)
+
+                filepath = base_dir / filename
+
+                with open(filepath, 'w') as f:
+                    json.dump(report, f, indent=2, default=str)
+
+            except queue.Empty:
+                continue  # Timeout, check stop event
+            except Exception as e:
+                print(f"Error in background logger: {e}")
+                continue
 
     @staticmethod
     def test_memory_capacity(genome: EvolvableGenome, sequence_length: int = 10) -> ProbeResult:
@@ -467,50 +523,80 @@ class BehavioralProbe:
     @staticmethod
     def run_diagnostic_suite(genome: EvolvableGenome, generation: int = 0) -> ProbeReport:
         """Run complete diagnostic suite on a genome"""
-        probe_results = []
+        with torch.no_grad():
+            probe_results = []
+            probe_errors = []
 
-        # Memory capacity test
-        memory_result = BehavioralProbe.test_memory_capacity(genome)
-        probe_results.append(memory_result)
+            def _run_probe(probe_name: str, probe_fn):
+                try:
+                    result = probe_fn()
+                    probe_results.append(result)
+                    return result
+                except Exception as exc:
+                    probe_errors.append({'probe_name': probe_name, 'error': str(exc)})
+                    return None
 
-        # Generalization test
-        train_envs = ['normal', 'noisy']
-        test_envs = ['sparse', 'dense', 'volatile']
-        generalization_result = BehavioralProbe.test_generalization(genome, train_envs, test_envs)
-        probe_results.append(generalization_result)
+            # Memory capacity test
+            memory_result = _run_probe('memory_capacity', lambda: BehavioralProbe.test_memory_capacity(genome))
 
-        # Learning speed test
-        learning_result = BehavioralProbe.test_learning_speed(genome, 'reversed_rewards')
-        probe_results.append(learning_result)
+            # Generalization test
+            train_envs = ['normal', 'noisy']
+            test_envs = ['sparse', 'dense', 'volatile']
+            generalization_result = _run_probe(
+                'generalization',
+                lambda: BehavioralProbe.test_generalization(genome, train_envs, test_envs)
+            )
 
-        # Credit assignment test
-        credit_result = BehavioralProbe.test_credit_assignment(genome, 'medium_delay')
-        probe_results.append(credit_result)
+            # Learning speed test
+            learning_result = _run_probe(
+                'learning_speed',
+                lambda: BehavioralProbe.test_learning_speed(genome, 'reversed_rewards')
+            )
 
-        # Additional diagnostic tasks
-        additional_probes = BehavioralProbe._run_additional_diagnostic_tasks(genome)
-        probe_results.extend(additional_probes)
+            # Credit assignment test
+            credit_result = _run_probe(
+                'credit_assignment',
+                lambda: BehavioralProbe.test_credit_assignment(genome, 'medium_delay')
+            )
 
-        # Calculate summary scores
-        summary_scores = {
-            'memory_capacity': memory_result.score,
-            'generalization': generalization_result.score,
-            'learning_speed': learning_result.score,
-            'credit_assignment': credit_result.score,
-            'overall_score': np.mean([r.score for r in probe_results])
-        }
+            # Additional diagnostic tasks
+            try:
+                additional_probes = BehavioralProbe._run_additional_diagnostic_tasks(genome)
+                probe_results.extend(additional_probes)
+            except Exception as exc:
+                probe_errors.append({'probe_name': 'additional_diagnostics', 'error': str(exc)})
 
-        # Create behavioral profile
-        behavioral_profile = BehavioralProbe._analyze_behavioral_profile(probe_results)
+            # Calculate summary scores
+            summary_scores = {}
+            if memory_result is not None:
+                summary_scores['memory_capacity'] = memory_result.score
+            if generalization_result is not None:
+                summary_scores['generalization'] = generalization_result.score
+            if learning_result is not None:
+                summary_scores['learning_speed'] = learning_result.score
+            if credit_result is not None:
+                summary_scores['credit_assignment'] = credit_result.score
 
-        return ProbeReport(
-            genome_id=genome.genome_id,
-            generation=generation,
-            timestamp=time.time(),
-            probe_results=probe_results,
-            summary_scores=summary_scores,
-            behavioral_profile=behavioral_profile
-        )
+            if probe_results:
+                summary_scores['overall_score'] = float(np.mean([r.score for r in probe_results]))
+            else:
+                summary_scores['overall_score'] = 0.0
+
+            # Create behavioral profile
+            behavioral_profile = BehavioralProbe._analyze_behavioral_profile(probe_results) if probe_results else {}
+            if probe_errors:
+                behavioral_profile = behavioral_profile or {}
+                behavioral_profile['partial'] = True
+                behavioral_profile['errors'] = probe_errors
+
+            return ProbeReport(
+                genome_id=genome.genome_id,
+                generation=generation,
+                timestamp=time.time(),
+                probe_results=probe_results,
+                summary_scores=summary_scores,
+                behavioral_profile=behavioral_profile
+            )
 
     @staticmethod
     def _run_additional_diagnostic_tasks(genome: EvolvableGenome) -> List[ProbeResult]:
@@ -935,7 +1021,7 @@ class BehavioralProbe:
 
     @staticmethod
     def save_probe_report(report: ProbeReport, filename: str):
-        """Save probe report to file"""
+        """Save probe report to file asynchronously"""
         report_dict = {
             'genome_id': report.genome_id,
             'generation': report.generation,
@@ -952,21 +1038,24 @@ class BehavioralProbe:
             ]
         }
 
-        base_dir = Path("artifacts/probes") / f"gen_{report.generation:04d}"
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        filepath = base_dir / filename
-
-        with open(filepath, 'w') as f:
-            json.dump(report_dict, f, indent=2, default=str)
+        # Push to async queue instead of writing directly
+        BehavioralProbe._log_queue.put((report_dict, filename))
 
     @staticmethod
     def integrate_with_evaluation_pipeline(genomes: List[EvolvableGenome],
                                          generation: int = 0,
                                          save_reports: bool = True) -> Dict[str, Any]:
         """Integrate behavioral probes into the evaluation pipeline"""
+        if generation < 3:
+            return {
+                'generation': generation,
+                'num_genomes_probed': 0,
+                'population_summary': {},
+                'individual_reports': []
+            }
         probe_reports = []
         selected_genome_ids = set()
+        probes_run = 0  # Track number of probes run this generation
 
         # Limit probe report saving to top K, novelty outliers (middle), failures, and random sample
         if save_reports and genomes:
@@ -995,9 +1084,22 @@ class BehavioralProbe:
             selected_genome_ids = {genomes[i].genome_id for i in selected_indices}
 
         for genome in genomes:
+            # Check probe budget - skip if exhausted
+            if probes_run >= PROBE_BUDGET:
+                print(f"Probe budget ({PROBE_BUDGET}) exhausted for generation {generation}, skipping remaining probes")
+                # EXIT THIS STAGE COMPLETELY
+                population_summary = BehavioralProbe._aggregate_population_results(probe_reports) if probe_reports else {}
+                return {
+                    'generation': generation,
+                    'num_genomes_probed': len(probe_reports),
+                    'population_summary': population_summary,
+                    'individual_reports': probe_reports
+                }
+
             try:
                 report = BehavioralProbe.run_diagnostic_suite(genome, generation)
                 probe_reports.append(report)
+                probes_run += 1
 
                 if save_reports and genome.genome_id in selected_genome_ids:
                     filename = f"probe_report_gen_{generation}_{genome.genome_id}.json"
@@ -1006,6 +1108,11 @@ class BehavioralProbe:
             except Exception as e:
                 print(f"Error running probes on genome {genome.genome_id}: {e}")
                 continue
+
+            # Memory cleanup after each genome
+            if hasattr(genome, 'brain') and genome.brain is not None:
+                genome.brain = None
+                torch.cuda.empty_cache()
 
         # Aggregate results across population
         if probe_reports:

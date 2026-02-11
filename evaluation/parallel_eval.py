@@ -18,10 +18,10 @@ class BatchedGenomeEvaluator:
     Supports both CPU and GPU evaluation with efficient kernel launches.
     """
     
-    def __init__(self, 
-                 num_envs_per_genome: int = 64,
+    def __init__(self,
+                 num_envs_per_genome: int = 4,
                  use_gpu: bool = False,
-                 max_workers: Optional[int] = None,
+                 max_workers: Optional[int] = 2,
                  curriculum_stage: CurriculumStage = CurriculumStage.FORAGING,
                  curriculum_config: Optional[Dict[str, Any]] = None):
         """
@@ -183,12 +183,22 @@ class BatchedGenomeEvaluator:
             results = list(executor.map(self._evaluate_single_genome_worker, args))
         
         # Update genome fitness
+        fitness_scores = []
         for i, genome in enumerate(genomes):
-            genome.fitness = float(results[i])
-        
+            result = results[i]
+            if isinstance(result, dict):
+                fitness = result.get("fitness", -1)
+                error = result.get("error")
+                if error:
+                    print(f"Genome {i} evaluation error: {error}")
+            else:
+                fitness = result
+            genome.fitness = float(fitness)
+            fitness_scores.append(fitness)
+
         self.eval_count += len(genomes)
-        
-        return np.array(results)
+
+        return np.array(fitness_scores)
     
     @staticmethod
     def _evaluate_single_genome_worker(args):
@@ -243,11 +253,11 @@ class BatchedGenomeEvaluator:
             else:
                 fitness = np.mean(total_reward)
             
-            return float(fitness)
+            return {"fitness": float(fitness), "error": None}
             
         except Exception as e:
             print(f"Error in worker (PID {os.getpid()}): {e}")
-            return 0.0
+            return {"fitness": -1, "error": str(e)}
     
     def _prepare_batched_weights(self, genomes: List) -> torch.Tensor:
         """

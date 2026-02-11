@@ -347,8 +347,12 @@ try:
                     dones[i] = True
                     continue
 
-                # Get result from future
-                obs, reward, done, _ = future.result()
+            # Get result from future
+                try:
+                    obs, reward, done, _ = future.result(timeout=30)
+                except TimeoutError:
+                    print("[ERROR] Worker hung, skipping genome")
+                    continue
 
                 # Update tracking (thread-safe with lock)
                 with self.lock:

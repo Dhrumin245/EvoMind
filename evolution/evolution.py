@@ -5,6 +5,7 @@ from core.genome import EvolvableGenome, NeuralGene, Genome
 from core.population import Population
 import math
 from dataclasses import dataclass, field
+import uuid
 
 
 class EvolutionMetrics:
@@ -554,6 +555,8 @@ class EvolutionEngine:
         novelty_threshold: float = 0.1,
         max_archive_size: int = 100,
         immigration_rate: float = 0.1,
+        architect_population=None,
+        mutator_population=None,
     ):
         self.population_size = population_size
         self.tournament_size = tournament_size
@@ -610,6 +613,7 @@ class EvolutionEngine:
 
         # Deterministic assignment given fixed genome order/fields.
         self.speciation_manager.speciate_population(genomes, generation)
+        print("[Evolution] Speciation done")
         return self.speciation_manager.get_species_stats()
 
     def _build_novelty_embedding(self, genome: 'EvolvableGenome', generation: int) -> 'BehaviorEmbedding':
@@ -707,7 +711,7 @@ class EvolutionEngine:
         """
         if not hasattr(genome, 'plastic_diagnostics'):
             return 0.0
-        
+
         plastic_diag = getattr(genome, 'plastic_diagnostics', None)
         if not plastic_diag:
             return 0.0
@@ -739,17 +743,21 @@ class EvolutionEngine:
             # High plastic_lr should correlate with high plasticity usage
             lr_effectiveness = min(plastic_lr / 10.0, 1.0) * (plastic_usage / 0.5)
             # Appropriate meta_gain should correlate with fitness improvement
-            gain_effectiveness = min(abs(meta_gain) / 5.0, 1.0)
+            gain_effectiveness = min(abs(meta_gain - 1.0) / 2.0, 1.0)  # Reward meta_gain close to 1.0
             meta_coherence = (lr_effectiveness + gain_effectiveness) / 2.0
 
         # 3. Stability bonus: reward genomes that maintain stability while adapting
         stability_bonus = stability * 0.3
 
-        # Combine scores
+        # 4. Meta-bias effectiveness: reward appropriate bias for the task
+        bias_effectiveness = 1.0 - min(abs(meta_bias) / 2.0, 1.0)  # Prefer small biases
+
+        # Combine scores with stronger meta-parameter weighting
         adaptability_score = (
-            plasticity_efficiency * 0.4 +      # 40% - efficient plasticity usage
+            plasticity_efficiency * 0.3 +      # 30% - efficient plasticity usage
             meta_coherence * 0.4 +             # 40% - well-tuned meta-parameters
-            stability_bonus * 0.2              # 20% - stability while adapting
+            stability_bonus * 0.2 +            # 20% - stability while adapting
+            bias_effectiveness * 0.1           # 10% - appropriate bias
         )
 
         return float(max(0.0, min(1.0, adaptability_score)))
@@ -798,7 +806,7 @@ class EvolutionEngine:
 
         return effective_fitness
 
-    def create_next_generation(self, population, generation: int):
+    def create_next_generation(self, population, generation: int, pop_name: Optional[str] = None):
         """
         CO-EVOLUTION SAFE
         - Never collapses population
@@ -811,10 +819,12 @@ class EvolutionEngine:
         # ----------------------------
         if isinstance(population, list):
             genomes = population
-            pop_name = "population"
+            resolved_name = pop_name or "population"
         else:
             genomes = population.genomes
-            pop_name = population.name
+            resolved_name = pop_name or population.name
+
+        print(f"[EVOLVE] {resolved_name} Generation {generation} START")
 
         # ----------------------------
         # SAFETY CHECK
@@ -823,7 +833,7 @@ class EvolutionEngine:
             print("⚠ Population empty — reinitializing")
             return Population(
                 size=self.population_size,
-                name=pop_name
+                name=pop_name or "population"
             )
 
         # Calculate effective fitness before normalization
@@ -841,6 +851,11 @@ class EvolutionEngine:
                     base_fitness, meta_gain, adaptability_score
                 )
                 genome.fitness = effective_fitness
+
+                # Plastic explosion penalty
+                mean_plastic_norm = genome.get_brain().get_mean_plastic_norm()
+                plastic_penalty = max(0.0, mean_plastic_norm - 2.0)
+                genome.fitness -= 0.5 * plastic_penalty
 
                 # META-3.2 learning rule regularization (now using learning_rule_net)
                 if hasattr(genome, 'learning_rule_net'):
@@ -868,6 +883,9 @@ class EvolutionEngine:
         # ----------------------------
         # OFFSPRING
         # ----------------------------
+        print("[Evolution] Selection start")
+        print("[Evolution] Crossover start")
+        print("[Evolution] Mutation start")
         while len(new_genomes) < self.population_size:
 
             parent1 = self.selector.select(genomes)
@@ -901,8 +919,9 @@ class EvolutionEngine:
         # ----------------------------
         # FINAL POPULATION
         # ----------------------------
-        new_population = Population(size=0, name=pop_name)
+        new_population = Population(size=0, name=pop_name or "population")
         new_population.genomes = new_genomes
+        print(f"[EVOLVE] {resolved_name} Generation {generation} END")
         return new_population
 
     
@@ -1434,7 +1453,7 @@ class ArchitectPopulation:
     """Population that evolves architectures"""
 
     def __init__(self, population_size: int = 20):
-        self.architecture_templates = []
+        self.architecture_templates: List[Dict[str, Any]] = []
         self.population_size = population_size
         self.generation = 0
         self.meta_fitness_history = []
@@ -1526,6 +1545,11 @@ class ArchitectPopulation:
             }
             self.architecture_templates.append(template)
 
+        # Seed templates if none exist yet to avoid empty-population stalls
+        if not self.architecture_templates:
+            for _ in range(min(5, self.population_size)):
+                self.architecture_templates.append(self._create_random_template())
+
         # Mutation: slightly modify existing templates
         for template in self.architecture_templates:
             if random.random() < 0.1:  # 10% mutation rate
@@ -1539,6 +1563,26 @@ class ArchitectPopulation:
                 parent2 = random.choice(self.architecture_templates)
                 child_template = self._crossover_templates(parent1, parent2)
                 self.architecture_templates.append(child_template)
+            else:
+                # Fallback: seed a random template to break empty-loop
+                self.architecture_templates.append(self._create_random_template())
+
+    def _create_random_template(self) -> Dict[str, Any]:
+        """Create a random architecture template for cold-start seeding"""
+        layer_count = random.randint(2, 5)
+        layer_pattern = [random.randint(4, 32) for _ in range(layer_count)]
+        activations = ['relu', 'tanh', 'sigmoid', 'leaky_relu']
+        activation_pattern = [random.choice(activations) for _ in range(layer_count)]
+        return {
+            'pattern': {
+                'layer_pattern': layer_pattern,
+                'activation_pattern': activation_pattern,
+                'skip_connections': random.randint(0, max(0, layer_count - 1))
+            },
+            'meta_fitness': 0.0,
+            'generation_discovered': self.generation,
+            'usage_count': 0
+        }
 
     def _mutate_template(self, template: Dict[str, Any]):
         """Mutate an architecture template"""
@@ -1675,6 +1719,11 @@ class MutatorPopulation:
             }
             self.mutation_strategies.append(strategy)
 
+        # Seed strategies if none exist yet to avoid empty-population stalls
+        if not self.mutation_strategies:
+            for _ in range(min(5, self.population_size)):
+                self.mutation_strategies.append(self._create_random_strategy())
+
         # Mutate existing strategies
         for strategy in self.mutation_strategies:
             if random.random() < 0.15:  # 15% mutation rate
@@ -1688,6 +1737,23 @@ class MutatorPopulation:
                 parent2 = random.choice(self.mutation_strategies)
                 child_strategy = self._crossover_strategies(parent1, parent2)
                 self.mutation_strategies.append(child_strategy)
+            else:
+                # Fallback: seed a random strategy to break empty-loop
+                self.mutation_strategies.append(self._create_random_strategy())
+
+    def _create_random_strategy(self) -> Dict[str, Any]:
+        """Create a random mutation strategy for cold-start seeding"""
+        params = {
+            'weight': random.uniform(0.05, 0.5),
+            'arch': random.uniform(0.05, 0.5),
+            'layer': random.uniform(0.05, 0.5),
+        }
+        return {
+            'parameters': params,
+            'meta_fitness': 0.0,
+            'generation_created': self.generation,
+            'usage_count': 0
+        }
 
     def _analyze_successful_patterns(self, mutation_effectiveness: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Analyze what made mutations successful"""

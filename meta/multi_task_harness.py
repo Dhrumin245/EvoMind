@@ -358,16 +358,16 @@ class GeneralizationReport:
         eval_times = [r.evaluation_time for r in self.benchmark_results]
 
         self.summary_stats = {
-            'mean_fitness': float(np.mean(fitnesses)),
-            'std_fitness': float(np.std(fitnesses)),
-            'min_fitness': float(np.min(fitnesses)),
-            'max_fitness': float(np.max(fitnesses)),
-            'median_fitness': float(np.median(fitnesses)),
+            'mean_fitness': float(np.mean(fitnesses)) if fitnesses else 0.0,
+            'std_fitness': float(np.std(fitnesses)) if fitnesses else 0.0,
+            'min_fitness': float(np.min(fitnesses)) if fitnesses else 0.0,
+            'max_fitness': float(np.max(fitnesses)) if fitnesses else 0.0,
+            'median_fitness': float(np.median(fitnesses)) if fitnesses else 0.0,
             'total_evaluation_time': float(np.sum(eval_times)),
-            'mean_evaluation_time': float(np.mean(eval_times)),
+            'mean_evaluation_time': float(np.mean(eval_times)) if eval_times else 0.0,
             'num_tasks_evaluated': len(self.benchmark_results),
-            'fitness_range': float(np.max(fitnesses) - np.min(fitnesses)),
-            'fitness_coefficient_of_variation': float(np.std(fitnesses) / np.mean(fitnesses)) if np.mean(fitnesses) != 0 else 0.0,
+            'fitness_range': float(np.max(fitnesses) - np.min(fitnesses)) if fitnesses else 0.0,
+            'fitness_coefficient_of_variation': float(np.std(fitnesses) / np.mean(fitnesses)) if fitnesses and np.mean(fitnesses) != 0 else 0.0,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -490,8 +490,8 @@ class MultiTaskEvaluator:
         opponents = []
 
         # Import here to avoid circular imports
-        from genome_prey import PreyGenome
-        from genome_predator import PredatorGenome
+        from genomes.genome_prey import PreyGenome
+        from genomes.genome_predator import PredatorGenome
 
         for _ in range(num_opponents):
             if isinstance(genome, PreyGenome):
@@ -507,8 +507,8 @@ class MultiTaskEvaluator:
         """
         Sample opponents from hall of fame and current populations using deterministic policy
         """
-        from genome_prey import PreyGenome
-        from genome_predator import PredatorGenome
+        from genomes.genome_prey import PreyGenome
+        from genomes.genome_predator import PredatorGenome
 
         # Determine opponent type needed
         is_prey_genome = isinstance(genome, PreyGenome)
@@ -557,8 +557,8 @@ class MultiTaskEvaluator:
         prey_state, pred_state = arena.reset()
 
         # Determine which is prey and which is predator
-        from genome_prey import PreyGenome
-        from genome_predator import PredatorGenome
+        from genomes.genome_prey import PreyGenome
+        from genomes.genome_predator import PredatorGenome
 
         if isinstance(genome1, PreyGenome):
             prey_genome, predator_genome = genome1, genome2

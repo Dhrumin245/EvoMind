@@ -1,6 +1,7 @@
 from core.genome import Genome
 import statistics
 import numpy as np
+import random
 from typing import List, Dict, Optional, Tuple
 
 class Population:
@@ -206,14 +207,20 @@ class Population:
         if len(self.genomes) < 2:
             return 0.0
 
-        # Calculate average pairwise Euclidean distance between genomes
+        sample = random.sample(self.genomes, min(20, len(self.genomes)))
+
+        # Calculate average pairwise Euclidean distance between sampled genomes
         distances = []
-        for i in range(len(self.genomes)):
-            for j in range(i + 1, len(self.genomes)):
+        for i in range(len(sample)):
+            for j in range(i + 1, len(sample)):
                 # Flatten all weights from genes into a single vector
-                weights_i = np.concatenate([gene.weights.flatten() for gene in self.genomes[i].genes])
-                weights_j = np.concatenate([gene.weights.flatten() for gene in self.genomes[j].genes])
-                distance = np.linalg.norm(weights_i - weights_j)
+                weights_i = np.concatenate([gene.weights.flatten() for gene in sample[i].genes])
+                weights_j = np.concatenate([gene.weights.flatten() for gene in sample[j].genes])
+                # Align lengths to compare heterogeneous architectures
+                min_len = min(weights_i.shape[0], weights_j.shape[0])
+                if min_len == 0:
+                    continue
+                distance = np.linalg.norm(weights_i[:min_len] - weights_j[:min_len])
                 distances.append(distance)
 
         return float(np.mean(distances)) if distances else 0.0

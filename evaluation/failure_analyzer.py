@@ -277,7 +277,7 @@ class FailureAnalyzer:
         if plastic_diag:
             stability_scores = plastic_diag.get('stability_scores', [])
             if stability_scores:
-                avg_stability = np.mean(stability_scores)
+                avg_stability = np.mean(stability_scores) if stability_scores else 0.0
                 if avg_stability < 0.3:
                     severity += 0.5
                     fixes.append({

@@ -1,4 +1,5 @@
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -458,16 +459,19 @@ class PlasticLinear(torch.nn.Module):
             delta_w_flat = self.learning_rule_net(pre, post, r, w_flat, t)
             delta_w = delta_w_flat.view(self.output_dim, self.input_dim)
 
+            # Hard-clip plastic updates per step
+            delta_w = torch.clamp(delta_w, -0.01, 0.01)
+
             # Scale by plastic_lr
             delta_w *= meta["plastic_lr"]
 
-            # Clamp plastic updates to prevent instability
-            delta_w = torch.clamp(delta_w, -0.01, 0.01)
+            # Normalize by presynaptic activity
+            delta_w = delta_w / (torch.norm(pre) + 1e-6)
 
             # Apply update
             self.plastic_weight += delta_w
 
-            # Plasticity clipping - increased range to allow larger updates
+            # Plasticity clipping - balanced range to allow learning while preventing runaway plasticity
             self.plastic_weight = torch.clamp(
                 self.plastic_weight,
                 min=-1.0,
@@ -481,8 +485,10 @@ class PlasticLinear(torch.nn.Module):
             plastic_norm_after = torch.norm(self.plastic_weight).item()
             self.plastic_delta_norm = plastic_norm_after - plastic_norm_before
 
-            # Log plastic weight norm per episode
-            PlasticLinear.plastic_norms.append(plastic_norm_after)
+            # Log per-weight RMS norm to keep values size-invariant
+            num_weights = max(1, self.plastic_weight.numel())
+            plastic_rms_norm = plastic_norm_after / math.sqrt(float(num_weights))
+            PlasticLinear.plastic_norms.append(plastic_rms_norm)
 
             # Per-episode tracking
             delta_norm = torch.norm(delta_w).item()
@@ -1303,6 +1309,18 @@ class TorchBrain(nn.Module):
             "min_plastic_delta": float(min(plastic_deltas)),
             "plastic_deltas": plastic_deltas
         }
+
+    def get_mean_plastic_norm(self) -> float:
+        """Get the mean norm of plastic weights across all plastic layers"""
+        plastic_layers = [layer for layer in self.layers if isinstance(layer, PlasticLinear)]
+        if not plastic_layers:
+            return 0.0
+        norms = []
+        for layer in plastic_layers:
+            norm = torch.norm(layer.plastic_weight).item()
+            num_weights = max(1, layer.plastic_weight.numel())
+            norms.append(norm / math.sqrt(float(num_weights)))
+        return float(np.mean(norms))
 
     def plot_plastic_weight_activation_timing(self, filename="diagnostics/plastic_weight_activation_timing.png"):
         """Plot DIAGNOSTIC 2: Plastic Weight Activation Timing - ||ΔW|| vs timestep per layer"""

@@ -966,7 +966,7 @@ class EvolvableGenome:
             self.meta = {
                 "reward_gain": np.random.uniform(1.0, 10.0),  # Stronger reward modulation
                 "reward_bias": np.random.uniform(-1.0, 1.0),  # Wider bias range
-                "plastic_lr": np.random.uniform(1.0, 20.0)    # Much higher learning rates
+                "plastic_lr": np.random.uniform(0.1, 5.0)    # Balanced learning rates
             }
         else:
             self.meta = meta

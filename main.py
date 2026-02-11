@@ -8,6 +8,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import torch
+import random
 import warnings
 import logging
 import numpy as np
@@ -16,6 +17,7 @@ import json
 import time
 import concurrent.futures
 import threading
+import sys
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from typing import Dict, Any, Optional, List, cast
@@ -51,7 +53,7 @@ from core.async_evaluator import AsyncDeterministicEvaluator
 # Import prey and predator genomes
 from genomes.genome_prey import PreyGenome
 from genomes.genome_predator import PredatorGenome, PredatorPackBrain
-from core.genome import Genome as EvolvableGenome
+from core.genome import Genome as EvolvableGenome, NeuralGene
 from core.torch_brain import TorchBrain
 
 # Import multi-task generalization harness
@@ -618,6 +620,8 @@ async def train_coevolution_async(
 
     # Integrate behavioral probes for comprehensive evaluation
     from evaluation.behavioral_probes import BehavioralProbe
+    # Start async logging if not already started
+    BehavioralProbe.start_async_logging()
     # Create properly typed list for behavioral probes
     evolvable_genomes: List[EvolvableGenome] = list(combined_population)
     # Only save probe reports at checkpoint intervals to avoid file system spam
@@ -633,19 +637,52 @@ async def train_coevolution_async(
 
     # META-EVOLUTION: Evolve architect and mutator populations
     # Prepare performance data for meta-evolution
+
+    # Calculate actual fitness improvement
+    avg_fitness_improvement = 0.0
+    if len(training_state.best_prey_fitness_history) > 1 and len(training_state.best_predator_fitness_history) > 1:
+        prev_prey_best = training_state.best_prey_fitness_history[-2]
+        prev_pred_best = training_state.best_predator_fitness_history[-2]
+        curr_prey_best = training_state.best_prey_fitness_history[-1]
+        curr_pred_best = training_state.best_predator_fitness_history[-1]
+        avg_fitness_improvement = ((curr_prey_best - prev_prey_best) + (curr_pred_best - prev_pred_best)) / 2.0
+
+    # Calculate diversity preservation (maintain high species count)
+    architecture_diversity = stats.get('prey_species', {}).get('num_species', 1) + stats.get('predator_species', {}).get('num_species', 1)
+    diversity_preservation = min(architecture_diversity / 10.0, 1.0)  # Normalize to 0-1
+
+    # Calculate exploration success (novelty scores)
+    prey_novelty = stats.get('prey_novelty', {}).get('mean', 0.0)
+    pred_novelty = stats.get('predator_novelty', {}).get('mean', 0.0)
+    exploration_success = (prey_novelty + pred_novelty) / 2.0
+
+    # Calculate mutation success rates (based on fitness variance improvement)
+    mutation_success_rates = {}
+    if len(training_state.generation_stats) > 1:
+        prev_stats = training_state.generation_stats[-2]
+        curr_stats = training_state.generation_stats[-1]
+
+        # Weight mutation success: if fitness improved after mutations
+        if avg_fitness_improvement > 0:
+            mutation_success_rates['weight'] = min(avg_fitness_improvement * 10.0, 1.0)
+            mutation_success_rates['arch'] = min(architecture_diversity / 5.0, 1.0)
+            mutation_success_rates['layer'] = min(exploration_success * 2.0, 1.0)
+        else:
+            mutation_success_rates['weight'] = 0.1
+            mutation_success_rates['arch'] = 0.1
+            mutation_success_rates['layer'] = 0.1
+    else:
+        mutation_success_rates = {'weight': 0.5, 'arch': 0.4, 'layer': 0.3}
+
     performance_data = {
         'avg_fitness': stats.get('mean_prey_fitness', 0.0) + stats.get('mean_predator_fitness', 0.0),
-        'architecture_diversity': stats.get('prey_species', {}).get('num_species', 1) + stats.get('predator_species', {}).get('num_species', 1),
+        'architecture_diversity': architecture_diversity,
         'motif_effectiveness': stats.get('avg_adaptability_score', 0.0),
         'successful_architectures': training_state.prey_population[:5] + training_state.predator_population[:5],  # Top performers
-        'mutation_success_rates': {
-            'weight': 0.5,  # Placeholder - could be tracked from mutation logs
-            'arch': 0.4,
-            'layer': 0.3
-        },
-        'avg_fitness_improvement': 0.1,  # Placeholder
-        'diversity_preservation': 0.8,  # Placeholder
-        'exploration_success': 0.6  # Placeholder
+        'mutation_success_rates': mutation_success_rates,
+        'avg_fitness_improvement': avg_fitness_improvement,
+        'diversity_preservation': diversity_preservation,
+        'exploration_success': exploration_success
     }
 
     # Evolve architect population
@@ -656,6 +693,7 @@ async def train_coevolution_async(
 
     # Use evolved mutation strategies to adapt main evolution engines
     adaptive_rates = mutator_population.get_adaptive_rates()
+    used_strategy = mutator_population.get_best_strategy()  # Track which strategy was used for effectiveness update
     if prey_engine and adaptive_rates:
         prey_engine.mutation_rate = adaptive_rates.get('weight_rate', prey_engine.mutation_rate)
         prey_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', prey_engine.architecture_mutation_rate)
@@ -663,6 +701,47 @@ async def train_coevolution_async(
     if predator_engine and adaptive_rates:
         predator_engine.mutation_rate = adaptive_rates.get('weight_rate', predator_engine.mutation_rate)
         predator_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', predator_engine.architecture_mutation_rate)
+
+    # Inject evolved architectures into main population to create causal influence
+    if random.random() < 0.05:  # 5% chance to inject evolved architecture
+        best_template = architect_population.get_best_template()
+        if best_template and 'pattern' in best_template:
+            pattern = best_template['pattern']
+            # Create new genome from evolved template
+            new_genome = PreyGenome.random_initialization()
+            if 'layer_pattern' in pattern and len(pattern['layer_pattern']) > 0:
+                new_genome.genes = []
+                prev_dim = new_genome.input_size
+                activation_pattern = pattern.get('activation_pattern', ['tanh'] * len(pattern['layer_pattern']))
+                for i, out_dim in enumerate(pattern['layer_pattern']):
+                    activation = activation_pattern[i] if i < len(activation_pattern) else 'tanh'
+                    gene = NeuralGene(
+                        gene_id=f"evolved_layer_{i}",
+                        input_dim=prev_dim,
+                        output_dim=out_dim,
+                        activation=activation,
+                        use_bias=True,
+                        plasticity=np.random.uniform(-0.1, 0.1, (out_dim, prev_dim)).astype(np.float32)
+                    )
+                    gene.initialize_weights(method="he_normal", scale=0.1)
+                    new_genome.genes.append(gene)
+                    prev_dim = out_dim
+                # Add output layer
+                if prev_dim != new_genome.output_size:
+                    gene = NeuralGene(
+                        gene_id="evolved_output",
+                        input_dim=prev_dim,
+                        output_dim=new_genome.output_size,
+                        activation='linear',
+                        use_bias=True,
+                        plasticity=None
+                    )
+                    gene.initialize_weights(method="he_normal", scale=0.1)
+                    new_genome.genes.append(gene)
+                # Replace random genome in prey population
+                if training_state.prey_population:
+                    idx = random.randint(0, len(training_state.prey_population) - 1)
+                    training_state.prey_population[idx] = new_genome
 
     # Log meta-evolution progress
     best_architect = architect_population.get_best_template()
@@ -1087,7 +1166,7 @@ def plot_plastic_norm_evolution(generation_stats: List[Dict[str, Any]]):
 
 def plot_learning_rule_stats(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]):
     """Plot learning rule parameter distributions per generation"""
-    population = prey_population + predator_population
+    population = prey_population + predator_population 
     rules = ["A", "B", "C", "D", "E"]
 
     for k in rules:
@@ -1533,6 +1612,14 @@ async def main_coevolution_async():
     print("Starting Co-Evolution Training with Adaptive Curriculum")
     print("=" * 60)
 
+    # Add watchdog thread (critical)
+    def watchdog():
+        while True:
+            print("[WATCHDOG] main loop alive")
+            time.sleep(10)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
     # Initialize configuration
     config = EvolutionConfig()
 
@@ -1581,6 +1668,10 @@ async def main_coevolution_async():
             training_state = load_coevolution_state()
             evaluator.load_seeds("seed_registry.json")
 
+    # Initialize meta-evolution populations
+    architect_population = ArchitectPopulation(population_size=20)
+    mutator_population = MutatorPopulation(population_size=15)
+
     # Initialize evolution engines
     prey_engine = EvolutionEngine(
         population_size=config.population_size,
@@ -1601,6 +1692,8 @@ async def main_coevolution_async():
         novelty_threshold=config.novelty_threshold,
         max_archive_size=config.novelty_max_archive_size,
         immigration_rate=config.novelty_immigration_rate,
+        architect_population=architect_population,
+        mutator_population=mutator_population,
     )
     predator_engine = EvolutionEngine(
         population_size=config.predator_population_size,
@@ -1622,19 +1715,47 @@ async def main_coevolution_async():
         novelty_threshold=config.novelty_threshold,
         max_archive_size=config.novelty_max_archive_size,
         immigration_rate=config.novelty_immigration_rate,
+        architect_population=architect_population,
+        mutator_population=mutator_population,
     )
-
-    # Initialize meta-evolution populations
-    architect_population = ArchitectPopulation(population_size=20)
-    mutator_population = MutatorPopulation(population_size=15)
 
     # Initialize meta-scientist systems
     meta_scientist = MetaScientist()
     evolution_modifier = EvolutionModifier()
     diagnostic_task_generator = DiagnosticTaskGenerator()
 
+    def evolve_all_populations(gen: int) -> None:
+        print(f"[EVOLVE] Generation {gen} START")
+
+        if prey_engine:
+            start = time.time()
+            prey_population = prey_engine.create_next_generation(
+                training_state.prey_population, gen, pop_name="prey"
+            )
+            if time.time() - start > 30:
+                print("[WARN] Evolution step slow")
+            training_state.prey_population = prey_population.genomes
+
+        if predator_engine:
+            start = time.time()
+            predator_population = predator_engine.create_next_generation(
+                training_state.predator_population, gen, pop_name="predator"
+            )
+            if time.time() - start > 30:
+                print("[WARN] Evolution step slow")
+            training_state.predator_population = predator_population.genomes
+
+        print(f"[EVOLVE] Generation {gen} END")
+
     # Training loop
+    MAX_GEN_TIME = 300  # Maximum time per generation in seconds
     for generation in range(training_state.generation, config.generations):
+        gen_start = time.time()
+
+        # Generation-level circuit breaker
+        if generation == 0:
+            MAX_GENOMES_EVALUATED = 10
+
         # Get current stage from curriculum controller
         current_stage = curriculum_controller.get_current_config()
         stage_name = current_stage['name']
@@ -1658,6 +1779,13 @@ async def main_coevolution_async():
             mutator_population,
         )
         training_state.generation_stats.append(stats)
+        print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
+
+        skip_diagnostics = False
+        gen_elapsed = time.time() - gen_start
+        if gen_elapsed > MAX_GEN_TIME:
+            print(f"[WARN] Generation exceeded MAX_GEN_TIME ({MAX_GEN_TIME}s) at {gen_elapsed:.1f}s — skipping diagnostics")
+            skip_diagnostics = True
 
         # Update hall of fame
         training_state.update_hall_of_fame()
@@ -1696,23 +1824,16 @@ async def main_coevolution_async():
                 print("Predator stagnation detected - adjusting mutation...")
                 config.mutation_strength = min(config.mutation_strength * 1.2, 0.5)
 
-        # Evolve populations separately
+        print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
+
+        # Evolve populations (single controller)
         print("Evolving populations...")
+        evolve_all_populations(generation)
 
-        if prey_engine:
-            prey_population = prey_engine.create_next_generation(
-                training_state.prey_population, generation
-            )
-            training_state.prey_population = prey_population.genomes
-
-        if predator_engine:
-            predator_population = predator_engine.create_next_generation(
-                training_state.predator_population , generation
-            )
-            training_state.predator_population = predator_population.genomes
+        print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
 
         # Save checkpoint and run diagnostics
-        if config.plot_every > 0 and generation % config.plot_every == 0:
+        if not skip_diagnostics and config.plot_every > 0 and generation % config.plot_every == 0:
             save_coevolution_state(training_state)
             evaluator.save_seeds()
             plot_meta_gene_histograms(stats)

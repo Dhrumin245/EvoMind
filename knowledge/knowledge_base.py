@@ -573,8 +573,8 @@ class KnowledgeBase:
                 try:
                     if isinstance(values[0], (int, float)):
                         # For numeric values, check coefficient of variation
-                        mean_val = np.mean(values)
-                        std_val = np.std(values)
+                        mean_val = np.mean(values) if values else 0.0
+                        std_val = np.std(values) if values else 0.0
                         if mean_val != 0 and std_val / abs(mean_val) < 0.3:  # CV < 30%
                             common_params[param] = mean_val
                     else:

@@ -402,7 +402,9 @@ class AsyncBatchEvaluator:
             tasks.append(task)
         
         # Run all evaluations in parallel
-        results = await asyncio.gather(*tasks)
+        if tasks:
+            await asyncio.wait(tasks, timeout=30)
+        results = [task.result() for task in tasks]
         return results
     
     def evaluate_batch_sync(self, genomes: List) -> List[float]:

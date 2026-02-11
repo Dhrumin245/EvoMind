@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 import logging
 import numpy as np
+import torch
 from typing import List, Tuple, Optional, Dict, Any, cast
 from environments.deterministic_env import DeterministicSeedManager
 import time
@@ -21,9 +22,9 @@ class EvaluationMode(Enum):
 class EvaluationConfig:
     """Configuration for evaluation to ensure determinism"""
     base_seed: int = 42
-    num_workers: int = 4
+    num_workers: int = 2
     use_gpu: bool = False
-    envs_per_genome: int = 8
+    envs_per_genome: int = 4
     max_steps: int = 1000
     mode: EvaluationMode = EvaluationMode.SINGLE_AGENT
     # Multi-agent specific
@@ -260,7 +261,8 @@ class AsyncDeterministicEvaluator:
 
             while step < self.max_steps:
                 # Get actions
-                actions = genome.act_batch(seed_states)  # Always use CPU for process safety
+                with torch.no_grad():
+                    actions = genome.act_batch(seed_states)  # Always use CPU for process safety
 
                 # We need to handle the full batch - create padded actions
                 batch_actions = np.zeros((self.envs_per_genome * 5,) + actions.shape[1:], dtype=actions.dtype)
@@ -268,7 +270,7 @@ class AsyncDeterministicEvaluator:
 
                 # Step environment
                 states, step_rewards, dones = env.step(batch_actions)
-                
+
                 # Extract rewards for this seed
                 seed_states = states[start_idx:end_idx]
                 seed_rewards = step_rewards[start_idx:end_idx]
@@ -494,7 +496,9 @@ class AsyncDeterministicEvaluator:
             tasks.append(task)
 
         # Run all evaluations in parallel
-        fitnesses = await asyncio.gather(*tasks)
+        if tasks:
+            await asyncio.wait(tasks, timeout=30)
+        fitnesses = [task.result() for task in tasks]
         return fitnesses
     
     async def evaluate_population_async(self,
@@ -818,8 +822,9 @@ class HybridEvaluator:
             pred_actions_list = []
             
             for i, (prey_genome, pred_genome) in enumerate(zip(prey_genomes, predator_genomes)):
-                prey_actions = prey_genome.act_batch(prey_state[i:i+1])
-                pred_actions = pred_genome.act_batch(pred_state[i:i+1])
+                with torch.no_grad():
+                    prey_actions = prey_genome.act_batch(prey_state[i:i+1])
+                    pred_actions = pred_genome.act_batch(pred_state[i:i+1])
                 prey_actions_list.append(prey_actions)
                 pred_actions_list.append(pred_actions)
             
