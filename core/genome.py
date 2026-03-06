@@ -9,6 +9,7 @@ import json
 import hashlib
 import math
 import ast
+import re
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
 
@@ -305,14 +306,23 @@ class LearningRuleNet(nn.Module):
         elif isinstance(value, str):
             s = value.strip()
             # Fast path: parse as whitespace-separated numeric stream.
-            numeric = np.fromstring(s.replace('[', ' ').replace(']', ' '), sep=' ', dtype=np.float32)
+            try:
+                numeric = np.fromstring(s.replace('[', ' ').replace(']', ' '), sep=' ', dtype=np.float32)
+            except ValueError:
+                numeric = np.array([], dtype=np.float32)
+
             if numeric.size == 0:
-                # Fallback: sometimes it may be a Python list string with commas.
-                try:
-                    parsed = ast.literal_eval(s)
-                except Exception as e:
-                    raise ValueError(f"Could not parse legacy weight string for {key}") from e
-                arr = np.array(parsed, dtype=np.float32)
+                # Fallback: extract numeric tokens (handles malformed strings).
+                tokens = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+                if tokens:
+                    arr = np.array([float(t) for t in tokens], dtype=np.float32)
+                else:
+                    # Last resort: try Python literal eval.
+                    try:
+                        parsed = ast.literal_eval(s)
+                    except Exception as e:
+                        raise ValueError(f"Could not parse legacy weight string for {key}") from e
+                    arr = np.array(parsed, dtype=np.float32)
             else:
                 arr = numeric
         else:
@@ -326,9 +336,12 @@ class LearningRuleNet(nn.Module):
         if arr.shape != expected_shape:
             flat = arr.reshape(-1)
             if flat.size != expected_elems:
-                raise ValueError(
-                    f"Shape mismatch for {key}: got {arr.shape} (flat {flat.size}), expected {expected_shape} (flat {expected_elems})"
-                )
+                if flat.size < expected_elems:
+                    padded = np.zeros(expected_elems, dtype=np.float32)
+                    padded[:flat.size] = flat
+                    flat = padded
+                else:
+                    flat = flat[:expected_elems]
             arr = flat.reshape(expected_shape)
 
         return arr.astype(np.float32, copy=False)
@@ -374,6 +387,50 @@ class LearningRuleNet(nn.Module):
                 noise = torch.randn_like(param) * mutation_strength
                 param[mask] += noise[mask]
 
+    def mutate_architecture(self, mutation_rate: float = 0.05):
+        """Mutate the learning rule architecture (family switching)"""
+        if random.random() < mutation_rate:
+            # Change hidden dimension (learning rule family)
+            old_hidden = self.hidden_dim
+            new_hidden = random.choice([8, 16, 32, 64])  # Different family sizes
+            if new_hidden != old_hidden:
+                # Create new network with different architecture
+                new_net = LearningRuleNet(self.input_dim, self.output_dim, new_hidden)
+
+                # Copy parameters where possible (reshape if needed)
+                with torch.no_grad():
+                    # Copy fc1 weights (may need to truncate or pad)
+                    old_fc1_out, old_fc1_in = self.fc1.weight.shape
+                    new_fc1_out, new_fc1_in = new_net.fc1.weight.shape
+
+                    copy_out = min(old_fc1_out, new_fc1_out)
+                    copy_in = min(old_fc1_in, new_fc1_in)
+                    new_net.fc1.weight[:copy_out, :copy_in] = self.fc1.weight[:copy_out, :copy_in]
+                    new_net.fc1.bias[:copy_out] = self.fc1.bias[:copy_out]
+
+                    # Copy fc2 weights
+                    old_fc2_out, old_fc2_in = self.fc2.weight.shape
+                    new_fc2_out, new_fc2_in = new_net.fc2.weight.shape
+
+                    copy_out = min(old_fc2_out, new_fc2_out)
+                    copy_in = min(old_fc2_in, new_fc2_in)
+                    new_net.fc2.weight[:copy_out, :copy_in] = self.fc2.weight[:copy_out, :copy_in]
+                    new_net.fc2.bias[:copy_out] = self.fc2.bias[:copy_out]
+
+                    # Copy output weights/bias with dimension-safe slicing
+                    old_out_out, old_out_in = self.output.weight.shape
+                    new_out_out, new_out_in = new_net.output.weight.shape
+
+                    copy_out = min(old_out_out, new_out_out)
+                    copy_in = min(old_out_in, new_out_in)
+                    new_net.output.weight[:copy_out, :copy_in] = self.output.weight[:copy_out, :copy_in]
+                    new_net.output.bias[:copy_out] = self.output.bias[:copy_out]
+
+                # Replace self with new network
+                self.__dict__.update(new_net.__dict__)
+                return True
+        return False
+
     def copy(self) -> 'LearningRuleNet':
         """Create a deep copy"""
         new_net = LearningRuleNet(self.input_dim, self.output_dim, self.hidden_dim)
@@ -386,6 +443,7 @@ class ActivationFunction:
     
     ACTIVATIONS = {
         'tanh': np.tanh,
+        'tanh_scaled': lambda x: 0.5 * np.tanh(x),
         'relu': lambda x: np.maximum(0, x),
         'leaky_relu': lambda x: np.where(x > 0, x, 0.01 * x),
         'sigmoid': lambda x: 1 / (1 + np.exp(-x)),
@@ -401,6 +459,7 @@ class ActivationFunction:
      
     TORCH_ACTIVATIONS = {
         'tanh': torch.tanh,
+        'tanh_scaled': lambda x: 0.5 * torch.tanh(x),
         'relu': F.relu,
         'leaky_relu': F.leaky_relu,
         'sigmoid': torch.sigmoid,
@@ -597,17 +656,19 @@ class NeuralGene:
     def mutate(
         self,
         weight_mutation_rate: float = 0.1,
-        weight_mutation_strength: float = 0.1,
+        weight_mutation_strength: float = 0.05,
         architecture_mutation: bool = False,
         plasticity_mutation_rate: float = 0.05,
         plasticity_mutation_strength: float = 0.1,
         max_neurons: int = 128,
-        min_neurons: int = 4
+        min_neurons: int = 4,
+        activation_mutation_rate: float = 0.05
     ) -> bool:
         """
         Mutate this gene
         Returns: True if architecture was mutated
         """
+
         mutated_architecture = False
 
         # Weight mutation
@@ -618,20 +679,112 @@ class NeuralGene:
             bias_mask = np.random.random(self.bias.shape) < weight_mutation_rate
             self.bias[bias_mask] += np.random.randn(*bias_mask.shape)[bias_mask] * weight_mutation_strength
 
+        self._renormalize_weights(max_norm=3.0)
+
         # Plasticity mutation
         if random.random() < plasticity_mutation_rate:
             if self.plasticity is not None:
                 self.plasticity = (self.plasticity + np.random.normal(
                     0, plasticity_mutation_strength, self.plasticity.shape
                 )).astype(np.float32)
+                self.plasticity = self._sanitize_array(self.plasticity)
+
+        # Activation mutation
+        if random.random() < activation_mutation_rate:
+            old_activation = self.activation
+            self.activation = ActivationFunction.get_random_activation()
+            # Avoid getting stuck in the same activation
+            while self.activation == old_activation and random.random() < 0.8:
+                self.activation = ActivationFunction.get_random_activation()
+
+        # Normalization mutation (favor layer norm to reduce saturation)
+        if random.random() < 0.05 and self.normalization_type != "layernorm":
+            self.normalization_type = "layernorm"
+            self.ln_gamma = np.ones(self.output_dim, dtype=np.float32)
+            self.ln_beta = np.zeros(self.output_dim, dtype=np.float32)
+            self.batch_norm = False
+            self.bn_gamma = None
+            self.bn_beta = None
+            self.bn_running_mean = None
+            self.bn_running_var = None
+
+        # Layer type mutation (beyond "linear")
+        if random.random() < 0.02:  # Low probability for layer type changes
+            available_types = ["linear", "mlp_block", "res_block", "attention_block"]
+            if self.layer_type in available_types:
+                old_type = self.layer_type
+                self.layer_type = random.choice(available_types)
+                # Avoid getting stuck in the same type
+                while self.layer_type == old_type and random.random() < 0.7:
+                    self.layer_type = random.choice(available_types)
+
+                # Adjust memory_size for recurrent layers
+                if self.layer_type in ["gru", "attention_block"]:
+                    if self.memory_size == 0:
+                        self.memory_size = random.randint(8, 32)
+                else:
+                    self.memory_size = 0
 
         # Architecture mutations
         if architecture_mutation:
-            self._add_neuron()
+            if self.output_dim > min_neurons and random.random() < 0.5:
+                self._remove_neuron()
+            else:
+                self._add_neuron()
             self._sync_plasticity()
             mutated_architecture = True
 
         return mutated_architecture
+
+    def _renormalize_weights(self, max_norm: float = 3.0) -> None:
+        """
+        Normalize weights after mutation to prevent saturation.
+        
+        Applies:
+        1. Global weight normalization: w = w / (||w|| + 1e-6)
+        2. Per-layer clamping to [-1, 1] as a fallback
+        """
+        if self.weights is None:
+            return
+
+        sanitized_weights = self._sanitize_array(self.weights)
+        if sanitized_weights is not None:
+            self.weights = sanitized_weights
+
+            # Step 1: Global weight normalization (FIX for saturation issue)
+            # This prevents weight explosion and reduces saturation
+            global_norm = np.linalg.norm(self.weights)
+            if global_norm > 1e-6:
+                self.weights = self.weights / (global_norm + 1e-6)
+            
+            # Step 2: Per-layer clamping to [-1, 1] as additional safeguard
+            # This ensures weights don't become too extreme
+            self.weights = np.clip(self.weights, -1.0, 1.0).astype(np.float32)
+        
+        # Also normalize bias if present
+        if self.bias is not None:
+            sanitized_bias = self._sanitize_array(self.bias)
+            if sanitized_bias is not None:
+                self.bias = sanitized_bias
+                self.bias = np.clip(self.bias, -1.0, 1.0).astype(np.float32)
+        
+        # Also normalize plasticity if present (prevents plasticity explosion)
+        if self.plasticity is not None:
+            sanitized_plasticity = self._sanitize_array(self.plasticity)
+            if sanitized_plasticity is not None:
+                self.plasticity = sanitized_plasticity
+                plastic_norm = np.linalg.norm(self.plasticity)
+                if plastic_norm > 1e-6:
+                    self.plasticity = self.plasticity / (plastic_norm + 1e-6)
+                self.plasticity = np.clip(self.plasticity, -1.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _sanitize_array(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        if not np.isfinite(arr).all():
+            arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+        return arr.astype(np.float32, copy=False)
     
     def _add_neuron(self):
         """Add a neuron to this layer"""
@@ -802,69 +955,9 @@ class NeuralGene:
         return self.from_dict(copy_data)
 
 
-class ConnectionGene:
-    """Individual synapse with its own learning rule"""
-    
-    def __init__(self, from_neuron: int, to_neuron: int):
-        self.from_neuron = from_neuron
-        self.to_neuron = to_neuron
-        self.weight = np.random.randn() * 0.01
-        self.learning_rule_params = {
-            'A': np.random.uniform(-0.1, 0.1),
-            'B': np.random.uniform(-0.1, 0.1),
-            'C': np.random.uniform(-0.1, 0.1),
-        }
-        self.enabled = True  # For sparse connection representation
-    
-    def update_plasticity(self, pre_activity: float, post_activity: float, reward: float, timestep: int):
-        """Per-connection plasticity update"""
-        # Simple learning rule: Δw = A * pre + B * post + C * reward
-        delta_w = (self.learning_rule_params['A'] * pre_activity + 
-                   self.learning_rule_params['B'] * post_activity + 
-                   self.learning_rule_params['C'] * reward)
-        self.weight += delta_w
-    
-    def mutate(self, weight_mutation_rate: float = 0.1, param_mutation_rate: float = 0.1, mutation_strength: float = 0.01):
-        """Connection-level mutation operators"""
-        # Mutate weight
-        if np.random.random() < weight_mutation_rate:
-            self.weight += np.random.randn() * mutation_strength
-        
-        # Mutate learning rule parameters
-        for key in self.learning_rule_params:
-            if np.random.random() < param_mutation_rate:
-                self.learning_rule_params[key] += np.random.uniform(-mutation_strength, mutation_strength)
-        
-        # Toggle enabled (sparse representation)
-        if np.random.random() < 0.01:  # Low probability to toggle
-            self.enabled = not self.enabled
-    
-    def copy(self) -> 'ConnectionGene':
-        """Create a deep copy"""
-        new_conn = ConnectionGene(self.from_neuron, self.to_neuron)
-        new_conn.weight = self.weight
-        new_conn.learning_rule_params = self.learning_rule_params.copy()
-        new_conn.enabled = self.enabled
-        return new_conn
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary"""
-        return {
-            'from_neuron': self.from_neuron,
-            'to_neuron': self.to_neuron,
-            'weight': self.weight,
-            'learning_rule_params': self.learning_rule_params,
-            'enabled': self.enabled
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ConnectionGene':
-        """Create from dictionary"""
-        conn = cls(data['from_neuron'], data['to_neuron'])
-        conn.weight = data['weight']
-        conn.learning_rule_params = data['learning_rule_params']
-        conn.enabled = data.get('enabled', True)
-        return conn
+# NOTE: ConnectionGene (per-synapse NEAT-style evolution) has been moved to
+# a dedicated module: genomes/connection_gene.py — it is not part of the
+# active modular evolution path.
 
 
 class EvolvableGenome:
@@ -876,6 +969,8 @@ class EvolvableGenome:
     - DAG execution order for complex connectivity
     - Automatic motif mining from high-performing genomes
     """
+
+    novelty_score_norm: float
 
     def __init__(
         self,
@@ -923,6 +1018,8 @@ class EvolvableGenome:
 
         self.fitness = 0.0
         self.norm_fitness = 0.0
+        self.novelty_score = 0.0  # Novelty score for selection
+        self.novelty_score_norm = 0.0  # Normalized novelty for selection
         self.age = 0  # Generation age
 
         # META-3.3: Learning curve tracking for self-directed evolution
@@ -942,8 +1039,6 @@ class EvolvableGenome:
         self.learning_rule: Optional[Dict[str, float]] = None
         self.plastic_diagnostics: Optional[Dict[str, Any]] = None
         self.metadata: GenomeMetadata = GenomeMetadata()
-        self._gpu_compiled: bool = False
-        self._gpu_layers: List[Dict[str, Any]] = []
         self._torch_brain: Optional[Any] = None
         self._signature_cache: Optional[str] = None
         self.layers: List[Dict[str, Any]] = []
@@ -970,6 +1065,11 @@ class EvolvableGenome:
             }
         else:
             self.meta = meta
+
+        # Update default activation to LeakyReLU for better gradient flow
+        for gene in self.genes:
+            if gene.activation == "relu":
+                gene.activation = "leaky_relu"
 
         # Initialize LearningRuleNet instead of static dict
         self.learning_rule_net = LearningRuleNet(input_dim=self.input_size, output_dim=self.output_size, hidden_dim=16)
@@ -1037,6 +1137,57 @@ class EvolvableGenome:
         self.genes = []
         for module in self.modules:
             self.genes.extend(module.genes)
+
+    def get_architecture_vector(self) -> np.ndarray:
+        """Return a fixed-length architecture feature vector for clustering."""
+        genes = self.genes if self.genes else []
+        num_genes = len(genes)
+        num_modules = len(self.modules) if self.modules else 0
+
+        if num_genes == 0:
+            return np.zeros(12, dtype=np.float32)
+
+        output_dims = [g.output_dim for g in genes]
+        input_dims = [g.input_dim for g in genes]
+        mean_width = float(np.mean(output_dims)) if output_dims else 0.0
+        max_width = float(np.max(output_dims)) if output_dims else 0.0
+        min_width = float(np.min(output_dims)) if output_dims else 0.0
+
+        total_params = 0
+        for gene in genes:
+            total_params += int(gene.output_dim * gene.input_dim)
+            if gene.use_bias:
+                total_params += int(gene.output_dim)
+
+        skip_fraction = float(sum(1 for g in genes if g.skip_connection)) / float(num_genes)
+        attention_fraction = float(sum(1 for g in genes if g.layer_type == "attention_block")) / float(num_genes)
+        residual_fraction = float(sum(1 for g in genes if g.layer_type == "res_block")) / float(num_genes)
+
+        dropout_mean = float(np.mean([g.dropout_rate for g in genes])) if genes else 0.0
+        layernorm_fraction = float(
+            sum(1 for g in genes if g.normalization_type == "layernorm")
+        ) / float(num_genes)
+        batchnorm_fraction = float(
+            sum(1 for g in genes if g.normalization_type == "batchnorm" or g.batch_norm)
+        ) / float(num_genes)
+
+        return np.array(
+            [
+                float(num_modules),
+                float(num_genes),
+                float(total_params),
+                mean_width,
+                max_width,
+                min_width,
+                skip_fraction,
+                attention_fraction,
+                residual_fraction,
+                dropout_mean,
+                layernorm_fraction,
+                batchnorm_fraction,
+            ],
+            dtype=np.float32,
+        )
 
     def mutate_modules(self) -> bool:
         """Mutate the modular architecture"""
@@ -1328,7 +1479,7 @@ class EvolvableGenome:
 
             # Strategy 1: Change to more stable activation
             if random.random() < 0.5:
-                stable_activations = ['tanh', 'sigmoid', 'elu', 'selu']
+                stable_activations = ['tanh_scaled', 'tanh', 'elu', 'selu']
                 if gene.activation not in stable_activations:
                     gene.activation = random.choice(stable_activations)
 
@@ -1336,13 +1487,16 @@ class EvolvableGenome:
             elif random.random() < 0.3:
                 gene.dropout_rate = min(0.5, gene.dropout_rate + 0.1)
 
-            # Strategy 3: Add batch normalization
-            elif random.random() < 0.2 and not gene.batch_norm:
-                gene.batch_norm = True
-                gene.bn_gamma = np.ones(gene.output_dim, dtype=np.float32)
-                gene.bn_beta = np.zeros(gene.output_dim, dtype=np.float32)
-                gene.bn_running_mean = np.zeros(gene.output_dim, dtype=np.float32)
-                gene.bn_running_var = np.ones(gene.output_dim, dtype=np.float32)
+            # Strategy 3: Add layer normalization
+            elif random.random() < 0.2 and gene.normalization_type != "layernorm":
+                gene.normalization_type = "layernorm"
+                gene.ln_gamma = np.ones(gene.output_dim, dtype=np.float32)
+                gene.ln_beta = np.zeros(gene.output_dim, dtype=np.float32)
+                gene.batch_norm = False
+                gene.bn_gamma = None
+                gene.bn_beta = None
+                gene.bn_running_mean = None
+                gene.bn_running_var = None
 
     def get_execution_order(self) -> List[int]:
         """Get topological execution order for modules (handles DAG)"""
@@ -1567,8 +1721,6 @@ class EvolvableGenome:
 
     def invalidate_caches(self):
         """Invalidate derived caches after any genome mutation/structural change."""
-        self._gpu_compiled = False
-        self._gpu_layers = []
         self._torch_brain = None
         self._signature_cache = None
 
@@ -1618,77 +1770,21 @@ class EvolvableGenome:
 
         self._signature_cache = hasher.hexdigest()
         return self._signature_cache
-    
-    def _initialize_architecture(self, num_layers: int, neurons_per_layer: int):
-        """Initialize random architecture with expanded NAS capabilities"""
-        num_layers = max(self.min_layers, min(num_layers, self.max_layers))
-        neurons_per_layer = max(self.min_neurons, min(neurons_per_layer, self.max_neurons))
 
-        # Available layer types for NAS expansion
-        layer_types = ["linear", "mlp_block", "res_block", "gru", "attention_block"]
-        normalization_types = ["none", "layernorm", "batchnorm"]
-
-        # Build layers
-        prev_dim = self.input_size
-        for i in range(num_layers):
-            # Last layer has output_size neurons and must be linear
-            if i == num_layers - 1:
-                layer_output = self.output_size
-                layer_type = "linear"
-                activation = "linear"  # Output layer typically linear for action values
-                normalization_type = "none"
-                memory_size = 0
-            else:
-                layer_output = neurons_per_layer
-                layer_type = random.choice(layer_types)
-                activation = ActivationFunction.get_random_activation()
-                normalization_type = random.choice(normalization_types)
-                memory_size = random.randint(8, 64) if layer_type in ["gru", "attention_block"] else 0
-
-            gene = NeuralGene(
-                gene_id=f"layer_{i}",
-                layer_type=layer_type,
-                input_dim=prev_dim,
-                output_dim=layer_output,
-                activation=activation,
-                use_bias=True,
-                dropout_rate=random.uniform(0.0, 0.3),
-                normalization_type=normalization_type,
-                dropout_schedule={"initial": 0.0, "final": random.uniform(0.1, 0.4), "decay_steps": 1000},
-                memory_size=memory_size,
-                batch_norm=(normalization_type == "batchnorm"),  # Backward compatibility
-                skip_connection=False,
-                skip_target=-1
-            )
-
-            # Initialize weights
-            gene.initialize_weights(method="he_normal", scale=0.1)
-
-            # Keep output layer non-plastic to avoid policy drift
-            if i == num_layers - 1:
-                gene.plasticity = None
-
-            self.genes.append(gene)
-            prev_dim = layer_output
-
-        # Randomly add skip connections (30% chance per layer)
-        for i, gene in enumerate(self.genes):
-            if i > 0 and random.random() < 0.3:
-                target = random.randint(0, i - 1)
-                gene.skip_connection = True
-                gene.skip_target = target
-    
     def forward(self, x: np.ndarray, training: bool = False) -> np.ndarray:
         """
-        Forward pass through the network.
-
-        NOTE: This is an inference-only Numpy implementation that does NOT apply plasticity updates.
-        Long-term, CPU path should be inference-only; learning must live in TorchBrain.
-        Use TorchBrain (via self.brain) for any learning/plasticity functionality.
+        Inference-only NumPy forward pass. Does NOT apply plasticity updates —
+        learning lives in TorchBrain (via self.brain).
+        Delegates to forward_modular() when the modular architecture is active.
         """
+        # Prefer the modular path when modules are populated
+        if self.modules:
+            return self.forward_modular(x, training)
+
+        # Legacy flat-gene fallback
         if len(self.genes) == 0:
             raise ValueError("Genome has no layers")
-        
+
         # Store activations for skip connections
         activations = [x]  # Store input as activation 0
         
@@ -1749,104 +1845,17 @@ class EvolvableGenome:
         return np.argmax(outputs, axis=1)
     
     def act_batch_gpu(self, states: np.ndarray, device: str = 'cuda') -> np.ndarray:
-        """Batch inference on GPU/CPU"""
-        # Determine actual device (fallback to CPU if CUDA not available)
-        actual_device = device if device == 'cuda' and torch.cuda.is_available() else 'cpu'
+        """GPU/CPU batch inference — delegates to TorchBrain which owns the GPU path."""
+        # TorchBrain handles device placement, plasticity, and compilation.
+        # The old hand-rolled GPU loop has been removed in favour of this.
+        return self.act_batch(states)
 
-        # Compile if not already
-        if not self._gpu_compiled:
-            self.compile_gpu(actual_device)
-
-        # Convert to tensor
-        if isinstance(states, np.ndarray):
-            states_tensor = torch.tensor(states, device=actual_device, dtype=torch.float32)
-        else:
-            states_tensor = states
-        
-        # Forward pass on GPU
-        x = states_tensor
-        activations = [x]
-        
-        for layer_dict in self._gpu_layers:
-            # Handle skip connections
-            if 'skip_target' in layer_dict and layer_dict['skip_target'] >= 0 and layer_dict['skip_target'] < len(activations):
-                skip_input = activations[layer_dict['skip_target']]
-                # Ensure dimensions match
-                if skip_input.shape[1] != x.shape[1]:
-                    # Simple padding/truncation
-                    if skip_input.shape[1] < x.shape[1]:
-                        pad_width = x.shape[1] - skip_input.shape[1]
-                        skip_input = F.pad(skip_input, (0, pad_width))
-                    else:
-                        skip_input = skip_input[:, :x.shape[1]]
-                x = x + skip_input
-            
-            # Linear layer
-            x = F.linear(x, layer_dict['weight'], layer_dict['bias'])
-            
-            # Batch normalization
-            if 'bn_gamma' in layer_dict:
-                if layer_dict.get('training', False):
-                    x = F.batch_norm(x, layer_dict['running_mean'], layer_dict['running_var'], 
-                                   layer_dict['bn_gamma'], layer_dict['bn_beta'], training=True)
-                else:
-                    x = F.batch_norm(x, layer_dict['running_mean'], layer_dict['running_var'],
-                                   layer_dict['bn_gamma'], layer_dict['bn_beta'], training=False)
-            
-            # Activation
-            activation_fn = ActivationFunction.get_torch_fn(layer_dict['activation'])
-            x = activation_fn(x)
-            
-            # Dropout (only during training)
-            if 'dropout_rate' in layer_dict and layer_dict.get('training', False):
-                x = F.dropout(x, p=layer_dict['dropout_rate'])
-            
-            activations.append(x)
-        
-        # Get actions (argmax)
-        return torch.argmax(x, dim=1).cpu().numpy()
-    
-    def compile_gpu(self, device: str = 'cuda'):
-        """Compile genome to GPU/CPU format"""
-        if device == 'cuda' and not torch.cuda.is_available():
-            device = 'cpu'
-
-        self._gpu_layers = []
-
-        for gene in self.genes:
-            layer_dict = {
-                'weight': torch.tensor(gene.weights, device=device, dtype=torch.float32),  # Stored as (out_features, in_features)
-                'activation': gene.activation,
-                'training': False,
-            }
-
-            if gene.use_bias and gene.bias is not None:
-                layer_dict['bias'] = torch.tensor(gene.bias, device=device, dtype=torch.float32)
-            else:
-                layer_dict['bias'] = None
-
-            if gene.batch_norm:
-                layer_dict['bn_gamma'] = torch.tensor(gene.bn_gamma, device=device, dtype=torch.float32)
-                layer_dict['bn_beta'] = torch.tensor(gene.bn_beta, device=device, dtype=torch.float32)
-                layer_dict['running_mean'] = torch.tensor(gene.bn_running_mean, device=device, dtype=torch.float32)
-                layer_dict['running_var'] = torch.tensor(gene.bn_running_var, device=device, dtype=torch.float32)
-
-            if gene.dropout_rate > 0:
-                layer_dict['dropout_rate'] = gene.dropout_rate
-
-            if gene.skip_connection:
-                layer_dict['skip_target'] = gene.skip_target
-
-            self._gpu_layers.append(layer_dict)
-
-        self._gpu_compiled = True
-    
     def mutate(
         self,
         weight_mutation_rate: float = 0.1,
         weight_mutation_strength: float = 0.1,
         architecture_mutation_rate: float = 0.05,
-        layer_mutation_rate: float = 0.02,
+        layer_mutation_rate: float = 0.05,
         plasticity_mutation_strength: float = 0.1,
         max_layers: int = 8,
         min_layers: int = 1
@@ -1872,6 +1881,17 @@ class EvolvableGenome:
             mutated = True
             mutation_event['details']['modular'] = True
 
+        # Role-specific architecture mutations (if implemented by subclasses)
+        if random.random() < architecture_mutation_rate:
+            mutate_architecture_fn = getattr(self, "mutate_architecture", None)
+            if callable(mutate_architecture_fn):
+                try:
+                    if mutate_architecture_fn():
+                        mutated = True
+                        mutation_event['details']['role_architecture'] = True
+                except Exception:
+                    pass
+
         # Weight mutations
         architecture_mutation = random.random() < architecture_mutation_rate
         for gene in self.genes:
@@ -1881,6 +1901,7 @@ class EvolvableGenome:
                 architecture_mutation,
                 plasticity_mutation_rate=plasticity_mutation_rate,
                 plasticity_mutation_strength=plasticity_mutation_strength,
+                activation_mutation_rate=0.05,  # Add activation mutation to existing layers
             ):
                 mutated = True
 
@@ -1889,6 +1910,11 @@ class EvolvableGenome:
             assert self.learning_rule_net is not None, "Learning rule net not initialized"
             self.learning_rule_net.mutate(mutation_rate=0.1, mutation_strength=0.1)
             mutation_event['details']['learning_rule_net'] = True
+
+        # Learning rule family mutation (structural)
+        if self.learning_rule_net is not None and random.random() < max(0.05, architecture_mutation_rate):
+            if self.learning_rule_net.mutate_architecture(mutation_rate=max(0.2, architecture_mutation_rate)):
+                mutation_event['details']['learning_rule_family'] = True
 
         # Structural mutations (add/remove layers)
         if random.random() < layer_mutation_rate:
@@ -2309,7 +2335,6 @@ class EvolvableGenome:
         copy_genome.fitness = self.fitness
         copy_genome.norm_fitness = self.norm_fitness
         copy_genome.age = self.age
-        copy_genome._gpu_compiled = False
         copy_genome.meta = {k: v for k, v in self.meta.items()}
         copy_genome.learning_rule = self.learning_rule.copy() if self.learning_rule else None
         assert self.learning_rule_net is not None, "Learning rule net not initialized"

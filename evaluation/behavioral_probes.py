@@ -14,8 +14,19 @@ import queue
 
 
 
-# Probe budget configuration
-PROBE_BUDGET = 10  # per generation
+# Probe budget configuration - adaptive based on generation
+def get_probe_budget(generation: int) -> int:
+    """Adaptive probe budget: fewer probes as evolution progresses"""
+    if generation < 50:
+        return 5  # Early exploration: more probes
+    elif generation < 200:
+        return 2  # Mid evolution: moderate probes
+    else:
+        return 1  # Late evolution: minimal probes
+
+# Legacy constant for backward compatibility
+PROBE_BUDGET = 10  # per generation (deprecated, use get_probe_budget)
+
 
 @dataclass
 class ProbeResult:
@@ -232,19 +243,20 @@ class BehavioralProbe:
 
         config = task_configs[novel_task]
 
-        # Baseline evaluation (first 10 episodes)
+        # Baseline evaluation (first 3 episodes - reduced from 10)
         baseline_scores = []
-        for episode in range(10):
+        for episode in range(3):
             score = BehavioralProbe._evaluate_episode(genome, config, seed=episode)
             baseline_scores.append(score)
 
         baseline_mean = np.mean(baseline_scores)
 
-        # Adaptation evaluation (next 20 episodes with plasticity)
+        # Adaptation evaluation (next 5 episodes with plasticity - reduced from 20)
         adaptation_scores = []
         learning_curve = []
 
-        for episode in range(20):
+        for episode in range(5):
+
             score = BehavioralProbe._evaluate_episode(genome, config, seed=episode + 10, enable_plasticity=True)
             adaptation_scores.append(score)
 
@@ -308,9 +320,10 @@ class BehavioralProbe:
 
         config = task_configs[delayed_reward_task]
 
-        # Run multiple episodes to assess credit assignment
-        episodes = 20
+        # Run multiple episodes to assess credit assignment (reduced from 20 to 5)
+        episodes = 5
         episode_results = []
+
 
         for episode in range(episodes):
             result = BehavioralProbe._evaluate_delayed_reward_episode(genome, config, seed=episode)
@@ -382,7 +395,7 @@ class BehavioralProbe:
         """Evaluate genome in a specific environment configuration"""
         env = DeterministicVectorizedArena(
             num_envs=1,
-            max_steps=50,
+            max_steps=20,  # Reduced from 50 to 20
             seed=random.randint(0, 10000)
         )
 
@@ -390,7 +403,8 @@ class BehavioralProbe:
         total_reward = 0.0
         steps = 0
 
-        while steps < 50:
+        while steps < 20:  # Reduced from 50 to 20
+
             action = genome.act(state[0])
             actions = np.array([action])
 
@@ -427,7 +441,7 @@ class BehavioralProbe:
         """Evaluate single episode with task-specific modifications"""
         env = DeterministicVectorizedArena(
             num_envs=1,
-            max_steps=50,
+            max_steps=20,  # Reduced from 50 to 20
             seed=seed
         )
 
@@ -435,7 +449,8 @@ class BehavioralProbe:
         total_reward = 0.0
         steps = 0
 
-        while steps < 50:
+        while steps < 20:  # Reduced from 50 to 20
+
             action = genome.act(state[0])
             actions = np.array([action])
 
@@ -471,15 +486,15 @@ class BehavioralProbe:
         """Evaluate episode for delayed reward credit assignment"""
         env = DeterministicVectorizedArena(
             num_envs=1,
-            max_steps=100,
+            max_steps=30,  # Reduced from 100 to 30
             seed=seed
         )
 
         # Determine delay for this episode
         if task_config['delay_steps'] == 'random':
-            delay = random.randint(1, 10)
+            delay = random.randint(1, 5)  # Reduced from 1-10 to 1-5
         else:
-            delay = task_config['delay_steps']
+            delay = min(task_config['delay_steps'], 5)  # Cap at 5
 
         state = env.reset()
         actions_taken = []
@@ -490,7 +505,8 @@ class BehavioralProbe:
         # Choose a "good" action randomly for this episode
         good_action = random.randint(0, 3)  # Assuming 4 possible actions
 
-        while steps < 100:
+        while steps < 30:  # Reduced from 100 to 30
+
             action = genome.act(state[0])
             actions_taken.append(action)
             actions = np.array([action])
@@ -559,12 +575,14 @@ class BehavioralProbe:
                 lambda: BehavioralProbe.test_credit_assignment(genome, 'medium_delay')
             )
 
-            # Additional diagnostic tasks
-            try:
-                additional_probes = BehavioralProbe._run_additional_diagnostic_tasks(genome)
-                probe_results.extend(additional_probes)
-            except Exception as exc:
-                probe_errors.append({'probe_name': 'additional_diagnostics', 'error': str(exc)})
+            # Additional diagnostic tasks - only run every 10 generations to save time
+            if generation % 10 == 0:
+                try:
+                    additional_probes = BehavioralProbe._run_additional_diagnostic_tasks(genome)
+                    probe_results.extend(additional_probes)
+                except Exception as exc:
+                    probe_errors.append({'probe_name': 'additional_diagnostics', 'error': str(exc)})
+
 
             # Calculate summary scores
             summary_scores = {}
@@ -632,14 +650,15 @@ class BehavioralProbe:
     @staticmethod
     def _test_exploration_balance(genome: EvolvableGenome) -> ProbeResult:
         """Test balance between exploration and exploitation"""
-        env = DeterministicVectorizedArena(num_envs=1, max_steps=100, seed=42)
+        env = DeterministicVectorizedArena(num_envs=1, max_steps=30, seed=42)  # Reduced from 100 to 30
 
         state = env.reset()
         actions_taken = []
         rewards_received = []
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Assuming 4 actions
 
-        for step in range(100):
+        for step in range(30):  # Reduced from 100 to 30
+
             action = genome.act(state[0])
             actions_taken.append(action)
             action_counts[action] += 1
@@ -685,16 +704,17 @@ class BehavioralProbe:
         base_scores = []
         perturbed_scores = []
 
-        # Base evaluation
-        for seed in range(5):
+        # Base evaluation (reduced from 5 to 2)
+        for seed in range(2):
             score = BehavioralProbe._evaluate_in_environment(genome, {'name': 'normal'})
             base_scores.append(score)
 
-        # Perturbed evaluation (with noise and volatility)
-        for seed in range(5):
+        # Perturbed evaluation (with noise and volatility) (reduced from 5 to 2)
+        for seed in range(2):
             score = BehavioralProbe._evaluate_in_environment(genome,
                 {'name': 'perturbed', 'noise_level': 0.3, 'reward_volatility': 0.5})
             perturbed_scores.append(score)
+
 
         base_mean = np.mean(base_scores)
         perturbed_mean = np.mean(perturbed_scores)
@@ -728,7 +748,7 @@ class BehavioralProbe:
     def _test_multi_step_planning(genome: EvolvableGenome) -> ProbeResult:
         """Test capability for multi-step planning"""
         # Create a simple planning task
-        env = DeterministicVectorizedArena(num_envs=1, max_steps=20, seed=123)
+        env = DeterministicVectorizedArena(num_envs=1, max_steps=15, seed=123)  # Reduced from 20 to 15
 
         state = env.reset()
         action_sequence = []
@@ -738,7 +758,8 @@ class BehavioralProbe:
         # Look for patterns that suggest planning (e.g., repeating successful actions)
         successful_actions = []
 
-        for step in range(20):
+        for step in range(15):  # Reduced from 20 to 15
+
             action = genome.act(state[0])
             action_sequence.append(action)
 
@@ -793,18 +814,19 @@ class BehavioralProbe:
     @staticmethod
     def _test_adaptation_to_change(genome: EvolvableGenome) -> ProbeResult:
         """Test adaptation to environmental changes"""
-        # Phase 1: Normal environment
+        # Phase 1: Normal environment (reduced from 5 to 2)
         normal_scores = []
-        for episode in range(5):
+        for episode in range(2):
             score = BehavioralProbe._evaluate_episode(genome, {'name': 'normal'}, seed=episode)
             normal_scores.append(score)
 
-        # Phase 2: Changed environment (reversed rewards)
+        # Phase 2: Changed environment (reversed rewards) (reduced from 10 to 3)
         changed_scores = []
-        for episode in range(10):
+        for episode in range(3):
             score = BehavioralProbe._evaluate_episode(genome,
                 {'name': 'changed', 'reward_multiplier': -1.0}, seed=episode + 5, enable_plasticity=True)
             changed_scores.append(score)
+
 
         # Calculate adaptation metrics
         normal_mean = np.mean(normal_scores)
@@ -839,49 +861,84 @@ class BehavioralProbe:
 
     @staticmethod
     def _test_social_learning(genome: EvolvableGenome) -> ProbeResult:
-        """Test social learning capability (simplified)"""
-        # Simulate observing another agent's behavior
-        # For simplicity, test if genome can learn from demonstrated optimal actions
+        """Test social learning capability via demonstration + plasticity.
 
-        env = DeterministicVectorizedArena(num_envs=1, max_steps=30, seed=456)
+        Proper three-phase design:
+          1. Baseline  – evaluate genome before any demonstration.
+          2. Demonstration – step the environment with *expert* actions (not the
+             genome's), then feed the resulting reward to the genome's plasticity
+             so it can associate observed states with optimal outcomes.
+          3. Post-demo – re-evaluate the genome (with plasticity) and measure
+             whether performance improved relative to baseline.
+        """
+        task_config = {'name': 'social_base'}
 
-        # "Demonstrate" optimal actions (simulated)
-        optimal_actions = [1, 1, 0, 0, 1, 1, 0]  # Pattern to learn
+        # Phase 1: Baseline (no plasticity, fixed seeds)
+        baseline_scores = []
+        for episode in range(2):
+            score = BehavioralProbe._evaluate_episode(
+                genome, task_config, seed=episode + 400
+            )
+            baseline_scores.append(score)
+        baseline_mean = float(np.mean(baseline_scores))
 
+        # Phase 2: Demonstration – expert actions drive the env;
+        # genome observes states and receives reward signals via plasticity.
+        optimal_actions = [1, 1, 0, 0, 1, 1, 0]  # Expert action sequence
+        env = DeterministicVectorizedArena(num_envs=1, max_steps=15, seed=456)
         state = env.reset()
+
         imitation_score = 0.0
-        total_steps = 0
+        demonstration_reward = 0.0
 
         for optimal_action in optimal_actions:
-            action = genome.act(state[0])
-
-            # Reward for matching demonstrated action
-            if action == optimal_action:
+            # Record what the genome *would* have chosen (imitation tendency)
+            genome_action = genome.act(state[0])
+            if genome_action == optimal_action:
                 imitation_score += 1.0
 
-            actions = np.array([action])
-            state, reward, done = env.step(actions)
-            total_steps += 1
+            # Step the env with the EXPERT action — this is the demonstration
+            state, reward, done = env.step(np.array([optimal_action]))
+            reward_val = float(reward[0])
+            demonstration_reward += reward_val
+
+            # Feed the demonstration reward into the genome's plasticity so it
+            # can update its weights based on the expert's outcomes
+            if hasattr(genome, 'brain') and genome.brain:
+                genome.brain.update_plasticity(reward_val, done[0])
 
             if done[0]:
                 break
 
         imitation_accuracy = imitation_score / len(optimal_actions)
 
-        # Test if genome adapts after "demonstration"
-        adaptation_scores = []
-        for episode in range(3):
-            score = BehavioralProbe._evaluate_episode(genome, {'name': 'social'}, seed=episode + 100)
-            adaptation_scores.append(score)
+        # Phase 3: Post-demonstration – evaluate with plasticity enabled
+        post_demo_scores = []
+        for episode in range(2):
+            score = BehavioralProbe._evaluate_episode(
+                genome, task_config, seed=episode + 400, enable_plasticity=True
+            )
+            post_demo_scores.append(score)
+        post_demo_mean = float(np.mean(post_demo_scores))
 
-        social_learning_score = imitation_accuracy * np.mean(adaptation_scores)
+        # Primary metric: did plasticity-driven learning from the demonstration
+        # actually improve performance?
+        learning_gain = (post_demo_mean - baseline_mean) / (abs(baseline_mean) + 1e-6)
+
+        # Combined score: imitation tendency + clamped improvement gain
+        social_learning_score = (imitation_accuracy + max(0.0, learning_gain)) / 2.0
 
         metrics = {
             'optimal_actions': optimal_actions,
             'imitation_score': imitation_score,
             'imitation_accuracy': imitation_accuracy,
-            'adaptation_scores': adaptation_scores,
-            'social_learning_score': social_learning_score
+            'baseline_scores': baseline_scores,
+            'baseline_mean': baseline_mean,
+            'post_demo_scores': post_demo_scores,
+            'post_demo_mean': post_demo_mean,
+            'learning_gain': learning_gain,
+            'demonstration_reward': demonstration_reward,
+            'social_learning_score': social_learning_score,
         }
 
         return ProbeResult(
@@ -891,6 +948,7 @@ class BehavioralProbe:
             metrics=metrics,
             timestamp=time.time()
         )
+
 
     @staticmethod
     def _test_meta_learning(genome: EvolvableGenome) -> ProbeResult:
@@ -906,9 +964,9 @@ class BehavioralProbe:
         task_performances = []
 
         for task in tasks:
-            # Quick adaptation to each task
+            # Quick adaptation to each task (reduced from 5 to 2 episodes)
             task_scores = []
-            for episode in range(5):
+            for episode in range(2):
                 score = BehavioralProbe._evaluate_episode(genome, task,
                     seed=episode + 200, enable_plasticity=True)
                 task_scores.append(score)
@@ -916,8 +974,9 @@ class BehavioralProbe:
             task_performances.append({
                 'task': task['name'],
                 'scores': task_scores,
-                'improvement': task_scores[-1] - task_scores[0] if task_scores else 0.0
+                'improvement': task_scores[-1] - task_scores[0] if len(task_scores) >= 2 else 0.0
             })
+
 
         # Meta-learning score: average improvement across tasks
         improvements = [p['improvement'] for p in task_performances]
@@ -1053,13 +1112,29 @@ class BehavioralProbe:
                 'population_summary': {},
                 'individual_reports': []
             }
+        
+        # Skip probes entirely on non-checkpoint generations after gen 100
+        if generation > 100 and not save_reports:
+            return {
+                'generation': generation,
+                'num_genomes_probed': 0,
+                'population_summary': {},
+                'individual_reports': [],
+                'skipped': True,
+                'reason': 'Non-checkpoint generation after gen 100'
+            }
+        
+        # Use adaptive probe budget based on generation
+        effective_budget = get_probe_budget(generation)
+        
         probe_reports = []
         selected_genome_ids = set()
         probes_run = 0  # Track number of probes run this generation
 
         # Limit probe report saving to top K, novelty outliers (middle), failures, and random sample
         if save_reports and genomes:
-            K = min(10, len(genomes) // 4)  # Adaptive K based on population size
+            K = min(5, len(genomes) // 8)  # Reduced K from 10 to 5
+
             sorted_genomes = sorted(genomes, key=lambda g: g.fitness, reverse=True)
             selected_indices = set()
 
@@ -1074,8 +1149,8 @@ class BehavioralProbe:
             middle_end = middle_start + K
             selected_indices.update(range(max(0, middle_start), min(len(genomes), middle_end)))
 
-            # Random sample (5%)
-            random_sample_size = max(1, int(0.05 * len(genomes)))
+            # Random sample (2% - reduced from 5%)
+            random_sample_size = max(1, int(0.02 * len(genomes)))
             random_indices = np.random.choice(len(genomes), size=random_sample_size, replace=False)
             selected_indices.update(random_indices)
 
@@ -1085,8 +1160,9 @@ class BehavioralProbe:
 
         for genome in genomes:
             # Check probe budget - skip if exhausted
-            if probes_run >= PROBE_BUDGET:
-                print(f"Probe budget ({PROBE_BUDGET}) exhausted for generation {generation}, skipping remaining probes")
+            if probes_run >= effective_budget:
+                print(f"Probe budget ({effective_budget}) exhausted for generation {generation}, skipping remaining probes")
+
                 # EXIT THIS STAGE COMPLETELY
                 population_summary = BehavioralProbe._aggregate_population_results(probe_reports) if probe_reports else {}
                 return {

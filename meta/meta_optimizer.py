@@ -5,7 +5,8 @@ from typing import Dict, List, Any, Tuple
 class EvolutionModifier:
     """Modify evolution parameters based on experiments"""
 
-    def __init__(self):
+    def __init__(self, evolution_engine=None):
+        self.evolution_engine = evolution_engine
         self.parameter_space = {
             'mutation_rate': (0.01, 0.5),
             'mutation_strength': (0.01, 0.3),
@@ -40,8 +41,9 @@ class EvolutionModifier:
 
     def apply_modifications(self, modifications: List[Dict[str, Any]], evolution_engine) -> None:
         """Apply modifications to evolution engine"""
+        self.evolution_engine = evolution_engine
         for mod in modifications:
-            setattr(evolution_engine, mod['parameter'], mod['new_value'])
+            self._set_param(evolution_engine, mod['parameter'], mod['new_value'])
             self.modification_history.append(mod)
 
     def rollback_modifications(self, evolution_engine) -> None:
@@ -58,7 +60,7 @@ class EvolutionModifier:
         # Apply rollback
         for param, old_value in last_mods.items():
             if old_value is not None:
-                setattr(evolution_engine, param, old_value)
+                self._set_param(evolution_engine, param, old_value)
 
         # Remove the last modifications from history
         self.modification_history = self.modification_history[:-len(last_mods)]
@@ -87,16 +89,32 @@ class EvolutionModifier:
         return successful_params
 
     def _get_current_value(self, param: str) -> float:
-        """Get current value of parameter (placeholder - would need access to evolution engine)"""
-        # This is a placeholder - in practice, this would get the current value from the evolution engine
-        # For now, return default values
+        """Get current value of a parameter from the live evolution engine, with defaults as fallback."""
         defaults = {
             'mutation_rate': 0.1,
             'mutation_strength': 0.1,
             'selection_pressure': 2.0,
             'novelty_weight': 0.5
         }
+        if self.evolution_engine is not None:
+            if param == 'selection_pressure':
+                selector = getattr(self.evolution_engine, 'selector', None)
+                if selector is not None:
+                    return float(getattr(selector, 'selection_pressure', defaults[param]))
+            else:
+                value = getattr(self.evolution_engine, param, None)
+                if value is not None:
+                    return float(value)
         return defaults.get(param, 0.0)
+
+    def _set_param(self, evolution_engine, param: str, value: float) -> None:
+        """Set a parameter on the evolution engine, routing selection_pressure to engine.selector."""
+        if param == 'selection_pressure':
+            selector = getattr(evolution_engine, 'selector', None)
+            if selector is not None:
+                setattr(selector, 'selection_pressure', value)
+        else:
+            setattr(evolution_engine, param, value)
 
     def _propose_new_value(self, param: str, current_value: float, successful_params: Dict[str, float]) -> float:
         """Propose new value for parameter based on successful patterns"""

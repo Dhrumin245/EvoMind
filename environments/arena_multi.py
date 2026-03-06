@@ -1,7 +1,6 @@
 import numpy as np
 from typing import Tuple, Dict, List, Optional, Any
 from dataclasses import dataclass, field
-import warnings
 
 # Import curriculum for config
 from curriculum.curriculum import CurriculumStage, get_stage_config
@@ -121,7 +120,15 @@ class EnergySystem:
 
 
 class PredatorPackSystem:
-    """Manages predator pack coordination"""
+    """
+    Manages predator pack coordination.
+
+    Coordination bonuses are earned through *actual physical cohesion* —
+    how tightly clustered pack members are around their shared center of mass.
+    A dispersed pack earns little or no bonus, forcing evolved brains to
+    actively learn to stay near pack-mates rather than receiving the reward
+    for free from spatial proximity to prey alone.
+    """
 
     def __init__(self, pack_size: int = 3):
         self.pack_size = pack_size
@@ -155,8 +162,12 @@ class PredatorPackSystem:
         self.pack_coordination = {
             'target_prey': np.full(total_packs, -1, dtype=int),
             'strategy': np.zeros(total_packs, dtype=int),  # 0=random, 1=encircle, 2=chase
-            'cohesion': np.ones(total_packs, dtype=np.float32)
+            # cohesion: actual spatial tightness of the pack [0, 1].
+            # 1.0 = all members at same point, 0.0 = spread >= MAX_COHESION_DIST pixels apart.
+            'cohesion': np.zeros(total_packs, dtype=np.float32)
         }
+        # Distance (pixels from pack center) at which cohesion reaches 0
+        self.MAX_COHESION_DIST: float = 150.0
 
     def update_pack_strategy(self, predator_positions: np.ndarray,
                            prey_positions: np.ndarray, prey_alive: np.ndarray,
@@ -194,6 +205,15 @@ class PredatorPackSystem:
                 # Find closest alive prey in this environment
                 pack_center = np.mean(pack_predators, axis=0)
 
+                # ── Spatial cohesion (brain must actually cluster to earn bonus) ──
+                if len(pack_predators) > 1:
+                    member_distances = np.linalg.norm(pack_predators - pack_center, axis=1)
+                    mean_spread = float(np.mean(member_distances))
+                else:
+                    mean_spread = 0.0  # Single predator: perfect cohesion
+                cohesion = float(np.clip(1.0 - mean_spread / self.MAX_COHESION_DIST, 0.0, 1.0))
+                self.pack_coordination['cohesion'][pack_global_idx] = cohesion
+
                 if np.any(env_prey_alive):
                     alive_prey_positions = env_prey_positions[env_prey_alive]
                     prey_distances = np.linalg.norm(alive_prey_positions - pack_center, axis=1)
@@ -213,19 +233,31 @@ class PredatorPackSystem:
                     self.pack_coordination['strategy'][pack_global_idx] = 0  # Random
 
     def get_coordination_bonus(self, predator_idx: int) -> float:
-        """Get coordination bonus for a predator based on pack strategy"""
+        """
+        Get coordination bonus for a predator.
+
+        The base bonus is determined by the current hunting strategy, but is
+        scaled by the pack's *actual spatial cohesion* — how tightly clustered
+        the members are around their center of mass.  A dispersed pack receives
+        a near-zero bonus, incentivising evolved brains to stay close to
+        pack-mates rather than hunting solo.
+        """
         if self.pack_assignments is None or self.pack_coordination is None:
             return 0.0
 
         pack_idx = self.pack_assignments[predator_idx]
         strategy = self.pack_coordination['strategy'][pack_idx]
+        cohesion = float(self.pack_coordination['cohesion'][pack_idx])
 
-        # Bonus for coordinated hunting
-        if strategy == 1:  # Encircle
-            return 0.3
+        # Base bonus by strategy (max values); scaled to zero when pack is dispersed
+        if strategy == 1:   # Encircle
+            base = 0.3
         elif strategy == 2:  # Chase
-            return 0.2
-        return 0.0
+            base = 0.2
+        else:               # Random / no prey
+            return 0.0
+
+        return base * cohesion
 
 
 class DeterministicRNG:
@@ -683,6 +715,14 @@ class MultiAgentArena:
 
         self.step_count += 1
 
+        # ── Noise magnitudes for this step (computed once, reused below) ──────
+        # All three channels default to 0.0, so this is a no-op unless the
+        # curriculum stage config sets non-zero noise levels.
+        _sched = self.get_current_noise_level(self.step_count)
+        _obs_noise_mag      = self.arena_config.observation_noise_level * _sched
+        _action_noise_mag   = self.arena_config.action_noise_level      * _sched
+        _dynamics_noise_mag = self.arena_config.dynamics_noise_level    * _sched
+
         # PRESSURE INJECTION #1: Kill non-adaptive agents mid-episode
         if self.step_count == self.ADAPTATION_POINT and not self.adaptation_triggered:
             self._trigger_adaptation()
@@ -698,7 +738,16 @@ class MultiAgentArena:
                 self.num_predators_per_env,
                 self.batch_size
             )
-        
+
+        # ── NOISE INJECTION 1/3: action noise ────────────────────────────────
+        # Corrupt action commands before physics so brains must be robust to
+        # actuator jitter.  Work on copies to avoid mutating the caller's arrays.
+        if _action_noise_mag > 0.0:
+            prey_actions     = prey_actions     + self.noise_injector.inject_action_noise(
+                prey_actions.astype(np.float32), _action_noise_mag)
+            predator_actions = predator_actions + self.noise_injector.inject_action_noise(
+                predator_actions.astype(np.float32), _action_noise_mag)
+
         # Process prey actions
         prey_rewards, prey_info = self._process_prey_actions(prey_actions)
         
@@ -707,6 +756,17 @@ class MultiAgentArena:
         
         # Update positions
         self._update_positions()
+
+        # ── NOISE INJECTION 2/3: dynamics noise ──────────────────────────────
+        # Perturb positions symmetrically (±) after the physics update but
+        # *before* boundary clamping so agents never leave the arena.
+        if _dynamics_noise_mag > 0.0:
+            self.prey_positions[~self.prey_done] += (
+                self.noise_injector.inject_dynamics_noise(
+                    self.prey_positions[~self.prey_done], _dynamics_noise_mag))
+            self.predator_positions[~self.predator_done] += (
+                self.noise_injector.inject_dynamics_noise(
+                    self.predator_positions[~self.predator_done], _dynamics_noise_mag))
 
         # Reward shaping (uses updated positions)
         self._apply_shaping_and_novelty(prey_rewards, predator_rewards)
@@ -728,7 +788,7 @@ class MultiAgentArena:
         self._handle_boundaries()
         
         # Update energy systems
-        self._update_energy_systems()
+        self._update_energy_systems(prey_info, predator_info)
         
         # Update done states
         self._update_done_states()
@@ -753,7 +813,16 @@ class MultiAgentArena:
         
         # Get observations
         prey_states, predator_states = self._get_observations()
-        
+
+        # ── NOISE INJECTION 3/3: observation noise ────────────────────────────
+        # Add noise to the sensor readings returned to the brains so evolved
+        # networks must generalise beyond exact values.
+        if _obs_noise_mag > 0.0:
+            prey_states     = self.noise_injector.inject_observation_noise(
+                prey_states,     _obs_noise_mag)
+            predator_states = self.noise_injector.inject_observation_noise(
+                predator_states, _obs_noise_mag)
+
         # Compile info
         info = self._compile_info(prey_info, predator_info, env_done)
         
@@ -1064,21 +1133,20 @@ class MultiAgentArena:
             self.arena_config.screen_height
         )
     
-    def _update_energy_systems(self):
+    def _update_energy_systems(self, prey_info: Dict[str, Any], predator_info: Dict[str, Any]):
         """Update energy systems for both prey and predators"""
-        # Update prey energy (we need info about which prey are moving/turning)
-        # For simplicity, assume all active prey are moving
+        # Use actual moving/turning masks from action processing so turn costs are charged correctly
         active_prey = ~self.prey_done
-        moving_prey = active_prey  # Simplified
-        turning_prey = np.zeros_like(active_prey)  # Would need actual turning info
-        
+        moving_prey = prey_info['moving'] & active_prey
+        turning_prey = prey_info['turning'] & active_prey
+
         self.energy_system_prey.apply_movement_cost(moving_prey, turning_prey)
-        
+
         # Update predator energy
         active_predator = ~self.predator_done
-        moving_predator = active_predator
-        turning_predator = np.zeros_like(active_predator)
-        
+        moving_predator = predator_info['moving'] & active_predator
+        turning_predator = predator_info['turning'] & active_predator
+
         self.energy_system_predator.apply_movement_cost(moving_predator, turning_predator)
         
         # Update starvation tracking
@@ -1350,6 +1418,7 @@ class MultiAgentArena:
         """Compile information dictionary"""
         # Get success signals and metrics for the current episode
         success_signals = self.get_episode_success_signals()
+        per_env = self._compute_per_env_success_signals()
 
         # Get success definition for current stage
         success_definition = self.get_success_definition(self.stage.name if hasattr(self.stage, 'name') else str(self.stage))
@@ -1374,10 +1443,19 @@ class MultiAgentArena:
                 'prey_energy_used': success_signals['prey_energy_used'],
                 'predator_energy_used': success_signals['predator_energy_used']
             },
+            'energy_usage_per_env': {
+                'prey_energy_used': per_env['prey_energy_used'],
+                'predator_energy_used': per_env['predator_energy_used']
+            },
             'novelty_hits': success_signals['novelty_hits'],
+            'novelty_hits_per_env': per_env['novelty_hits'],
             'adaptation_recovery': {
                 'prey_adaptation_recovery': success_signals['prey_adaptation_recovery'],
                 'predator_adaptation_recovery': success_signals['predator_adaptation_recovery']
+            },
+            'adaptation_recovery_per_env': {
+                'prey_adaptation_recovery': per_env['prey_adaptation_recovery'],
+                'predator_adaptation_recovery': per_env['predator_adaptation_recovery']
             }
         }
     
@@ -1569,9 +1647,10 @@ class MultiAgentArena:
         prey_energy_used = np.sum(self.prey_energy_initial - self.prey_energy)
         predator_energy_used = np.sum(self.predator_energy_initial - self.predator_energy)
 
-        # Novelty hit counts (simplified: number of unique behaviors)
-        # This is a placeholder - would need more sophisticated tracking
-        novelty_hits = 0
+        # Novelty hit counts based on unique grid cells visited
+        prey_novelty_hits = sum(len(s) for s in self._visited_prey) if self._visited_prey else 0
+        predator_novelty_hits = sum(len(s) for s in self._visited_predator) if self._visited_predator else 0
+        novelty_hits = prey_novelty_hits + predator_novelty_hits
 
         # Adaptation recovery score (how well agents recovered from energy depletion)
         prey_recovery = np.mean(np.maximum(0, self.prey_energy - self.prey_config.energy_max * 0.1))
@@ -1584,8 +1663,66 @@ class MultiAgentArena:
             'prey_energy_used': float(prey_energy_used),
             'predator_energy_used': float(predator_energy_used),
             'novelty_hits': int(novelty_hits),
+            'prey_novelty_hits': int(prey_novelty_hits),
+            'predator_novelty_hits': int(predator_novelty_hits),
             'prey_adaptation_recovery': float(prey_recovery),
             'predator_adaptation_recovery': float(predator_recovery)
+        }
+
+    def _compute_per_env_success_signals(self) -> Dict[str, np.ndarray]:
+        """Compute per-environment success signals and energy usage."""
+        prey_alive_per_env = np.zeros(self.batch_size, dtype=np.int32)
+        predator_captures_per_env = np.zeros(self.batch_size, dtype=np.int32)
+        food_collected_per_env = np.zeros(self.batch_size, dtype=np.int32)
+        prey_energy_used_per_env = np.zeros(self.batch_size, dtype=np.float32)
+        predator_energy_used_per_env = np.zeros(self.batch_size, dtype=np.float32)
+        prey_recovery_per_env = np.zeros(self.batch_size, dtype=np.float32)
+        predator_recovery_per_env = np.zeros(self.batch_size, dtype=np.float32)
+        prey_novelty_per_env = np.zeros(self.batch_size, dtype=np.int32)
+        predator_novelty_per_env = np.zeros(self.batch_size, dtype=np.int32)
+
+        for env_idx in range(self.batch_size):
+            prey_start = env_idx * self.num_prey_per_env
+            prey_end = prey_start + self.num_prey_per_env
+            predator_start = env_idx * self.num_predators_per_env
+            predator_end = predator_start + self.num_predators_per_env
+
+            prey_alive_per_env[env_idx] = int(np.sum(self.prey_alive[prey_start:prey_end]))
+            predator_captures_per_env[env_idx] = int(np.sum(self.predator_captures[predator_start:predator_end]))
+            food_collected_per_env[env_idx] = int(np.sum(self.prey_food_collected[prey_start:prey_end]))
+
+            prey_energy_used_per_env[env_idx] = float(
+                np.sum(self.prey_energy_initial - self.prey_energy[prey_start:prey_end])
+            )
+            predator_energy_used_per_env[env_idx] = float(
+                np.sum(self.predator_energy_initial - self.predator_energy[predator_start:predator_end])
+            )
+
+            prey_recovery_per_env[env_idx] = float(
+                np.mean(np.maximum(0, self.prey_energy[prey_start:prey_end] - self.prey_config.energy_max * 0.1))
+            )
+            predator_recovery_per_env[env_idx] = float(
+                np.mean(np.maximum(0, self.predator_energy[predator_start:predator_end] - self.predator_config.energy_max * 0.1))
+            )
+
+            prey_novelty_per_env[env_idx] = int(
+                sum(len(self._visited_prey[idx]) for idx in range(prey_start, prey_end))
+            )
+            predator_novelty_per_env[env_idx] = int(
+                sum(len(self._visited_predator[idx]) for idx in range(predator_start, predator_end))
+            )
+
+        return {
+            'prey_alive': prey_alive_per_env,
+            'predator_captures': predator_captures_per_env,
+            'food_collected': food_collected_per_env,
+            'prey_energy_used': prey_energy_used_per_env,
+            'predator_energy_used': predator_energy_used_per_env,
+            'prey_adaptation_recovery': prey_recovery_per_env,
+            'predator_adaptation_recovery': predator_recovery_per_env,
+            'prey_novelty_hits': prey_novelty_per_env,
+            'predator_novelty_hits': predator_novelty_per_env,
+            'novelty_hits': prey_novelty_per_env + predator_novelty_per_env
         }
 
     def get_success_definition(self, stage: str) -> Dict[str, Any]:
@@ -1621,18 +1758,43 @@ class MultiAgentArena:
         return stage_configs.get(stage, stage_configs['FORAGING'])
 
     def get_robustness_metrics(self) -> Dict[str, Any]:
-        """Get robustness metrics for fitness evaluation"""
+        """Get robustness metrics for fitness evaluation.
+
+        robustness_score reflects how much noise is actually active across all
+        three channels.  When all base levels are 0.0 (the default) the score
+        stays at 1.0 regardless of the schedule position.
+        """
         noise_level = self.get_current_noise_level(self.step_count)
 
-        # Calculate performance degradation under noise
-        base_performance = self.get_episode_success_signals()
-        robustness_score = 1.0 - (noise_level * 0.2)  # Reduce score by up to 20% under full noise
+        # Effective magnitudes for each active channel at this step
+        obs_mag      = self.arena_config.observation_noise_level * noise_level
+        action_mag   = self.arena_config.action_noise_level      * noise_level
+        dynamics_mag = self.arena_config.dynamics_noise_level    * noise_level
 
+        # Mean active noise across channels that have non-zero base levels.
+        # Uses only configured channels so a single-channel setup isn't
+        # deflated by the two silent channels.
+        base_levels = [
+            self.arena_config.observation_noise_level,
+            self.arena_config.action_noise_level,
+            self.arena_config.dynamics_noise_level,
+        ]
+        active_mags = [obs_mag, action_mag, dynamics_mag]
+        configured  = [m for b, m in zip(base_levels, active_mags) if b > 0.0]
+        mean_active_noise = float(np.mean(configured)) if configured else 0.0
+
+        # robustness_score: 1.0 at silence, approaches 0 as noise saturates
+        robustness_score = max(0.0, 1.0 - mean_active_noise)
+
+        base_performance = self.get_episode_success_signals()
         return {
             'noise_level': float(noise_level),
+            'obs_noise_mag': float(obs_mag),
+            'action_noise_mag': float(action_mag),
+            'dynamics_noise_mag': float(dynamics_mag),
             'robustness_score': float(robustness_score),
             'performance_under_noise': base_performance['food_collected'] * robustness_score,
-            'noise_penalty': float(noise_level * 0.1)
+            'noise_penalty': mean_active_noise * 0.1
         }
 
     def get_current_noise_level(self, step: int) -> float:
@@ -1668,13 +1830,36 @@ class MultiAgentArena:
 
     def get_episode_info(self) -> Dict[str, Any]:
         """Get episode-level metrics for evaluation"""
-        # TODO: Implement comprehensive info collection for metrics contract
-        # Should include: success signals, energy usage summaries, novelty hit counts, adaptation recovery score
+        # Provide comprehensive info collection for metrics contract
         robustness_metrics = self.get_robustness_metrics()
+        success_signals = self.get_episode_success_signals()
+        success_definition = self.get_success_definition(self.stage.name if hasattr(self.stage, 'name') else str(self.stage))
+        per_env = self._compute_per_env_success_signals()
+        env_done = self._check_episode_termination()
         return {
-            'prey_energy': np.zeros(self.num_prey_per_env * self.batch_size),
-            'predator_energy': np.zeros(self.num_predators_per_env * self.batch_size),
-            'env_done': np.zeros(self.batch_size, dtype=bool),
+            'prey_energy': self.energy_system_prey.get_energy_normalized().copy(),
+            'predator_energy': self.energy_system_predator.get_energy_normalized().copy(),
+            'env_done': env_done.copy(),
             'robustness_metrics': robustness_metrics,
-            # TODO: Add success signals, novelty hits, adaptation recovery
+            'success_signals': success_signals,
+            'success_definition': success_definition,
+            'success_signals_per_env': per_env,
+            'energy_usage': {
+                'prey_energy_used': success_signals['prey_energy_used'],
+                'predator_energy_used': success_signals['predator_energy_used']
+            },
+            'energy_usage_per_env': {
+                'prey_energy_used': per_env['prey_energy_used'],
+                'predator_energy_used': per_env['predator_energy_used']
+            },
+            'novelty_hits': success_signals['novelty_hits'],
+            'novelty_hits_per_env': per_env['novelty_hits'],
+            'adaptation_recovery': {
+                'prey_adaptation_recovery': success_signals['prey_adaptation_recovery'],
+                'predator_adaptation_recovery': success_signals['predator_adaptation_recovery']
+            },
+            'adaptation_recovery_per_env': {
+                'prey_adaptation_recovery': per_env['prey_adaptation_recovery'],
+                'predator_adaptation_recovery': per_env['predator_adaptation_recovery']
+            }
         }

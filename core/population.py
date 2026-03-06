@@ -2,7 +2,7 @@ from core.genome import Genome
 import statistics
 import numpy as np
 import random
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 
 class Population:
     # Define possible population roles

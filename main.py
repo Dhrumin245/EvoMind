@@ -1,5 +1,6 @@
 
 import os
+import signal
 
 # Configure threadpools BEFORE importing NumPy/Torch.
 # This prevents CPU oversubscription and huge slowdowns on Windows.
@@ -7,7 +8,13 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+# Python 3.13 propagates KeyboardInterrupt through exec() in dataclasses.
+# VS Code terminals can send stray SIGINT on attach, crashing torch import.
+# Temporarily ignore SIGINT while torch loads its dataclass-heavy internals.
+_prev_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
 import torch
+signal.signal(signal.SIGINT, _prev_sigint)
 import random
 import warnings
 import logging
@@ -17,12 +24,54 @@ import json
 import time
 import concurrent.futures
 import threading
+from collections import OrderedDict
 import sys
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 from typing import Dict, Any, Optional, List, cast
 from dataclasses import dataclass, field
 from enum import Enum
+
+# Fitness cache to avoid re-evaluating identical genome pairs.
+_FITNESS_CACHE: "OrderedDict[tuple, Dict[str, float]]" = OrderedDict()
+_FITNESS_CACHE_LOCK = threading.Lock()
+
+_ACTIVE_CONFIG: Optional["EvolutionConfig"] = None
+_ACTIVE_GENERATION: int = 0
+
+
+def _make_fitness_cache_key(prey_genome, predator_genome, stage_config, max_steps: int, do_nonplastic_compare: bool) -> tuple:
+    prey_sig = getattr(prey_genome, "signature", None) or getattr(prey_genome, "genome_id", "unknown_prey")
+    pred_sig = getattr(predator_genome, "signature", None) or getattr(predator_genome, "genome_id", "unknown_pred")
+    stage_key = json.dumps(stage_config, sort_keys=True, default=str) if stage_config else "none"
+    return (prey_sig, pred_sig, stage_key, int(max_steps), bool(do_nonplastic_compare))
+
+def _get_cached_fitness(cache_key: tuple) -> Optional[Dict[str, float]]:
+    with _FITNESS_CACHE_LOCK:
+        cached = _FITNESS_CACHE.get(cache_key)
+        if cached is not None:
+            _FITNESS_CACHE.move_to_end(cache_key)
+        return cached
+
+def _set_cached_fitness(cache_key: tuple, value: Dict[str, float], max_size: int) -> None:
+    with _FITNESS_CACHE_LOCK:
+        _FITNESS_CACHE[cache_key] = value
+        _FITNESS_CACHE.move_to_end(cache_key)
+        while len(_FITNESS_CACHE) > max_size:
+            _FITNESS_CACHE.popitem(last=False)
+
+def _get_effective_max_steps(config: "EvolutionConfig", stage_config: Optional[Dict[str, Any]], generation: int) -> int:
+    stage_max_steps = int(stage_config.get("max_steps", config.max_steps)) if stage_config else config.max_steps
+    max_steps = min(int(config.max_steps), stage_max_steps)
+    if config.reduce_episode_length_early and generation < config.early_curriculum_generations:
+        max_steps = max(1, int(max_steps * config.early_curriculum_reduction_factor))
+    return max_steps
+
+def _get_opponent_sample_size(num_opponents: int, partial_enabled: bool, partial_fraction: float) -> int:
+    if not partial_enabled:
+        return num_opponents
+    return max(1, int(round(num_opponents * partial_fraction)))
 
 try:
     import torch
@@ -82,6 +131,7 @@ class EpisodeMetrics:
     novelty: float  # Novelty score (exploration of new strategies/behaviors)
     seed: int  # Random seed used for this evaluation
     stage: str  # Curriculum stage name
+    adaptability: float = 0.0  # Reward delta from lifetime learning (plastic vs non-plastic)
     opponent_id: Optional[str] = None  # ID of opponent genome (for co-evolution)
     saturation_penalty: Optional[float] = None  # Penalty for high saturation in networks
     dead_unit_penalty: Optional[float] = None  # Penalty for dead units in networks
@@ -109,7 +159,7 @@ class EvolutionConfig:
     elite_count: int = 5
     mutation_rate: float = 0.001
     mutation_strength: float = 0.1
-    architecture_mutation_rate: float = 0.01
+    architecture_mutation_rate: float = 0.05
     base_seed: int = 42
     envs_per_genome: int = 8
     batch_size: int = 2
@@ -120,10 +170,11 @@ class EvolutionConfig:
     # and is not safe unless opponents are deep-copied (brains are mutated per rollout).
     use_threaded_eval: bool = False
     # Fraction of evaluations that also run the non-plastic rollout.
-    # Setting this to 0.0 makes evaluation ~2x faster.
-    nonplastic_check_fraction: float = 0.0
+    # Higher values improve adaptability measurement but slow evaluation.
+    nonplastic_check_fraction: float = 0.25
     # Plotting/diagnostics are expensive; do them every N generations.
-    plot_every: int = 20
+    plot_every: int = 50  # Reduced from 20 to 50 for performance
+
     # Multi-agent specific
     num_prey_per_arena: int = 10
     num_predators_per_arena: int = 3
@@ -133,30 +184,102 @@ class EvolutionConfig:
 
     # Milestone 4: Speciation + novelty archive knobs
     speciation_enabled: bool = True
-    speciation_compatibility_threshold: float = 3.0
-    speciation_architecture_weight: float = 0.3
-    speciation_behavior_weight: float = 0.4
-    speciation_param_weight: float = 0.3
+    speciation_compatibility_threshold: float = 0.85
+    speciation_compatibility_decay_rate: float = 400.0
+    speciation_architecture_weight: float = 0.6
+    speciation_behavior_weight: float = 0.2
+    speciation_param_weight: float = 0.2
     speciation_min_species_size: int = 5
     speciation_max_stagnation: int = 15
+    speciation_min_offspring_per_species: int = 5
+    speciation_target_species_min: int = 4
+    speciation_target_species_max: int = 7
+    speciation_adjust_rate: float = 0.05
+    speciation_threshold_min: float = 0.1
+    speciation_threshold_max: float = 5.0
+
+    # Prey-specific diversity controls
+    prey_speciation_compatibility_threshold: float = 0.75
+    prey_novelty_weight: float = 0.6
+    prey_min_species_enforcement: int = 2
+    prey_min_species_adjust_rate: float = 0.2
+
+    # Predator-specific diversity controls (Issue 3: Fix predator monoculture)
+    predator_speciation_compatibility_threshold: float = 0.75
+    predator_novelty_weight: float = 0.6
+    predator_min_species_enforcement: int = 2
+    predator_min_species_adjust_rate: float = 0.2
+
+    # Cross-species reproduction rate (5-10% recommended to maintain speciation)
+    cross_species_reproduction_rate: float = 0.05
 
     novelty_archive_enabled: bool = True
+
     novelty_threshold: float = 0.1
     novelty_max_archive_size: int = 100
     novelty_immigration_rate: float = 0.1
     novelty_archive_add_top_k: int = 5
 
     # Weight used by fitness shaping (currently EpisodeMetrics.novelty is a stub)
-    novelty_weight: float = 0.2
+    novelty_weight: float = 0.5
+    novelty_fitness_beta: float = 0.2
+
+    # Adaptability pressure schedule (favor learning early, then taper)
+    adaptability_weight_base: float = 0.3
+    adaptability_weight_boost: float = 1.0
+    adaptability_boost_generations: int = 15
+    adaptability_taper_generations: int = 10
     # PPO inner-loop training - DISABLED: Contradicts NeuroGenesis philosophy
     ppo_training_steps: int = 100  # Number of PPO training steps per genome
     enable_ppo_inner_loop: bool = False  # PERMANENTLY DISABLED: Evolution discovers learning rules, not gradients
-    
+
+    # === Performance Optimization Parameters ===
+    # Early stopping: terminate episode if score is catastrophically low
+    early_stopping_enabled: bool = True  # Enable early stopping
+    early_stopping_threshold: float = -30.0  # Catastrophic low score threshold
+    early_stopping_patience: int = 5  # Steps to wait before terminating
+
+    # Curriculum-aware episode length: reduce steps in early generations
+    reduce_episode_length_early: bool = True  # Enable reduced episode length
+    early_curriculum_reduction_factor: float = 0.5  # Multiply max_steps by this in early generations
+    early_curriculum_generations: int = 50  # Number of generations to apply reduction
+
+    # Partial evaluation: evaluate on subset of seeds
+    partial_evaluation_enabled: bool = True  # Enable partial evaluation
+    partial_eval_fraction: float = 0.5  # Fraction of seeds to evaluate (0.0-1.0)
+
+    # Fitness caching: cache fitness for identical genomes
+    fitness_cache_enabled: bool = True  # Enable fitness caching
+    fitness_cache_max_size: int = 1000  # Maximum cache size
+
     def __post_init__(self):
         """Validate configuration"""
         assert self.population_size > 0, "Population size must be positive"
         assert self.predator_population_size > 0, "Predator population size must be positive"
         assert self.mutation_rate >= 0 and self.mutation_rate <= 1, "Mutation rate must be between 0 and 1"
+        # Validate optimization parameters
+        assert -100 <= self.early_stopping_threshold <= 0, "Early stopping threshold must be between -100 and 0"
+        assert 0 < self.early_curriculum_reduction_factor <= 1, "Reduction factor must be between 0 and 1"
+        assert 0 < self.partial_eval_fraction <= 1, "Partial eval fraction must be between 0 and 1"
+        assert self.speciation_target_species_min >= 1, "Speciation target min must be >= 1"
+        assert self.speciation_target_species_max >= self.speciation_target_species_min, "Speciation target max must be >= min"
+        assert 0 < self.speciation_adjust_rate <= 1, "Speciation adjust rate must be in (0, 1]"
+        assert 0 < self.speciation_threshold_min <= self.speciation_threshold_max, "Speciation threshold bounds invalid"
+        assert self.prey_speciation_compatibility_threshold > 0, "Prey speciation threshold must be > 0"
+        assert 0 <= self.prey_novelty_weight <= 1, "Prey novelty weight must be between 0 and 1"
+        assert self.prey_min_species_enforcement >= 1, "Prey min species enforcement must be >= 1"
+        assert 0 < self.prey_min_species_adjust_rate <= 1, "Prey min species adjust rate must be in (0, 1]"
+        assert self.predator_speciation_compatibility_threshold > 0, "Predator speciation threshold must be > 0"
+        assert 0 <= self.predator_novelty_weight <= 1, "Predator novelty weight must be between 0 and 1"
+        assert self.predator_min_species_enforcement >= 1, "Predator min species enforcement must be >= 1"
+        assert 0 < self.predator_min_species_adjust_rate <= 1, "Predator min species adjust rate must be in (0, 1]"
+        assert 0.0 <= self.cross_species_reproduction_rate <= 1.0, "Cross-species reproduction rate must be between 0.0 and 1.0"
+
+        assert self.adaptability_weight_base >= 0, "Adaptability base weight must be >= 0"
+
+        assert self.adaptability_weight_boost >= 0, "Adaptability boost weight must be >= 0"
+        assert self.adaptability_boost_generations >= 0, "Adaptability boost generations must be >= 0"
+        assert self.adaptability_taper_generations >= 0, "Adaptability taper generations must be >= 0"
 
 class EvolutionMode(Enum):
     SINGLE_AGENT = "single"
@@ -256,6 +379,13 @@ def evaluate_population_parallel(
     num_predators_per_env,
     num_workers,
     nonplastic_check_fraction: float,
+    partial_evaluation_enabled: bool,
+    partial_eval_fraction: float,
+    fitness_cache_enabled: bool,
+    fitness_cache_max_size: int,
+    early_stopping_enabled: bool,
+    early_stopping_threshold: float,
+    early_stopping_patience: int,
 ):
     """Parallel evaluation per-genome using a thread pool.
     Each worker owns its own arena to avoid shared-state contention.
@@ -275,31 +405,65 @@ def evaluate_population_parallel(
             )
             arena = thread_local.arena
 
-        opp_indices = np.random.choice(len(opponents), size=num_opponents, replace=False)
+        effective_opponents = _get_opponent_sample_size(
+            num_opponents,
+            partial_evaluation_enabled,
+            partial_eval_fraction,
+        )
+        effective_opponents = min(effective_opponents, len(opponents))
+        opp_indices = np.random.choice(len(opponents), size=effective_opponents, replace=False)
         genome_fitnesses = []
         for opp_idx in opp_indices:
             opponent = opponents[opp_idx]
+            do_nonplastic = np.random.random() < nonplastic_check_fraction
+            cache_key = None
+            if fitness_cache_enabled:
+                prey = genome if is_prey_evaluation else opponent
+                predator = opponent if is_prey_evaluation else genome
+                cache_key = _make_fitness_cache_key(prey, predator, stage_config, max_steps, do_nonplastic)
+                cached = _get_cached_fitness(cache_key)
+                if cached is not None:
+                    fitness = cached["prey_fitness"] if is_prey_evaluation else cached["predator_fitness"]
+                    genome_fitnesses.append(float(fitness))
+                    continue
+
             if is_prey_evaluation:
-                (prey_result, _) = evaluate_multi_agent_pair(
+                (prey_result, pred_result) = evaluate_multi_agent_pair(
                     genome,
                     opponent,
                     arena,
                     stage_config,
                     max_steps,
-                    do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
+                    do_nonplastic_compare=do_nonplastic,
+                    early_stopping_enabled=early_stopping_enabled,
+                    early_stopping_threshold=early_stopping_threshold,
+                    early_stopping_patience=early_stopping_patience,
                 )
                 fitness = prey_result[0]
             else:
-                (_, pred_result) = evaluate_multi_agent_pair(
+                (prey_result, pred_result) = evaluate_multi_agent_pair(
                     opponent,
                     genome,
                     arena,
                     stage_config,
                     max_steps,
-                    do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
+                    do_nonplastic_compare=do_nonplastic,
+                    early_stopping_enabled=early_stopping_enabled,
+                    early_stopping_threshold=early_stopping_threshold,
+                    early_stopping_patience=early_stopping_patience,
                 )
                 fitness = pred_result[0]
             genome_fitnesses.append(fitness)
+
+            if fitness_cache_enabled and cache_key is not None:
+                _set_cached_fitness(
+                    cache_key,
+                    {
+                        "prey_fitness": float(prey_result[0]),
+                        "predator_fitness": float(pred_result[0]),
+                    },
+                    max_size=fitness_cache_max_size,
+                )
 
         avg_fitness = float(np.mean(genome_fitnesses)) if genome_fitnesses else 0.0
         genome.fitness = avg_fitness
@@ -329,6 +493,13 @@ def evaluate_population_serial(
     num_opponents,
     is_prey_evaluation,
     nonplastic_check_fraction: float,
+    partial_evaluation_enabled: bool,
+    partial_eval_fraction: float,
+    fitness_cache_enabled: bool,
+    fitness_cache_max_size: int,
+    early_stopping_enabled: bool,
+    early_stopping_threshold: float,
+    early_stopping_patience: int,
 ):
     """Serial evaluation that reuses a single arena instance.
 
@@ -349,31 +520,65 @@ def evaluate_population_serial(
         if hasattr(brain, "layers") and len(brain.layers) == 0:
             brain.build_from_genome(genome)
 
-        opp_indices = np.random.choice(len(opponents), size=num_opponents, replace=False)
+        effective_opponents = _get_opponent_sample_size(
+            num_opponents,
+            partial_evaluation_enabled,
+            partial_eval_fraction,
+        )
+        effective_opponents = min(effective_opponents, len(opponents))
+        opp_indices = np.random.choice(len(opponents), size=effective_opponents, replace=False)
         genome_fitnesses = []
         for opp_idx in opp_indices:
             opponent = opponents[opp_idx]
+            do_nonplastic = np.random.random() < nonplastic_check_fraction
+            cache_key = None
+            if fitness_cache_enabled:
+                prey = genome if is_prey_evaluation else opponent
+                predator = opponent if is_prey_evaluation else genome
+                cache_key = _make_fitness_cache_key(prey, predator, stage_config, max_steps, do_nonplastic)
+                cached = _get_cached_fitness(cache_key)
+                if cached is not None:
+                    fitness = cached["prey_fitness"] if is_prey_evaluation else cached["predator_fitness"]
+                    genome_fitnesses.append(float(fitness))
+                    continue
+
             if is_prey_evaluation:
-                (prey_result, _) = evaluate_multi_agent_pair(
+                (prey_result, pred_result) = evaluate_multi_agent_pair(
                     genome,
                     opponent,
                     arena,
                     stage_config,
                     max_steps,
-                    do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
+                    do_nonplastic_compare=do_nonplastic,
+                    early_stopping_enabled=early_stopping_enabled,
+                    early_stopping_threshold=early_stopping_threshold,
+                    early_stopping_patience=early_stopping_patience,
                 )
                 fitness = prey_result[0]
             else:
-                (_, pred_result) = evaluate_multi_agent_pair(
+                (prey_result, pred_result) = evaluate_multi_agent_pair(
                     opponent,
                     genome,
                     arena,
                     stage_config,
                     max_steps,
-                    do_nonplastic_compare=(np.random.random() < nonplastic_check_fraction),
+                    do_nonplastic_compare=do_nonplastic,
+                    early_stopping_enabled=early_stopping_enabled,
+                    early_stopping_threshold=early_stopping_threshold,
+                    early_stopping_patience=early_stopping_patience,
                 )
                 fitness = pred_result[0]
             genome_fitnesses.append(fitness)
+
+            if fitness_cache_enabled and cache_key is not None:
+                _set_cached_fitness(
+                    cache_key,
+                    {
+                        "prey_fitness": float(prey_result[0]),
+                        "predator_fitness": float(pred_result[0]),
+                    },
+                    max_size=fitness_cache_max_size,
+                )
 
         avg_fitness = float(np.mean(genome_fitnesses)) if genome_fitnesses else 0.0
         genome.fitness = avg_fitness
@@ -394,6 +599,10 @@ async def train_coevolution_async(
     """
     Async training step for co-evolution
     """
+    global _ACTIVE_CONFIG, _ACTIVE_GENERATION
+    _ACTIVE_CONFIG = training_state.config
+    _ACTIVE_GENERATION = generation
+
     print(f"\n Generation {generation} - Stage: {stage.name}", flush=True)
     print(f" Prey Population: {len(training_state.prey_population)}", flush=True)
     print(f" Predator Population: {len(training_state.predator_population)}", flush=True)
@@ -418,6 +627,8 @@ async def train_coevolution_async(
         num_prey_per_env=1,
         num_predators_per_env=1,
     )
+
+    effective_max_steps = _get_effective_max_steps(training_state.config, stage_config, generation)
     
     # Evaluate prey population
     print("  Evaluating prey population...")
@@ -426,7 +637,7 @@ async def train_coevolution_async(
             training_state.prey_population,
             all_predators,
             stage_config,
-            training_state.config.max_steps,
+            effective_max_steps,
             num_prey_opponents,
             is_prey_evaluation=True,
             batch_size=training_state.config.batch_size,
@@ -434,6 +645,13 @@ async def train_coevolution_async(
             num_predators_per_env=training_state.config.num_predators_per_arena,
             num_workers=training_state.config.num_workers,
             nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
+            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            fitness_cache_enabled=training_state.config.fitness_cache_enabled,
+            fitness_cache_max_size=training_state.config.fitness_cache_max_size,
+            early_stopping_enabled=training_state.config.early_stopping_enabled,
+            early_stopping_threshold=training_state.config.early_stopping_threshold,
+            early_stopping_patience=training_state.config.early_stopping_patience,
         )
     else:
         prey_fitnesses = evaluate_population_serial(
@@ -441,10 +659,17 @@ async def train_coevolution_async(
             all_predators,
             arena,
             stage_config,
-            training_state.config.max_steps,
+            effective_max_steps,
             num_prey_opponents,
             is_prey_evaluation=True,
             nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
+            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            fitness_cache_enabled=training_state.config.fitness_cache_enabled,
+            fitness_cache_max_size=training_state.config.fitness_cache_max_size,
+            early_stopping_enabled=training_state.config.early_stopping_enabled,
+            early_stopping_threshold=training_state.config.early_stopping_threshold,
+            early_stopping_patience=training_state.config.early_stopping_patience,
         )
 
     # Evaluate predator population
@@ -454,7 +679,7 @@ async def train_coevolution_async(
             training_state.predator_population,
             all_prey,
             stage_config,
-            training_state.config.max_steps,
+            effective_max_steps,
             num_pred_opponents,
             is_prey_evaluation=False,
             batch_size=training_state.config.batch_size,
@@ -462,6 +687,13 @@ async def train_coevolution_async(
             num_predators_per_env=training_state.config.num_predators_per_arena,
             num_workers=training_state.config.num_workers,
             nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
+            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            fitness_cache_enabled=training_state.config.fitness_cache_enabled,
+            fitness_cache_max_size=training_state.config.fitness_cache_max_size,
+            early_stopping_enabled=training_state.config.early_stopping_enabled,
+            early_stopping_threshold=training_state.config.early_stopping_threshold,
+            early_stopping_patience=training_state.config.early_stopping_patience,
         )
     else:
         predator_fitnesses = evaluate_population_serial(
@@ -469,10 +701,17 @@ async def train_coevolution_async(
             all_prey,
             arena,
             stage_config,
-            training_state.config.max_steps,
+            effective_max_steps,
             num_pred_opponents,
             is_prey_evaluation=False,
             nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
+            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            fitness_cache_enabled=training_state.config.fitness_cache_enabled,
+            fitness_cache_max_size=training_state.config.fitness_cache_max_size,
+            early_stopping_enabled=training_state.config.early_stopping_enabled,
+            early_stopping_threshold=training_state.config.early_stopping_threshold,
+            early_stopping_patience=training_state.config.early_stopping_patience,
         )
     
     eval_time = time.time() - start_time
@@ -507,43 +746,97 @@ async def train_coevolution_async(
 
     adaptability_scores = []
     meta_effectiveness_scores = []
+    reward_before_learning = []
+    reward_after_learning = []
+    reward_delta_learning = []
+    energy_costs = []
+    learning_speeds = []
+    stabilities = []
+    novelties = []
+    success_rates = []
+    instability_scores = []  # CRITICAL FIX 2: Track instability
+    metrics_missing = 0
 
     for genome in training_state.prey_population + training_state.predator_population:
         if hasattr(genome, 'plastic_diagnostics') and genome.plastic_diagnostics:
-            plastic_usage = genome.plastic_diagnostics.get('mean_final_plastic_delta', 0.0)
+            # Use actual measured plastic advantage from evaluation
+            plastic_advantage = genome.plastic_diagnostics.get('plastic_advantage', 0.0)
+            reward_before = genome.plastic_diagnostics.get('reward_before_learning', 0.0)
+            reward_after = genome.plastic_diagnostics.get('reward_after_learning', 0.0)
 
-            if plastic_usage > 0:
-                plasticity_efficiency = 1.0 - abs(plastic_usage - 0.3) / 0.3
-                plasticity_efficiency = max(0.0, plasticity_efficiency)
-            else:
-                plasticity_efficiency = 0.0
+            # CRITICAL FIX 2: Get instability from plastic diagnostics
+            instability = genome.plastic_diagnostics.get('instability', 0.0)
+            instability_scores.append(float(instability))
 
+            # Calculate adaptability as signed improvement from plasticity
+            denom = max(1.0, abs(float(reward_before)))
+            adaptability_score = float(plastic_advantage) / denom
+            adaptability_scores.append(float(np.clip(adaptability_score, -1.0, 1.0)))
+            reward_before_learning.append(float(reward_before))
+            reward_after_learning.append(float(reward_after))
+            reward_delta_learning.append(float(plastic_advantage))
+
+            # Meta-parameter effectiveness based on how well they enable plasticity
             local_meta_gain = genome.meta.get('reward_gain', 1.0)
             local_meta_bias = genome.meta.get('reward_bias', 0.0)
             plastic_lr = genome.meta.get('plastic_lr', 1.0)
 
-            meta_coherence = 0.0
-            if plastic_usage > 0.1:
-                lr_effectiveness = min(plastic_lr / 10.0, 1.0) * (plastic_usage / 0.5)
+            # Meta-params are effective if they correlate with actual plastic improvement
+            meta_effectiveness = 0.0
+            if plastic_advantage > 0:
+                # Reward meta-params that enable positive plasticity
                 gain_effectiveness = min(abs(local_meta_gain) / 5.0, 1.0)
-                meta_coherence = (lr_effectiveness + gain_effectiveness) / 2.0
+                lr_effectiveness = min(plastic_lr / 10.0, 1.0)
+                meta_effectiveness = (gain_effectiveness + lr_effectiveness) / 2.0
+            else:
+                # Penalize meta-params that don't enable plasticity
+                meta_effectiveness = 0.1  # Small baseline
 
-            stability = 1.0 - abs(genome.plastic_diagnostics.get('mean_final_plastic_delta', 0.0))
-            stability_bonus = stability * 0.3
-
-            adaptability_score = (
-                plasticity_efficiency * 0.4 +
-                meta_coherence * 0.4 +
-                stability_bonus * 0.2
-            )
-            adaptability_scores.append(float(max(0.0, min(1.0, adaptability_score))))
-
-            # Meta-parameter effectiveness (how well meta-params correlate with performance)
-            meta_effectiveness = min(abs(local_meta_gain) / 5.0, 1.0) * min(plastic_lr / 10.0, 1.0)
             meta_effectiveness_scores.append(float(meta_effectiveness))
+        else:
+            # No plastic diagnostics - assume no adaptability
+            adaptability_scores.append(0.0)
+            meta_effectiveness_scores.append(0.0)
+            instability_scores.append(0.0)  # CRITICAL FIX 2: Default instability
+
+
+        last_metrics = getattr(genome, 'last_eval_metrics', None)
+        if isinstance(last_metrics, dict):
+            energy_costs.append(float(last_metrics.get('energy_cost', 0.0)))
+            learning_speeds.append(float(last_metrics.get('learning_speed', 0.0)))
+            stabilities.append(float(last_metrics.get('stability', 0.0)))
+            novelties.append(float(last_metrics.get('novelty', 0.0)))
+            success_rates.append(1.0 if last_metrics.get('task_success', False) else 0.0)
+        else:
+            metrics_missing += 1
+
+    if metrics_missing == len(training_state.prey_population) + len(training_state.predator_population):
+        print("[WARN] Evaluator metrics missing for all genomes; check last_eval_metrics wiring.")
+    elif energy_costs and learning_speeds and stabilities and novelties and success_rates:
+        print(
+            "[EvalRaw] "
+            f"Energy {np.min(energy_costs):.3f}/{np.mean(energy_costs):.3f}/{np.max(energy_costs):.3f} | "
+            f"Learn {np.min(learning_speeds):.3f}/{np.mean(learning_speeds):.3f}/{np.max(learning_speeds):.3f} | "
+            f"Stability {np.min(stabilities):.3f}/{np.mean(stabilities):.3f}/{np.max(stabilities):.3f} | "
+            f"Novelty {np.min(novelties):.3f}/{np.mean(novelties):.3f}/{np.max(novelties):.3f} | "
+            f"Success {np.mean(success_rates):.3f}"
+        )
 
     avg_adaptability = float(np.mean(adaptability_scores)) if adaptability_scores else 0.0
     avg_meta_effectiveness = float(np.mean(meta_effectiveness_scores)) if meta_effectiveness_scores else 0.0
+    avg_reward_before = float(np.mean(reward_before_learning)) if reward_before_learning else 0.0
+    avg_reward_after = float(np.mean(reward_after_learning)) if reward_after_learning else 0.0
+    avg_reward_delta = float(np.mean(reward_delta_learning)) if reward_delta_learning else 0.0
+    avg_energy_cost = float(np.mean(energy_costs)) if energy_costs else 0.0
+    avg_learning_speed = float(np.mean(learning_speeds)) if learning_speeds else 0.0
+    avg_stability = float(np.mean(stabilities)) if stabilities else 0.0
+    avg_novelty = float(np.mean(novelties)) if novelties else 0.0
+    avg_success_rate = float(np.mean(success_rates)) if success_rates else 0.0
+    avg_instability = float(np.mean(instability_scores)) if instability_scores else 0.0  # CRITICAL FIX 2
+
+
+    # TEMPORARY FIX: Update learning speed normalization stats for population-level normalization
+    _update_learning_speed_stats(learning_speeds)
 
     # Calculate statistics
     stats = {
@@ -563,7 +856,17 @@ async def train_coevolution_async(
         'p95_plastic_norm': p95_plastic_norm,
         'avg_adaptability_score': avg_adaptability,
         'avg_meta_effectiveness': avg_meta_effectiveness,
+        'avg_reward_before_learning': avg_reward_before,
+        'avg_reward_after_learning': avg_reward_after,
+        'avg_reward_delta': avg_reward_delta,
+        'avg_energy_cost': avg_energy_cost,
+        'avg_learning_speed': avg_learning_speed,
+        'avg_stability': avg_stability,
+        'avg_novelty': avg_novelty,
+        'avg_success_rate': avg_success_rate,
+        'avg_instability': avg_instability,  # CRITICAL FIX 2
         'config': stage_config
+
     }
 
     # Speciation + novelty logging
@@ -572,9 +875,59 @@ async def train_coevolution_async(
         predator_species = predator_engine.compute_species_stats(cast(Any, training_state.predator_population), generation)
         stats['prey_species'] = prey_species
         stats['predator_species'] = predator_species
+
+        prey_species_count = int(prey_species.get('num_species', 0)) if isinstance(prey_species, dict) else 0
+        if prey_engine and prey_species_count > 0:
+            prey_engine.adjust_speciation_threshold(
+                num_species=prey_species_count,
+                target_min=training_state.config.speciation_target_species_min,
+                target_max=training_state.config.speciation_target_species_max,
+                adjust_rate=training_state.config.speciation_adjust_rate,
+                min_threshold=training_state.config.speciation_threshold_min,
+                max_threshold=training_state.config.speciation_threshold_max,
+            )
+
+            if prey_species_count < training_state.config.prey_min_species_enforcement:
+                prey_engine.adjust_speciation_threshold(
+                    num_species=prey_species_count,
+                    target_min=training_state.config.prey_min_species_enforcement,
+                    target_max=max(
+                        training_state.config.prey_min_species_enforcement,
+                        training_state.config.speciation_target_species_max,
+                    ),
+                    adjust_rate=training_state.config.prey_min_species_adjust_rate,
+                    min_threshold=training_state.config.speciation_threshold_min,
+                    max_threshold=training_state.config.speciation_threshold_max,
+                )
+
+        # Adjust predator speciation threshold (Issue 3: Fix predator monoculture)
+        predator_species_count = int(predator_species.get('num_species', 0)) if isinstance(predator_species, dict) else 0
+        if predator_engine and predator_species_count > 0:
+            predator_engine.adjust_speciation_threshold(
+                num_species=predator_species_count,
+                target_min=training_state.config.speciation_target_species_min,
+                target_max=training_state.config.speciation_target_species_max,
+                adjust_rate=training_state.config.speciation_adjust_rate,
+                min_threshold=training_state.config.speciation_threshold_min,
+                max_threshold=training_state.config.speciation_threshold_max,
+            )
+
+            if predator_species_count < training_state.config.predator_min_species_enforcement:
+                predator_engine.adjust_speciation_threshold(
+                    num_species=predator_species_count,
+                    target_min=training_state.config.predator_min_species_enforcement,
+                    target_max=max(
+                        training_state.config.predator_min_species_enforcement,
+                        training_state.config.speciation_target_species_max,
+                    ),
+                    adjust_rate=training_state.config.predator_min_species_adjust_rate,
+                    min_threshold=training_state.config.speciation_threshold_min,
+                    max_threshold=training_state.config.speciation_threshold_max,
+                )
     except Exception:
         stats['prey_species'] = {'num_species': 0, 'avg_species_size': 0.0, 'total_members': 0, 'species_sizes': []}
         stats['predator_species'] = {'num_species': 0, 'avg_species_size': 0.0, 'total_members': 0, 'species_sizes': []}
+
 
     try:
         prey_novelty = prey_engine.compute_novelty_stats(
@@ -592,6 +945,18 @@ async def train_coevolution_async(
     except Exception:
         stats['prey_novelty'] = {'mean': 0.0, 'max': 0.0, 'p95': 0.0, 'archive': {'size': 0, 'avg_fitness': 0.0, 'generations_covered': 0}}
         stats['predator_novelty'] = {'mean': 0.0, 'max': 0.0, 'p95': 0.0, 'archive': {'size': 0, 'avg_fitness': 0.0, 'generations_covered': 0}}
+
+    # Cluster every 5 generations to reduce overhead, skip after gen 500
+    if generation % 5 == 0 and generation <= 500:
+        try:
+            arch_cluster_stats = compute_architecture_clustering_stats(cast(List[EvolvableGenome], combined_population))
+            stats['architecture_clusters'] = arch_cluster_stats
+        except Exception:
+            stats['architecture_clusters'] = {'num_clusters': 0, 'silhouette': 0.0, 'diversity': 0.0, 'cluster_sizes': []}
+    else:
+        # Skip clustering this generation
+        stats['architecture_clusters'] = {'num_clusters': 0, 'silhouette': 0.0, 'diversity': 0.0, 'cluster_sizes': [], 'skipped': True}
+
     
     # Calculate neural health metrics across population
     total_dead_layers = 0
@@ -674,18 +1039,32 @@ async def train_coevolution_async(
     else:
         mutation_success_rates = {'weight': 0.5, 'arch': 0.4, 'layer': 0.3}
 
+    # Compute motif_effectiveness from the architect population's own improvement trend.
+    # Using the delta between the last two meta-fitness scores captures whether the
+    # templates are actually getting better, rather than relying on a proxy metric.
+    if len(architect_population.meta_fitness_history) >= 2:
+        _arch_delta = architect_population.meta_fitness_history[-1] - architect_population.meta_fitness_history[-2]
+        motif_effectiveness = float(max(0.0, min(_arch_delta, 1.0)))
+    else:
+        motif_effectiveness = float(max(0.0, stats.get('avg_adaptability_score', 0.0)))
+
+    # Combine top prey and predator genomes so the architect sees both roles.
+    _top_prey = sorted(training_state.prey_population, key=lambda g: g.fitness, reverse=True)[:5]
+    _top_pred = sorted(training_state.predator_population, key=lambda g: g.fitness, reverse=True)[:5]
+
     performance_data = {
         'avg_fitness': stats.get('mean_prey_fitness', 0.0) + stats.get('mean_predator_fitness', 0.0),
         'architecture_diversity': architecture_diversity,
-        'motif_effectiveness': stats.get('avg_adaptability_score', 0.0),
-        'successful_architectures': training_state.prey_population[:5] + training_state.predator_population[:5],  # Top performers
+        'motif_effectiveness': motif_effectiveness,
+        'successful_architectures': _top_prey + _top_pred,
         'mutation_success_rates': mutation_success_rates,
         'avg_fitness_improvement': avg_fitness_improvement,
         'diversity_preservation': diversity_preservation,
         'exploration_success': exploration_success
     }
 
-    # Evolve architect population
+    # Evolve architect population (called exactly once per generation here;
+    # EvolutionEngine.create_next_generation no longer drives it to avoid triple-calling).
     architect_population.evolve_architectures(performance_data)
 
     # Evolve mutator population
@@ -702,46 +1081,66 @@ async def train_coevolution_async(
         predator_engine.mutation_rate = adaptive_rates.get('weight_rate', predator_engine.mutation_rate)
         predator_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', predator_engine.architecture_mutation_rate)
 
-    # Inject evolved architectures into main population to create causal influence
-    if random.random() < 0.05:  # 5% chance to inject evolved architecture
-        best_template = architect_population.get_best_template()
-        if best_template and 'pattern' in best_template:
-            pattern = best_template['pattern']
-            # Create new genome from evolved template
-            new_genome = PreyGenome.random_initialization()
-            if 'layer_pattern' in pattern and len(pattern['layer_pattern']) > 0:
-                new_genome.genes = []
-                prev_dim = new_genome.input_size
-                activation_pattern = pattern.get('activation_pattern', ['tanh'] * len(pattern['layer_pattern']))
-                for i, out_dim in enumerate(pattern['layer_pattern']):
-                    activation = activation_pattern[i] if i < len(activation_pattern) else 'tanh'
-                    gene = NeuralGene(
-                        gene_id=f"evolved_layer_{i}",
-                        input_dim=prev_dim,
-                        output_dim=out_dim,
-                        activation=activation,
-                        use_bias=True,
-                        plasticity=np.random.uniform(-0.1, 0.1, (out_dim, prev_dim)).astype(np.float32)
-                    )
-                    gene.initialize_weights(method="he_normal", scale=0.1)
-                    new_genome.genes.append(gene)
-                    prev_dim = out_dim
-                # Add output layer
-                if prev_dim != new_genome.output_size:
-                    gene = NeuralGene(
-                        gene_id="evolved_output",
-                        input_dim=prev_dim,
-                        output_dim=new_genome.output_size,
-                        activation='linear',
-                        use_bias=True,
-                        plasticity=None
-                    )
-                    gene.initialize_weights(method="he_normal", scale=0.1)
-                    new_genome.genes.append(gene)
-                # Replace random genome in prey population
-                if training_state.prey_population:
-                    idx = random.randint(0, len(training_state.prey_population) - 1)
-                    training_state.prey_population[idx] = new_genome
+    def _inject_template_into_population(
+        population: list,
+        genome_cls,
+        template: Dict[str, Any],
+        role_tag: str,
+    ) -> None:
+        """Build a genome from *template* and replace a random slot in *population*."""
+        pattern = template.get('pattern', {})
+        if not pattern or not pattern.get('layer_pattern'):
+            return
+        new_genome = genome_cls.random_initialization()
+        new_genome.genes = []
+        prev_dim = new_genome.input_size
+        layer_pattern = pattern['layer_pattern']
+        activation_pattern = pattern.get('activation_pattern', ['tanh'] * len(layer_pattern))
+        for i, out_dim in enumerate(layer_pattern):
+            activation = activation_pattern[i] if i < len(activation_pattern) else 'tanh'
+            gene = NeuralGene(
+                gene_id=f"evolved_{role_tag}_layer_{i}",
+                input_dim=prev_dim,
+                output_dim=out_dim,
+                activation=activation,
+                use_bias=True,
+                plasticity=np.random.uniform(-0.1, 0.1, (out_dim, prev_dim)).astype(np.float32),
+            )
+            gene.initialize_weights(method="he_normal", scale=0.1)
+            new_genome.genes.append(gene)
+            prev_dim = out_dim
+        # Ensure output dimension matches expected network output
+        if prev_dim != new_genome.output_size:
+            gene = NeuralGene(
+                gene_id=f"evolved_{role_tag}_output",
+                input_dim=prev_dim,
+                output_dim=new_genome.output_size,
+                activation='linear',
+                use_bias=True,
+                plasticity=None,
+            )
+            gene.initialize_weights(method="he_normal", scale=0.1)
+            new_genome.genes.append(gene)
+        if population:
+            idx = random.randint(0, len(population) - 1)
+            population[idx] = new_genome
+
+    # Inject evolved architectures into both prey and predator populations.
+    # Use shared_templates (cached by _share_templates) so prey and predator each
+    # get a distinct template from the sorted top-5 rather than both using index 0.
+    if random.random() < 0.05:  # 5% chance per generation
+        shared = architect_population.shared_templates
+        best_template = shared[0] if shared else architect_population.get_best_template()
+        if best_template:
+            _inject_template_into_population(
+                training_state.prey_population, PreyGenome, best_template, 'prey'
+            )
+        # Predator gets the second-best template (or same if only one exists)
+        pred_template = shared[1] if len(shared) > 1 else best_template
+        if pred_template:
+            _inject_template_into_population(
+                training_state.predator_population, PredatorGenome, pred_template, 'predator'
+            )
 
     # Log meta-evolution progress
     best_architect = architect_population.get_best_template()
@@ -761,6 +1160,9 @@ def evaluate_multi_agent_pair(
     stage_config,
     max_steps,
     do_nonplastic_compare: bool = True,
+    early_stopping_enabled: bool = False,
+    early_stopping_threshold: float = -30.0,
+    early_stopping_patience: int = 5,
 ):
     """
     Evaluate a single prey-predator pair in multi-agent arena with PRESSURE INJECTION
@@ -777,18 +1179,36 @@ def evaluate_multi_agent_pair(
 
     # CONDITION A: Compare plastic vs non-plastic performance within same episode (identical arena state)
     (plastic_prey_reward, plastic_prey_metrics), (plastic_pred_reward, plastic_pred_metrics) = evaluate_with_plasticity(
-        prey_genome, predator_genome, arena, max_steps, seed=arena_seed, stage_name=stage_name
+        prey_genome,
+        predator_genome,
+        arena,
+        max_steps,
+        seed=arena_seed,
+        stage_name=stage_name,
+        early_stopping_enabled=early_stopping_enabled,
+        early_stopping_threshold=early_stopping_threshold,
+        early_stopping_patience=early_stopping_patience,
     )
 
     if not do_nonplastic_compare:
         # Compute fitness from metrics (weighted combination)
-        prey_fitness = compute_fitness_from_metrics(plastic_prey_metrics)
-        predator_fitness = compute_fitness_from_metrics(plastic_pred_metrics)
+        prey_fitness = compute_fitness_from_metrics(plastic_prey_metrics, brain=prey_genome.brain)
+        predator_fitness = compute_fitness_from_metrics(plastic_pred_metrics, brain=predator_genome.brain)
+        _store_last_eval_metrics(prey_genome, plastic_prey_metrics, prey_fitness)
+        _store_last_eval_metrics(predator_genome, plastic_pred_metrics, predator_fitness)
         return (prey_fitness, plastic_prey_metrics), (predator_fitness, plastic_pred_metrics)
 
     # Create non-plastic versions (disable plasticity updates) with same arena seed
     (nonplastic_prey_reward, nonplastic_prey_metrics), (nonplastic_pred_reward, nonplastic_pred_metrics) = evaluate_without_plasticity(
-        prey_genome, predator_genome, arena, max_steps, seed=arena_seed, stage_name=stage_name
+        prey_genome,
+        predator_genome,
+        arena,
+        max_steps,
+        seed=arena_seed,
+        stage_name=stage_name,
+        early_stopping_enabled=early_stopping_enabled,
+        early_stopping_threshold=early_stopping_threshold,
+        early_stopping_patience=early_stopping_patience,
     )
 
     # Plastic agents must outperform non-plastic agents within the episode
@@ -801,12 +1221,30 @@ def evaluate_multi_agent_pair(
     final_prey_reward = plastic_prey_reward + plasticity_bonus_prey
     final_pred_reward = plastic_pred_reward + plasticity_bonus_pred
 
+    # Store plastic advantage in diagnostics for adaptability calculation
+    if prey_genome.plastic_diagnostics is None:
+        prey_genome.plastic_diagnostics = {}
+    prey_genome.plastic_diagnostics['plastic_advantage'] = float(plastic_advantage_prey)
+    prey_genome.plastic_diagnostics['reward_before_learning'] = float(nonplastic_prey_reward)
+    prey_genome.plastic_diagnostics['reward_after_learning'] = float(plastic_prey_reward)
+
+    if predator_genome.plastic_diagnostics is None:
+        predator_genome.plastic_diagnostics = {}
+    predator_genome.plastic_diagnostics['plastic_advantage'] = float(plastic_advantage_pred)
+    predator_genome.plastic_diagnostics['reward_before_learning'] = float(nonplastic_pred_reward)
+    predator_genome.plastic_diagnostics['reward_after_learning'] = float(plastic_pred_reward)
+
     # Update metrics with final rewards and compute fitness
     plastic_prey_metrics.episode_return = final_prey_reward
     plastic_pred_metrics.episode_return = final_pred_reward
+    plastic_prey_metrics.adaptability = float(plastic_advantage_prey)
+    plastic_pred_metrics.adaptability = float(plastic_advantage_pred)
 
-    prey_fitness = compute_fitness_from_metrics(plastic_prey_metrics)
-    predator_fitness = compute_fitness_from_metrics(plastic_pred_metrics)
+    prey_fitness = compute_fitness_from_metrics(plastic_prey_metrics, brain=prey_genome.brain)
+    predator_fitness = compute_fitness_from_metrics(plastic_pred_metrics, brain=predator_genome.brain)
+
+    _store_last_eval_metrics(prey_genome, plastic_prey_metrics, prey_fitness)
+    _store_last_eval_metrics(predator_genome, plastic_pred_metrics, predator_fitness)
 
     return (prey_fitness, plastic_prey_metrics), (predator_fitness, plastic_pred_metrics)
 
@@ -815,6 +1253,106 @@ def _to_numpy(x):
     """Convert torch tensors or other array-likes to numpy arrays."""
     return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
 
+def _action_entropy(counts: np.ndarray) -> float:
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        return 0.0
+    probs = counts.astype(np.float32) / total
+    entropy = -float(np.sum(probs * np.log(probs + 1e-8)))
+    max_entropy = float(np.log(max(len(counts), 1)))
+    if max_entropy <= 0.0:
+        return 0.0
+    return float(entropy / max_entropy)
+
+def _store_last_eval_metrics(genome, metrics: EpisodeMetrics, fitness: float) -> None:
+    genome.last_eval_metrics = {
+        'fitness': float(fitness),
+        'energy_cost': float(metrics.energy_cost),
+        'learning_speed': float(metrics.learning_speed),
+        'stability': float(metrics.stability),
+        'task_success': bool(metrics.task_success),
+        'episode_return': float(metrics.episode_return),
+        'complexity_penalty': float(metrics.complexity_penalty),
+        'novelty': float(metrics.novelty),
+        'saturation_penalty': float(metrics.saturation_penalty or 0.0),
+        'dead_unit_penalty': float(metrics.dead_unit_penalty or 0.0),
+        'seed': int(metrics.seed),
+        'stage': str(metrics.stage),
+        'opponent_id': metrics.opponent_id,
+        'adaptability': float(metrics.adaptability),
+    }
+
+def _get_adaptability_weight() -> float:
+    config = _ACTIVE_CONFIG
+    if config is None:
+        return 0.3
+
+    boost_gens = int(config.adaptability_boost_generations)
+    taper_gens = int(config.adaptability_taper_generations)
+    base = float(config.adaptability_weight_base)
+    boost = float(config.adaptability_weight_boost)
+    gen = int(_ACTIVE_GENERATION)
+
+    if boost_gens <= 0:
+        return base
+    if gen < boost_gens:
+        return boost
+    if taper_gens <= 0:
+        return base
+
+    t = (gen - boost_gens + 1) / float(taper_gens)
+    t = max(0.0, min(1.0, t))
+    return float(boost + (base - boost) * t)
+
+
+# Global state for learning speed normalization (population-level statistics)
+_LEARNING_SPEED_STATS = {
+    'min': 0.0,
+    'max': 1.0,
+    'mean': 0.0,
+    'std': 1.0,
+    'initialized': False
+}
+
+# TEMPORARY FIX: Force evolution to prioritize learning
+# This addresses the issue where adaptability collapsed to 0.002 while learn_speed is 1.493
+# Without this, plasticity remains decorative - learning has no evolutionary consequence
+_TEMPORARY_LEARN_SPEED_WEIGHT = 2.0  # Force: fitness = reward + 2.0 * normalized_learn_speed
+
+
+def _update_learning_speed_stats(learning_speeds: List[float]) -> None:
+    """Update global learning speed statistics for normalization"""
+    global _LEARNING_SPEED_STATS
+    if not learning_speeds:
+        return
+    
+    speeds = np.array(learning_speeds, dtype=np.float32)
+    _LEARNING_SPEED_STATS['min'] = float(np.min(speeds))
+    _LEARNING_SPEED_STATS['max'] = float(np.max(speeds))
+    _LEARNING_SPEED_STATS['mean'] = float(np.mean(speeds))
+    _LEARNING_SPEED_STATS['std'] = float(np.std(speeds)) if len(speeds) > 1 else 1.0
+    _LEARNING_SPEED_STATS['initialized'] = True
+
+
+def _normalize_learning_speed(learning_speed: float) -> float:
+    """Normalize learning speed using z-score normalization"""
+    global _LEARNING_SPEED_STATS
+    
+    if not _LEARNING_SPEED_STATS['initialized']:
+        # Fallback: if not initialized, use raw value capped at reasonable range
+        return float(np.clip(learning_speed / 10.0, 0.0, 2.0))
+    
+    # Z-score normalization: (x - mean) / std
+    std = max(_LEARNING_SPEED_STATS['std'], 1e-6)
+    normalized = (learning_speed - _LEARNING_SPEED_STATS['mean']) / std
+    
+    # Scale to 0-2 range for reasonable fitness contribution
+    # Typical z-scores range from -3 to 3, so we scale accordingly
+    normalized = float(np.clip(normalized * 0.5 + 1.0, 0.0, 2.0))
+    
+    return normalized
+
+
 def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[TorchBrain]" = None) -> float:
     """Compute scalar fitness from metrics decomposition with neural health penalties"""
     # Weighted combination of metrics for fitness
@@ -822,12 +1360,23 @@ def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[Torch
     # Secondary: success bonus, learning speed, stability penalty, energy efficiency
     fitness = metrics.episode_return
 
+    # Adaptability bonus/penalty: reward improvement over lifetime learning
+    adaptability_weight = _get_adaptability_weight()
+    fitness += metrics.adaptability * adaptability_weight
+
     # Success bonus
     if metrics.task_success:
         fitness += 1.0
 
-    # Learning speed bonus (plasticity effectiveness)
-    fitness += metrics.learning_speed * 0.1
+    # TEMPORARY FIX: Learning speed bonus with strong weight
+    # Issue: Adaptability collapsed to 0.002 while LearnSpeed is 1.493
+    # Learning happens but is not rewarded enough in fitness
+    # Fix: Enforce fitness = reward + 2.0 * normalized_learn_speed
+    normalized_learn_speed = _normalize_learning_speed(metrics.learning_speed)
+    fitness += normalized_learn_speed * _TEMPORARY_LEARN_SPEED_WEIGHT
+
+    # Legacy learning speed bonus (kept for backward compatibility, now redundant with temp fix)
+    # fitness += metrics.learning_speed * 0.1
 
     # Stability penalty (prefer consistent performance)
     fitness -= metrics.stability * 0.05
@@ -856,7 +1405,17 @@ def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[Torch
 
     return float(fitness)
 
-def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, seed=None, stage_name="unknown"):
+def evaluate_with_plasticity(
+    prey_genome,
+    predator_genome,
+    arena,
+    max_steps,
+    seed=None,
+    stage_name="unknown",
+    early_stopping_enabled: bool = False,
+    early_stopping_threshold: float = -30.0,
+    early_stopping_patience: int = 5,
+):
     """Evaluate episode with plasticity enabled and return metrics"""
     # Reset plasticity and episode tracking before rollout
     prey_genome.brain.reset_plasticity()
@@ -874,7 +1433,12 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
     predator_energy_cost = 0.0
     steps_survived = 0
 
+    prey_action_counts = np.zeros(int(prey_genome.output_size), dtype=np.int64)
+    pred_action_counts = np.zeros(int(predator_genome.output_size), dtype=np.int64)
+
     predator_brain = PredatorPackBrain(predator_genome)
+
+    catastrophic_steps = 0
 
     for step in range(max_steps):
         # Get actions from genomes
@@ -882,6 +1446,9 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
 
         # Use predator pack brain for coordinated actions
         pred_actions = predator_brain.act(pred_state)
+
+        prey_action_counts += np.bincount(np.ravel(prey_actions), minlength=prey_action_counts.size)
+        pred_action_counts += np.bincount(np.ravel(pred_actions), minlength=pred_action_counts.size)
 
         # Step the arena
         (prey_state, pred_state), r_prey, r_pred, info = arena.step(
@@ -907,12 +1474,20 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
         predator_rewards.append(pred_r)
 
         # Track energy costs from info
-        if 'prey_energy' in info:
+        if 'prey_energy' in info and len(info['prey_energy']) > 0:
             prey_energy_cost += np.mean(info['prey_energy'])
-        if 'predator_energy' in info:
+        if 'predator_energy' in info and len(info['predator_energy']) > 0:
             predator_energy_cost += np.mean(info['predator_energy'])
 
         steps_survived += 1
+
+        if early_stopping_enabled:
+            if prey_total_reward <= early_stopping_threshold and predator_total_reward <= early_stopping_threshold:
+                catastrophic_steps += 1
+            else:
+                catastrophic_steps = 0
+            if catastrophic_steps >= early_stopping_patience:
+                break
 
         if np.any(info['env_done']):
             break
@@ -927,10 +1502,42 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
     prey_learning_speed = 0.0
     if hasattr(prey_genome.brain, 'get_plastic_diagnostics'):
         plastic_diag = prey_genome.brain.get_plastic_diagnostics()
+        if prey_genome.plastic_diagnostics is None:
+            prey_genome.plastic_diagnostics = {}
+        prey_genome.plastic_diagnostics.update(plastic_diag)
+        if 'mean_plastic_delta' in plastic_diag:
+            prey_genome.plastic_diagnostics['mean_final_plastic_delta'] = float(plastic_diag['mean_plastic_delta'])
         if 'total_plastic_delta' in plastic_diag:
             prey_learning_speed = float(plastic_diag['total_plastic_delta'])
 
     # Compute metrics
+    prey_action_entropy = _action_entropy(prey_action_counts)
+    pred_action_entropy = _action_entropy(pred_action_counts)
+
+    prey_genome.behavior_stats = {
+        'mean_reward': float(np.mean(prey_rewards)) if prey_rewards else 0.0,
+        'reward_std': float(np.std(prey_rewards)) if prey_rewards else 0.0,
+        'steps_survived': int(steps_survived),
+        'action_entropy': float(prey_action_entropy),
+        'energy_cost': float(prey_energy_cost),
+        'episode_return': float(prey_total_reward),
+    }
+    predator_genome.behavior_stats = {
+        'mean_reward': float(np.mean(predator_rewards)) if predator_rewards else 0.0,
+        'reward_std': float(np.std(predator_rewards)) if predator_rewards else 0.0,
+        'steps_survived': int(steps_survived),
+        'action_entropy': float(pred_action_entropy),
+        'energy_cost': float(predator_energy_cost),
+        'episode_return': float(predator_total_reward),
+    }
+
+    prey_stability = prey_genome.brain.get_stability_diagnostics()
+    predator_stability = predator_genome.brain.get_stability_diagnostics()
+    prey_saturation_penalty = float(prey_stability.get('avg_saturation_fraction', 0.0)) * 0.5
+    prey_dead_unit_penalty = float(prey_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
+    predator_saturation_penalty = float(predator_stability.get('avg_saturation_fraction', 0.0)) * 0.5
+    predator_dead_unit_penalty = float(predator_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
+
     prey_metrics = EpisodeMetrics(
         task_success=prey_total_reward > 0,  # Basic success: positive reward
         episode_return=prey_total_reward,
@@ -938,16 +1545,23 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
         stability=float(np.std(prey_rewards)) if prey_rewards else 0.0,
         energy_cost=prey_energy_cost,
         complexity_penalty=0.0,  # implement complexity measure
-        novelty=0.0,  # compute novelty score
+        novelty=prey_action_entropy,
         seed=seed or 0,
         stage=stage_name,
-        opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None
+        opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None,
+        saturation_penalty=prey_saturation_penalty,
+        dead_unit_penalty=prey_dead_unit_penalty
     )
 
     # Compute learning speed from plasticity diagnostics
     predator_learning_speed = 0.0
     if hasattr(predator_genome.brain, 'get_plastic_diagnostics'):
         plastic_diag = predator_genome.brain.get_plastic_diagnostics()
+        if predator_genome.plastic_diagnostics is None:
+            predator_genome.plastic_diagnostics = {}
+        predator_genome.plastic_diagnostics.update(plastic_diag)
+        if 'mean_plastic_delta' in plastic_diag:
+            predator_genome.plastic_diagnostics['mean_final_plastic_delta'] = float(plastic_diag['mean_plastic_delta'])
         if 'total_plastic_delta' in plastic_diag:
             predator_learning_speed = float(plastic_diag['total_plastic_delta'])
 
@@ -958,15 +1572,27 @@ def evaluate_with_plasticity(prey_genome, predator_genome, arena, max_steps, see
         stability=float(np.std(predator_rewards)) if predator_rewards else 0.0,
         energy_cost=predator_energy_cost,
         complexity_penalty=0.0,
-        novelty=0.0,
+        novelty=pred_action_entropy,
         seed=seed or 0,
         stage=stage_name,
-        opponent_id=prey_genome.genome_id if hasattr(prey_genome, 'genome_id') else None
+        opponent_id=prey_genome.genome_id if hasattr(prey_genome, 'genome_id') else None,
+        saturation_penalty=predator_saturation_penalty,
+        dead_unit_penalty=predator_dead_unit_penalty
     )
 
     return (prey_total_reward, prey_metrics), (predator_total_reward, predator_metrics)
 
-def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, seed=None, stage_name="unknown"):
+def evaluate_without_plasticity(
+    prey_genome,
+    predator_genome,
+    arena,
+    max_steps,
+    seed=None,
+    stage_name="unknown",
+    early_stopping_enabled: bool = False,
+    early_stopping_threshold: float = -30.0,
+    early_stopping_patience: int = 5,
+):
     """Evaluate episode with plasticity disabled and return metrics"""
     # Reset plasticity and episode tracking but don't update plasticity during episode
     prey_genome.brain.reset_plasticity()
@@ -984,8 +1610,13 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
     predator_energy_cost = 0.0
     steps_survived = 0
 
+    prey_action_counts = np.zeros(int(prey_genome.output_size), dtype=np.int64)
+    pred_action_counts = np.zeros(int(predator_genome.output_size), dtype=np.int64)
+
     # Create predator brain once, outside the loop
     predator_brain = PredatorPackBrain(predator_genome)
+
+    catastrophic_steps = 0
 
     for step in range(max_steps):
         # Get actions from genomes (plasticity not updated)
@@ -1009,12 +1640,20 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
         predator_rewards.append(float(np.mean(pred_reward)))
 
         # Track energy costs from info
-        if 'prey_energy' in info:
+        if 'prey_energy' in info and len(info['prey_energy']) > 0:
             prey_energy_cost += np.mean(info['prey_energy'])
-        if 'predator_energy' in info:
+        if 'predator_energy' in info and len(info['predator_energy']) > 0:
             predator_energy_cost += np.mean(info['predator_energy'])
 
         steps_survived += 1
+
+        if early_stopping_enabled:
+            if prey_total_reward <= early_stopping_threshold and predator_total_reward <= early_stopping_threshold:
+                catastrophic_steps += 1
+            else:
+                catastrophic_steps = 0
+            if catastrophic_steps >= early_stopping_patience:
+                break
 
         if np.any(info['env_done']):
             break
@@ -1026,6 +1665,15 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
         predator_genome.brain.finalize_episode_plastic_norms()
 
     # Compute metrics (no learning speed for non-plastic)
+    prey_action_entropy = _action_entropy(prey_action_counts)
+    pred_action_entropy = _action_entropy(pred_action_counts)
+    prey_stability = prey_genome.brain.get_stability_diagnostics()
+    predator_stability = predator_genome.brain.get_stability_diagnostics()
+    prey_saturation_penalty = float(prey_stability.get('avg_saturation_fraction', 0.0)) * 0.5
+    prey_dead_unit_penalty = float(prey_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
+    predator_saturation_penalty = float(predator_stability.get('avg_saturation_fraction', 0.0)) * 0.5
+    predator_dead_unit_penalty = float(predator_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
+
     prey_metrics = EpisodeMetrics(
         task_success=prey_total_reward > 0,
         episode_return=prey_total_reward,
@@ -1033,10 +1681,12 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
         stability=float(np.std(prey_rewards)) if prey_rewards else 0.0,
         energy_cost=prey_energy_cost,
         complexity_penalty=0.0,
-        novelty=0.0,
+        novelty=prey_action_entropy,
         seed=seed or 0,
         stage=stage_name,
-        opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None
+        opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None,
+        saturation_penalty=prey_saturation_penalty,
+        dead_unit_penalty=prey_dead_unit_penalty
     )
 
     predator_metrics = EpisodeMetrics(
@@ -1046,10 +1696,12 @@ def evaluate_without_plasticity(prey_genome, predator_genome, arena, max_steps, 
         stability=float(np.std(predator_rewards)) if predator_rewards else 0.0,
         energy_cost=predator_energy_cost,
         complexity_penalty=0.0,
-        novelty=0.0,
+        novelty=pred_action_entropy,
         seed=seed or 0,
         stage=stage_name,
-        opponent_id=prey_genome.genome_id if hasattr(prey_genome, 'genome_id') else None
+        opponent_id=prey_genome.genome_id if hasattr(prey_genome, 'genome_id') else None,
+        saturation_penalty=predator_saturation_penalty,
+        dead_unit_penalty=predator_dead_unit_penalty
     )
 
     return (prey_total_reward, prey_metrics), (predator_total_reward, predator_metrics)
@@ -1067,9 +1719,26 @@ def log_coevolution_generation(stats: Dict[str, Any]):
 
     # Log metrics decomposition summary
     if 'avg_adaptability_score' in stats:
-        print(f"Adaptability: {stats['avg_adaptability_score']:.3f} | Meta Effectiveness: {stats['avg_meta_effectiveness']:.3f}")
+        print(
+            "Adaptability: "
+            f"{stats['avg_adaptability_score']:.3f} | "
+            f"Meta Effectiveness: {stats['avg_meta_effectiveness']:.3f} | "
+            f"Delta Reward: {stats.get('avg_reward_delta', 0.0):.3f} | "
+            f"Instability: {stats.get('avg_instability', 0.0):.3f}"
+        )
+
     if 'mean_plastic_norm' in stats:
         print(f"Plastic Norms: Mean {stats['mean_plastic_norm']:.4f} | Max {stats['max_plastic_norm']:.4f} | 95th {stats['p95_plastic_norm']:.4f}")
+
+    if 'avg_energy_cost' in stats:
+        print(
+            "Evaluator: "
+            f"Energy {stats['avg_energy_cost']:.3f} | "
+            f"LearnSpeed {stats['avg_learning_speed']:.3f} | "
+            f"Stability {stats['avg_stability']:.3f} | "
+            f"Novelty {stats['avg_novelty']:.3f} | "
+            f"Success {stats['avg_success_rate']:.3f}"
+        )
 
     # Neural health summary (replaces per-layer spam)
     neural_health = stats.get('neural_health')
@@ -1088,6 +1757,16 @@ def log_coevolution_generation(stats: Dict[str, Any]):
             f"pred {predator_species.get('num_species', 0)} species (avg {predator_species.get('avg_species_size', 0.0):.1f})"
         )
 
+    # Log speciation thresholds (already set in train_coevolution_async)
+    if 'prey_speciation_threshold' in stats and 'predator_speciation_threshold' in stats:
+        print(
+            "Speciation Thresholds: "
+            f"prey {stats['prey_speciation_threshold']:.3f} | "
+            f"pred {stats['predator_speciation_threshold']:.3f}"
+        )
+
+
+
     prey_novelty = stats.get('prey_novelty')
     predator_novelty = stats.get('predator_novelty')
     if isinstance(prey_novelty, dict) and isinstance(predator_novelty, dict):
@@ -1097,6 +1776,15 @@ def log_coevolution_generation(stats: Dict[str, Any]):
             "Novelty: "
             f"prey mean {prey_novelty.get('mean', 0.0):.3f} (p95 {prey_novelty.get('p95', 0.0):.3f}) archive {prey_arch.get('size', 0)}, "
             f"pred mean {predator_novelty.get('mean', 0.0):.3f} (p95 {predator_novelty.get('p95', 0.0):.3f}) archive {pred_arch.get('size', 0)}"
+        )
+
+    arch_clusters = stats.get('architecture_clusters')
+    if isinstance(arch_clusters, dict):
+        print(
+            "Architecture Clusters: "
+            f"{arch_clusters.get('num_clusters', 0)} clusters | "
+            f"silhouette {arch_clusters.get('silhouette', 0.0):.3f} | "
+            f"diversity {arch_clusters.get('diversity', 0.0):.3f}"
         )
 
     print(f"{'='*80}")
@@ -1174,7 +1862,9 @@ def plot_learning_rule_stats(generation: int, prey_population: List[PreyGenome],
         plt.hist(vals, bins=30)
         plt.axvline(float(np.mean(vals).item()), color='r')
         plt.title(f"Learning Rule {k} — Gen {generation}")
-        plt.show()
+    plt.tight_layout()
+    plt.savefig(f'learning_rule_stats_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.close()
 
 def plot_learning_rule_vs_fitness(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]):
     """Plot scatter plots of learning rule parameters vs fitness for each gene"""
@@ -1242,6 +1932,74 @@ def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome],
     plt.close()
 
     print(f"Strategy clustering plot saved: strategy_clustering_gen_{generation:04d}.png")
+
+def compute_architecture_clustering_stats(population: List[EvolvableGenome], n_clusters: int = 3) -> Dict[str, Any]:
+    """Compute architecture clustering stats using genome structural features."""
+    vectors = [g.get_architecture_vector() for g in population if hasattr(g, "get_architecture_vector")]
+    if len(vectors) < 2:
+        return {
+            'num_clusters': 0,
+            'silhouette': 0.0,
+            'diversity': 0.0,
+            'cluster_sizes': []
+        }
+
+    X = np.array(vectors)
+    k = min(n_clusters, len(vectors))
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X)
+    centers = kmeans.cluster_centers_
+
+    if len(np.unique(labels)) > 1:
+        silhouette = float(silhouette_score(X, labels))
+    else:
+        silhouette = 0.0
+
+    diversity = float(np.mean([np.linalg.norm(vec - centers[label]) for vec, label in zip(X, labels)]))
+    unique_labels, counts = np.unique(labels, return_counts=True)
+
+    return {
+        'num_clusters': int(len(unique_labels)),
+        'silhouette': silhouette,
+        'diversity': diversity,
+        'cluster_sizes': counts.tolist()
+    }
+
+def plot_architecture_clustering(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]):
+    """Plot fitness per cluster after clustering genomes by architecture features."""
+    population: List[EvolvableGenome] = list(prey_population + predator_population)
+    vectors = [g.get_architecture_vector() for g in population if hasattr(g, "get_architecture_vector")]
+    if len(vectors) < 2:
+        return
+
+    X = np.array(vectors)
+    k = min(3, len(vectors))
+    labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X)
+
+    fitness_per_cluster: Dict[int, List[float]] = {i: [] for i in range(k)}
+    for idx, genome in enumerate(population[:len(labels)]):
+        fitness_per_cluster[int(labels[idx])].append(genome.fitness)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cluster_names = [f'Cluster {i}' for i in range(k)]
+    fitness_data = [fitness_per_cluster[i] for i in range(k)]
+
+    ax.boxplot(fitness_data, label=cluster_names, patch_artist=True,
+               boxprops=dict(facecolor='lightgreen', color='green'),
+               medianprops=dict(color='red'),
+               whiskerprops=dict(color='green'),
+               capprops=dict(color='green'))
+
+    ax.set_title(f'Architecture Clustering - Fitness per Cluster - Generation {generation}')
+    ax.set_xlabel('Cluster')
+    ax.set_ylabel('Fitness')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'architecture_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"Architecture clustering plot saved: architecture_clustering_gen_{generation:04d}.png")
 
 def evaluate_single_episode_with_logging(genome, seed: int, max_steps: int = 50) -> Dict[str, List[float]]:
 
@@ -1683,18 +2441,24 @@ async def main_coevolution_async():
         genome_cls=PreyGenome,
         speciation_enabled=config.speciation_enabled,
         novelty_archive_enabled=config.novelty_archive_enabled,
-        compatibility_threshold=config.speciation_compatibility_threshold,
+        compatibility_threshold=config.prey_speciation_compatibility_threshold,
+        compatibility_threshold_decay_rate=config.speciation_compatibility_decay_rate,
         speciation_architecture_weight=config.speciation_architecture_weight,
         speciation_behavior_weight=config.speciation_behavior_weight,
         speciation_param_weight=config.speciation_param_weight,
         min_species_size=config.speciation_min_species_size,
         max_species_stagnation=config.speciation_max_stagnation,
+        min_offspring_per_species=config.speciation_min_offspring_per_species,
         novelty_threshold=config.novelty_threshold,
         max_archive_size=config.novelty_max_archive_size,
         immigration_rate=config.novelty_immigration_rate,
+        novelty_weight=config.prey_novelty_weight,
+        novelty_fitness_beta=config.novelty_fitness_beta,
+        cross_species_reproduction_rate=config.cross_species_reproduction_rate,
         architect_population=architect_population,
         mutator_population=mutator_population,
     )
+
     predator_engine = EvolutionEngine(
         population_size=config.predator_population_size,
         tournament_size=config.tournament_size,
@@ -1706,18 +2470,25 @@ async def main_coevolution_async():
         ,
         speciation_enabled=config.speciation_enabled,
         novelty_archive_enabled=config.novelty_archive_enabled,
-        compatibility_threshold=config.speciation_compatibility_threshold,
+        compatibility_threshold=config.predator_speciation_compatibility_threshold,
+        compatibility_threshold_decay_rate=config.speciation_compatibility_decay_rate,
+
         speciation_architecture_weight=config.speciation_architecture_weight,
         speciation_behavior_weight=config.speciation_behavior_weight,
         speciation_param_weight=config.speciation_param_weight,
         min_species_size=config.speciation_min_species_size,
         max_species_stagnation=config.speciation_max_stagnation,
+        min_offspring_per_species=config.speciation_min_offspring_per_species,
         novelty_threshold=config.novelty_threshold,
         max_archive_size=config.novelty_max_archive_size,
         immigration_rate=config.novelty_immigration_rate,
+        novelty_weight=config.predator_novelty_weight,
+        novelty_fitness_beta=config.novelty_fitness_beta,
+        cross_species_reproduction_rate=config.cross_species_reproduction_rate,
         architect_population=architect_population,
         mutator_population=mutator_population,
     )
+
 
     # Initialize meta-scientist systems
     meta_scientist = MetaScientist()
@@ -1749,6 +2520,9 @@ async def main_coevolution_async():
 
     # Training loop
     MAX_GEN_TIME = 300  # Maximum time per generation in seconds
+    stagnation_generations = 0
+    last_combined_best = None
+    stagnation_epsilon = 1e-3
     for generation in range(training_state.generation, config.generations):
         gen_start = time.time()
 
@@ -1789,6 +2563,41 @@ async def main_coevolution_async():
 
         # Update hall of fame
         training_state.update_hall_of_fame()
+
+        # Meta-stagnation: if no improvement for several generations, boost exploration
+        if training_state.best_prey_fitness_history and training_state.best_predator_fitness_history:
+            current_best = (
+                training_state.best_prey_fitness_history[-1]
+                + training_state.best_predator_fitness_history[-1]
+            ) / 2.0
+            if last_combined_best is None:
+                last_combined_best = current_best
+            elif current_best <= last_combined_best + stagnation_epsilon:
+                stagnation_generations += 1
+            else:
+                last_combined_best = current_best
+                stagnation_generations = 0
+
+            if stagnation_generations > 5:
+                old_mutation_rate = config.mutation_rate
+                old_arch_rate = config.architecture_mutation_rate
+                config.mutation_rate = min(config.mutation_rate * 1.2, 1.0)
+                config.architecture_mutation_rate = min(config.architecture_mutation_rate + 0.05, 1.0)
+
+                if prey_engine:
+                    prey_engine.mutation_rate = config.mutation_rate
+                    prey_engine.architecture_mutation_rate = config.architecture_mutation_rate
+                if predator_engine:
+                    predator_engine.mutation_rate = config.mutation_rate
+                    predator_engine.architecture_mutation_rate = config.architecture_mutation_rate
+
+                print(
+                    "Meta-Scientist: Stagnation > 5 generations. "
+                    f"Increasing mutation rate {old_mutation_rate:.4f} -> {config.mutation_rate:.4f} "
+                    f"and architecture mutation {old_arch_rate:.4f} -> {config.architecture_mutation_rate:.4f}"
+                )
+
+                stagnation_generations = 0
 
         # Compute diversity score from population
         from core.population import Population
@@ -1833,6 +2642,7 @@ async def main_coevolution_async():
         print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
 
         # Save checkpoint and run diagnostics
+        top_prey_genome = None
         if not skip_diagnostics and config.plot_every > 0 and generation % config.plot_every == 0:
             save_coevolution_state(training_state)
             evaluator.save_seeds()
@@ -1841,15 +2651,19 @@ async def main_coevolution_async():
             plot_learning_rule_stats(generation, training_state.prey_population, training_state.predator_population)
             plot_learning_rule_vs_fitness(generation, training_state.prey_population, training_state.predator_population)
             plot_strategy_clustering(generation, training_state.prey_population, training_state.predator_population)
+            plot_architecture_clustering(generation, training_state.prey_population, training_state.predator_population)
 
             # In-Lifetime Learning Curve: Pick top genome and log during single episode
             top_prey_genome = max(training_state.prey_population, key=lambda g: g.fitness)
             episode_data = evaluate_single_episode_with_logging(top_prey_genome, seed=generation, max_steps=config.max_steps)
             plot_in_lifetime_learning_curve(generation, episode_data)
 
-            # Milestone 7: Run integrated meta-scientist experiments
-            print("Running integrated meta-scientist experiments...")
+        # Milestone 7: Run integrated meta-scientist experiments
 
+        # Reduced frequency: every 10 generations instead of 20, skip after gen 300
+        if generation % 10 == 0 and generation <= 300:
+            print("Running integrated meta-scientist experiments...")
+            
             # Analyze population failures and generate hypotheses
             combined_population = cast(List[EvolvableGenome], training_state.prey_population + training_state.predator_population)
             task_info = {'name': stage_name, 'generation': generation}
@@ -1867,18 +2681,26 @@ async def main_coevolution_async():
                 )
                 target_capability = diagnostic_tasks[0].target_capability if diagnostic_tasks else None
 
-                diagnostic_suite = _build_targeted_task_suite(target_capability, generation, max_tasks=6)
+                # Reduced from 6 to 3 tasks for performance
+                diagnostic_suite = _build_targeted_task_suite(target_capability, generation, max_tasks=3)
+
                 diagnostic_evaluator = MultiTaskEvaluator(diagnostic_suite, base_seed=config.base_seed)
 
+                # Reduced from 6 to 3 tasks for performance
+                # Ensure top_prey_genome is available for meta-scientist experiments
+                if top_prey_genome is None and training_state.prey_population:
+                    top_prey_genome = max(training_state.prey_population, key=lambda g: g.fitness)
                 diagnostic_report = diagnostic_evaluator.run_subset_evaluation(
                     top_prey_genome,
-                    num_tasks=min(6, len(diagnostic_suite.tasks)),
+                    num_tasks=min(3, len(diagnostic_suite.tasks)),
+
                     generation=generation,
                     hall_of_fame_prey=training_state.prey_hall_of_fame,
                     hall_of_fame_pred=training_state.predator_hall_of_fame,
                     current_prey=training_state.prey_population,
                     current_pred=training_state.predator_population,
                 )
+
                 training_state.generalization_reports.append(diagnostic_report)
 
                 stage_candidates = [
@@ -1907,6 +2729,59 @@ async def main_coevolution_async():
 
             # Learn from experiments and update knowledge base
             meta_scientist.learn_from_experiments(experiment_results)
+
+            # NEUROGENESIS: Detect failure patterns with additional health metrics
+            # Prepare adaptability stats from generation stats
+            adaptability_stats = {
+                'avg_adaptability_score': stats.get('avg_adaptability_score', 0.0),
+                'avg_meta_effectiveness': stats.get('avg_meta_effectiveness', 0.0),
+                'avg_reward_delta': stats.get('avg_reward_delta', 0.0),
+            }
+            
+            # Get neural health from stats
+            neural_health = stats.get('neural_health', {
+                'dead_layers': 0,
+                'saturated_layers': 0,
+                'genomes_analyzed': 1
+            })
+            
+            # Get species stats for both populations
+            prey_species_stats = stats.get('prey_species', {'num_species': 0})
+            predator_species_stats = stats.get('predator_species', {'num_species': 0})
+            
+            # Detect failure patterns with NeuroGenesis metrics
+            failure_patterns = meta_scientist.detect_failure_patterns(
+                analysis_results,
+                experiment_results,
+                population=combined_population,
+                evolution_engine=prey_engine,  # Use prey engine as reference for chaos risk
+                species_stats=prey_species_stats,
+                generation=generation,
+                neural_health=neural_health,
+                prey_species_stats=prey_species_stats,
+                predator_species_stats=predator_species_stats,
+                adaptability_stats=adaptability_stats
+            )
+            
+            # NEUROGENESIS: Execute interventions based on detected patterns
+            if failure_patterns:
+                interventions = meta_scientist.intervene_in_evolution(
+                    failure_patterns,
+                    evolution_engine=None,  # Not used - we pass prey/predator engines directly
+                    curriculum_controller=curriculum_controller,
+                    generation=generation,
+                    prey_engine=prey_engine,
+                    predator_engine=predator_engine
+                )
+                
+                # Log intervention summary
+                total_interventions = (
+                    len(interventions.get('plasticity_boosts', [])) +
+                    len(interventions.get('architecture_prunes', [])) +
+                    len(interventions.get('species_rebalances', []))
+                )
+                if total_interventions > 0:
+                    print(f"Meta-Scientist NeuroGenesis: Applied {total_interventions} specialized interventions")
 
             # Apply meta-optimizer changes to evolution engines
             if experiment_results:
@@ -1957,6 +2832,10 @@ async def main_coevolution_async():
                 hypothesis = exp.get('hypothesis', 'unknown')[:50]
                 result = exp.get('result', {}).get('hypothesis_supported', False)
                 print(f"  {hypothesis}... -> {'SUPPORTED' if result else 'NOT SUPPORTED'}")
+        else:
+            print(f"Meta-scientist: Skipped (gen {generation} > 300 or not multiple of 10)")
+
+
 
         training_state.generation += 1
 

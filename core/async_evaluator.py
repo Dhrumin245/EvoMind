@@ -6,10 +6,7 @@ import numpy as np
 import torch
 from typing import List, Tuple, Optional, Dict, Any, cast
 from environments.deterministic_env import DeterministicSeedManager
-import time
-import os
 import multiprocessing
-import threading
 from dataclasses import dataclass
 from enum import Enum
 
@@ -809,6 +806,8 @@ class HybridEvaluator:
         prey_state, pred_state = arena.reset()
         prey_rewards = np.zeros(len(prey_genomes), dtype=np.float32)
         predator_rewards = np.zeros(len(prey_genomes), dtype=np.float32)
+        prey_reward_steps: List[List[float]] = [[] for _ in range(len(prey_genomes))]
+        predator_reward_steps: List[List[float]] = [[] for _ in range(len(prey_genomes))]
 
         # Reset episode tracking for all genomes
         for genome in prey_genomes + predator_genomes:
@@ -845,43 +844,115 @@ class HybridEvaluator:
                 if brain is not None and hasattr(brain, "update_plasticity"):
                     brain.update_plasticity(reward_signal=float(r_pred[i].mean().item()))
 
-                prey_rewards[i] += r_prey[i].mean().item()
-                predator_rewards[i] += r_pred[i].mean().item()
+                prey_step_reward = float(r_prey[i].mean().item())
+                pred_step_reward = float(r_pred[i].mean().item())
+                prey_rewards[i] += prey_step_reward
+                predator_rewards[i] += pred_step_reward
+                prey_reward_steps[i].append(prey_step_reward)
+                predator_reward_steps[i].append(pred_step_reward)
 
             if np.any(info['env_done']):
                 break
         
+        episode_info = arena.get_episode_info()
         arena.close()
+
+        per_env_signals = episode_info.get('success_signals_per_env', {})
+        per_env_energy = episode_info.get('energy_usage_per_env', {})
+        per_env_novelty = episode_info.get('novelty_hits_per_env', None)
+        per_env_recovery = episode_info.get('adaptation_recovery_per_env', {})
+        success_definition = episode_info.get('success_definition')
+
+        def _get_learning_speed(genome) -> float:
+            brain = getattr(genome, "brain", None)
+            if brain is not None and hasattr(brain, "get_episode_data"):
+                data = brain.get_episode_data()
+                delta_norms = data.get("delta_norms", [])
+                if delta_norms:
+                    return float(np.mean(np.abs(delta_norms)))
+            return 0.0
+
+        def _get_health_penalties(genome) -> Tuple[float, float]:
+            brain = getattr(genome, "brain", None)
+            if brain is not None and hasattr(brain, "get_stability_diagnostics"):
+                stability = brain.get_stability_diagnostics()
+                saturation_penalty = float(stability.get('avg_saturation_fraction', 0.0)) * 0.5
+                dead_unit_penalty = float(stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
+                return saturation_penalty, dead_unit_penalty
+            return 0.0, 0.0
+
+        def _get_per_env_value(values, idx: int, default: float = 0.0) -> float:
+            if isinstance(values, np.ndarray):
+                return float(values[idx]) if idx < values.shape[0] else default
+            if isinstance(values, list):
+                return float(values[idx]) if idx < len(values) else default
+            return default
         
         # Store metrics in genomes for later retrieval
         for i, (prey_genome, pred_genome) in enumerate(zip(prey_genomes, predator_genomes)):
-            if hasattr(prey_genome, 'last_eval_metrics'):
-                prey_genome.last_eval_metrics = {
-                    'fitness': prey_rewards[i],
-                    'energy_cost': 0.0,  # TODO: compute from arena info
-                    'learning_speed': 0.0,  # TODO: compute from plasticity diagnostics
-                    'stability': 0.0,  # TODO: compute from reward variance
-                    'task_success': prey_rewards[i] > 0,
-                    'episode_return': prey_rewards[i],
-                    'complexity_penalty': 0.0,
-                    'novelty': 0.0,
-                    'seed': batch_seed,
-                    'stage': 'coevolution',
-                    'opponent_id': getattr(pred_genome, 'genome_id', None)
+            prey_energy_cost = _get_per_env_value(per_env_energy.get('prey_energy_used', []), i, 0.0)
+            predator_energy_cost = _get_per_env_value(per_env_energy.get('predator_energy_used', []), i, 0.0)
+            prey_novelty = _get_per_env_value(per_env_novelty, i, 0.0)
+            predator_novelty = _get_per_env_value(per_env_novelty, i, 0.0)
+
+            prey_stability = float(np.std(prey_reward_steps[i])) if prey_reward_steps[i] else 0.0
+            predator_stability = float(np.std(predator_reward_steps[i])) if predator_reward_steps[i] else 0.0
+            prey_learning_speed = _get_learning_speed(prey_genome)
+            predator_learning_speed = _get_learning_speed(pred_genome)
+            prey_saturation_penalty, prey_dead_unit_penalty = _get_health_penalties(prey_genome)
+            predator_saturation_penalty, predator_dead_unit_penalty = _get_health_penalties(pred_genome)
+
+            prey_success = prey_rewards[i] > 0
+            predator_success = predator_rewards[i] > 0
+            if isinstance(success_definition, dict) and per_env_signals:
+                signals = {
+                    'food_collected': _get_per_env_value(per_env_signals.get('food_collected', []), i, 0.0),
+                    'predator_captures': _get_per_env_value(per_env_signals.get('predator_captures', []), i, 0.0),
+                    'prey_alive': _get_per_env_value(per_env_signals.get('prey_alive', []), i, 0.0),
+                    'prey_energy_used': prey_energy_cost,
+                    'predator_energy_used': predator_energy_cost,
                 }
-            if hasattr(pred_genome, 'last_eval_metrics'):
-                pred_genome.last_eval_metrics = {
-                    'fitness': predator_rewards[i],
-                    'energy_cost': 0.0,  # TODO: compute from arena info
-                    'learning_speed': 0.0,  # TODO: compute from plasticity diagnostics
-                    'stability': 0.0,  # TODO: compute from reward variance
-                    'task_success': predator_rewards[i] > 0,
-                    'episode_return': predator_rewards[i],
-                    'complexity_penalty': 0.0,
-                    'novelty': 0.0,
-                    'seed': batch_seed,
-                    'stage': 'coevolution',
-                    'opponent_id': getattr(prey_genome, 'genome_id', None)
-                }
+                try:
+                    prey_success = bool(success_definition['prey_success'](signals))
+                    predator_success = bool(success_definition['predator_success'](signals))
+                except Exception:
+                    pass
+
+            prey_genome.last_eval_metrics = {
+                'fitness': prey_rewards[i],
+                'energy_cost': prey_energy_cost,
+                'learning_speed': prey_learning_speed,
+                'stability': prey_stability,
+                'task_success': prey_success,
+                'episode_return': prey_rewards[i],
+                'complexity_penalty': 0.0,
+                'novelty': prey_novelty,
+                'saturation_penalty': prey_saturation_penalty,
+                'dead_unit_penalty': prey_dead_unit_penalty,
+                'seed': batch_seed,
+                'stage': 'coevolution',
+                'opponent_id': getattr(pred_genome, 'genome_id', None),
+                'adaptation_recovery': _get_per_env_value(
+                    per_env_recovery.get('prey_adaptation_recovery', []), i, 0.0
+                )
+            }
+            pred_genome.last_eval_metrics = {
+                'fitness': predator_rewards[i],
+                'energy_cost': predator_energy_cost,
+                'learning_speed': predator_learning_speed,
+                'stability': predator_stability,
+                'task_success': predator_success,
+                'episode_return': predator_rewards[i],
+                'complexity_penalty': 0.0,
+                'novelty': predator_novelty,
+                'saturation_penalty': predator_saturation_penalty,
+                'dead_unit_penalty': predator_dead_unit_penalty,
+                'seed': batch_seed,
+                'stage': 'coevolution',
+                'opponent_id': getattr(prey_genome, 'genome_id', None),
+                'adaptation_recovery': _get_per_env_value(
+                    per_env_recovery.get('predator_adaptation_recovery', []), i, 0.0
+                )
+            }
 
         return prey_rewards.tolist(), predator_rewards.tolist()

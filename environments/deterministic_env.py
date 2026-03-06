@@ -1,6 +1,7 @@
 """
 Deterministic environment implementations with seed control
 """
+import hashlib
 import numpy as np
 import random
 import logging
@@ -318,7 +319,9 @@ class DeterministicSeedManager:
             return self.seed_registry[component] + offset
         else:
             # Generate new seed based on base seed and component name
-            component_hash = hash(component) % 1000000
+            # Use hashlib (not Python's hash()) for cross-run stability —
+            # Python's built-in hash() is randomized per-process by PYTHONHASHSEED.
+            component_hash = int(hashlib.md5(component.encode()).hexdigest(), 16) % 1000000
             seed = self.base_seed + component_hash + offset
             self.register_seed(component, seed)
             return seed

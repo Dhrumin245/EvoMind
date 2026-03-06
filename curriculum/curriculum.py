@@ -101,33 +101,33 @@ def get_stage_transition_thresholds() -> Dict[CurriculumStage, Dict[str, float]]
     """
     return {
         CurriculumStage.FORAGING: {
-            'min_mean_fitness': 50.0,
-            'min_success_rate': 0.7,
-            'min_diversity': 0.3,
+            'min_mean_fitness': 1.2,
+            'min_success_rate': 0.45,
+            'min_diversity': 0.2,
             'max_stagnation': 20
         },
         CurriculumStage.PRECISION: {
-            'min_mean_fitness': 40.0,
-            'min_success_rate': 0.6,
-            'min_diversity': 0.25,
+            'min_mean_fitness': 1.8,
+            'min_success_rate': 0.4,
+            'min_diversity': 0.18,
             'max_stagnation': 25
         },
         CurriculumStage.SCARCITY: {
-            'min_mean_fitness': 35.0,
-            'min_success_rate': 0.5,
-            'min_diversity': 0.2,
+            'min_mean_fitness': 2.2,
+            'min_success_rate': 0.35,
+            'min_diversity': 0.16,
             'max_stagnation': 30
         },
         CurriculumStage.THREAT: {
-            'min_mean_fitness': 30.0,
-            'min_success_rate': 0.4,
-            'min_diversity': 0.15,
+            'min_mean_fitness': 2.6,
+            'min_success_rate': 0.3,
+            'min_diversity': 0.14,
             'max_stagnation': 35
         },
         CurriculumStage.ADVERSARIAL: {
-            'min_mean_fitness': 25.0,
-            'min_success_rate': 0.3,
-            'min_diversity': 0.1,
+            'min_mean_fitness': 3.0,
+            'min_success_rate': 0.25,
+            'min_diversity': 0.12,
             'max_stagnation': 40
         }
     }

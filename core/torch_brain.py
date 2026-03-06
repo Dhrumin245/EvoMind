@@ -3,26 +3,22 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
 import logging
 from collections import deque
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, cast
 from core.genome import EvolvableGenome
+from core.numeric_safety import sanitize_array, safe_divide, safe_normalize, check_finite
 from diagnostics.plasticity_timing import PlasticityTimingLogger
 from diagnostics.reward_recovery import RewardRecoveryLogger
 from diagnostics.meta_gene_entropy import MetaGeneEntropyLogger
 
-
-# -----------------------------------------------------------------------------
 # Global caches / knobs
-# -----------------------------------------------------------------------------
 # Plasticity updates are noisy when rewards are near-zero.
 PLASTICITY_REWARD_EPSILON: float = 0.05
 
 # Cache TorchBrain instances by deterministic genome signature to avoid repeated
 # torch.compile / graph build overhead across identical genomes.
 _BRAIN_CACHE: Dict[str, "TorchBrain"] = {}
-
 
 def get_cached_brain(genome: EvolvableGenome) -> "TorchBrain":
     """Return a cached TorchBrain keyed by genome.signature."""
@@ -127,11 +123,12 @@ class DynamicBatchNorm(nn.Module):
                 self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
                 self.num_batches_tracked += 1
 
-            # Normalize using batch statistics
-            x_norm = (x - mean) / torch.sqrt(var + self.eps)
+            # Normalize using batch statistics - NUMERIC SAFETY: epsilon protection
+            std = torch.sqrt(var + self.eps)
+            x_norm = (x - mean) / std
         else:
-            # Normalize using running statistics
-            x_norm = (x - self.running_mean) / torch.sqrt(self.running_var + self.eps)
+            # Normalize using running statistics - NUMERIC SAFETY: use safe_divide
+            x_norm = cast(torch.Tensor, safe_divide(x - self.running_mean, torch.sqrt(self.running_var + self.eps), epsilon=0.0, default_value=0.0))
 
         # Scale and shift
         return self.gamma * x_norm + self.beta
@@ -193,11 +190,16 @@ class DynamicLayerNorm(nn.Module):
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
 
-        # Normalize
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        # Normalize - NUMERIC SAFETY: epsilon protection
+        std = torch.sqrt(var + self.eps)
+        x_norm = (x - mean) / std
+        # Replace any NaN/Inf with 0
+        x_norm = torch.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Scale and shift
         return self.gamma * x_norm + self.beta
+
+
 
     def copy_params_from_numpy(self, gamma: np.ndarray, beta: np.ndarray):
         """Copy parameters from numpy arrays"""
@@ -237,13 +239,13 @@ class MLPBlock(nn.Module):
                 # Last layer
                 layers.extend([
                     nn.Linear(current_dim, output_dim),
-                    nn.ReLU()
+                    nn.LeakyReLU(negative_slope=0.01)
                 ])
             else:
                 # Hidden layers
                 layers.extend([
                     nn.Linear(current_dim, self.hidden_dim),
-                    nn.ReLU()
+                    nn.LeakyReLU(negative_slope=0.01)
                 ])
                 current_dim = self.hidden_dim
 
@@ -320,13 +322,20 @@ class GRUBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Simple attention block with evolvable memory size"""
+    """Temporal self-attention block with evolvable memory size.
 
-    def __init__(self, input_dim: int, output_dim: int, memory_size: int):
+    Each agent attends over its own recent observation history (last `history_len`
+    timesteps) instead of across the batch dimension. This eliminates information
+    leakage between independent agents sharing a vectorized evaluation batch and
+    ensures consistent behaviour at any batch size, including batch=1.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, memory_size: int, history_len: int = 8):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.memory_size = memory_size
+        self.history_len = history_len
 
         # Key, Query, Value projections
         self.key_proj = nn.Linear(input_dim, memory_size)
@@ -336,29 +345,49 @@ class AttentionBlock(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(memory_size, output_dim)
 
-        # Memory buffer for attention
-        self.register_buffer('memory', torch.zeros(1, memory_size))
+        # Per-agent observation history: (batch, history_len, input_dim)
+        # Initialised with batch=1; resized dynamically on first forward call
+        # with a different batch size (same pattern as GRUBlock.hidden).
+        self.register_buffer('obs_history', torch.zeros(1, history_len, input_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, input_dim)
+        batch_size = x.size(0)
 
-        # Compute attention
-        keys = self.key_proj(x)      # (batch_size, memory_size)
-        queries = self.query_proj(x) # (batch_size, memory_size)
-        values = self.value_proj(x)  # (batch_size, memory_size)
+        # Resize history buffer if batch size changed (e.g. first call or eval switch)
+        if self.obs_history.size(0) != batch_size:
+            self.obs_history = torch.zeros(
+                batch_size, self.history_len, self.input_dim,
+                device=x.device, dtype=x.dtype
+            )
 
-        # Simple dot-product attention
-        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / (self.memory_size ** 0.5)
+        # Shift history left by one and append current observation at the end.
+        # detach() prevents gradients flowing into the stored history buffer.
+        self.obs_history = torch.cat(
+            [self.obs_history[:, 1:, :], x.unsqueeze(1).detach()], dim=1
+        )  # (batch, history_len, input_dim)
+
+        # Project history to keys and values: (batch, history_len, memory_size)
+        keys   = self.key_proj(self.obs_history)
+        values = self.value_proj(self.obs_history)
+
+        # Project current input to a single query: (batch, 1, memory_size)
+        query = self.query_proj(x).unsqueeze(1)
+
+        # Scaled dot-product: query attends over own history
+        # scores: (batch, 1, history_len)
+        attention_scores = torch.matmul(query, keys.transpose(-2, -1)) / (self.memory_size ** 0.5)
         attention_weights = F.softmax(attention_scores, dim=-1)
 
-        # Apply attention
-        attended = torch.matmul(attention_weights, values)
-
-        # Update memory (simple average)
-        self.memory = (0.9 * self.memory + 0.1 * attended.mean(dim=0, keepdim=True)).detach()
+        # Attended context: (batch, 1, memory_size) -> (batch, memory_size)
+        attended = torch.matmul(attention_weights, values).squeeze(1)
 
         # Output projection
         return self.output_proj(attended)
+
+    def reset_history(self):
+        """Reset observation history buffer (call at episode boundaries)."""
+        self.obs_history.zero_()
 
 
 class PlasticLinear(torch.nn.Module):
@@ -396,10 +425,16 @@ class PlasticLinear(torch.nn.Module):
         # DIAGNOSTIC 2: Plastic Weight Activation Timing
         self.plastic_delta_logs = []  # List of ||ΔW|| per timestep
 
+        # CRITICAL FIX 2: Instability tracking for adaptability calculation
+        self.plastic_delta_history = []  # History of plastic deltas for variance calculation
+        self.max_history_size = 100  # Limit history to prevent memory growth
+        self.instability_score = 0.0  # Running instability metric
+
         # Milestone 6: Stability monitoring and adaptive controls
         self.drift_budget = 1.0  # Per-layer drift budget
         self.observed_drift = 0.0  # Running average of observed drift
         self.adaptive_clamp = 0.01  # Adaptive clamp based on observed drift
+
 
         self.reset_parameters()
 
@@ -417,6 +452,11 @@ class PlasticLinear(torch.nn.Module):
         self.episode_delta_norms = []
         self.episode_rewards = []
         self.plastic_delta_logs = []  # Clear to prevent unbounded growth
+        # CRITICAL FIX 2: Keep plastic_delta_history across episodes for stability calculation
+        # but trim if it gets too large
+        if len(self.plastic_delta_history) > self.max_history_size:
+            self.plastic_delta_history = self.plastic_delta_history[-self.max_history_size//2:]
+
 
     def get_episode_data(self) -> Dict[str, List[float]]:
         """Get episode data for plotting"""
@@ -425,8 +465,50 @@ class PlasticLinear(torch.nn.Module):
             "rewards": self.episode_rewards.copy()
         }
 
+    def get_instability_metric(self) -> float:
+        """CRITICAL FIX 2: Calculate instability as variance of plastic updates
+        
+        High variance = unstable learning = bad
+        Low variance = stable learning = good
+        
+        Returns:
+            Instability score (0.0 = perfectly stable, higher = more unstable)
+        """
+        if len(self.plastic_delta_history) < 2:
+            return 0.0
+        
+        # Calculate coefficient of variation (CV) = std / mean
+        # This normalizes for different scales of plasticity
+        deltas = np.array(self.plastic_delta_history)
+        mean_delta = np.mean(deltas)
+        std_delta = np.std(deltas)
+        
+        if abs(mean_delta) < 1e-6:
+            # If mean is near zero, just use std as instability
+            return float(std_delta * 10.0)  # Scale up since small updates
+        
+        cv = std_delta / abs(mean_delta)
+        
+        # Also penalize large spikes (max delta)
+        max_delta = np.max(deltas)
+        spike_penalty = max(0.0, max_delta - 0.1)  # Penalty for deltas > 0.1
+        
+        # Combine CV and spike penalty
+        instability = cv * 0.5 + spike_penalty * 2.0
+        
+        return float(instability)
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = torch.add(self.base_weight, self.plastic_weight)
+        # NUMERIC SAFETY: Protect weight normalization with epsilon
+        w_norm = torch.norm(w)
+        if w_norm > 1e-8:
+            w = w / w_norm
+        else:
+            w = w / (w_norm + 1e-8)
+        # Replace any NaN/Inf with safe values
+        w = torch.nan_to_num(w, nan=0.0, posinf=1.0, neginf=-1.0)
         out = x @ w.T
         if self.bias is not None:
             out = out + self.bias
@@ -434,10 +516,15 @@ class PlasticLinear(torch.nn.Module):
         self.last_output = out.detach()
         return out
 
+
+
     def apply_plasticity(self, reward: float, meta: Dict[str, float], state: Optional[torch.Tensor] = None):
         """META-3.2 plastic update with learned function ΔW = f(pre, post, reward, w, t)"""
         # Gate: ignore tiny reward signals (noise-dominated).
         if abs(reward) <= PLASTICITY_REWARD_EPSILON:
+            return
+
+        if not math.isfinite(float(reward)):
             return
 
         # Track plastic delta before update
@@ -455,6 +542,10 @@ class PlasticLinear(torch.nn.Module):
             w_flat = (self.base_weight + self.plastic_weight).flatten()  # Current weights flattened
             t = torch.tensor([self.timestep], dtype=torch.float32, device=self.plastic_weight.device)
 
+            pre = torch.nan_to_num(pre, nan=0.0, posinf=1.0, neginf=-1.0)
+            post = torch.nan_to_num(post, nan=0.0, posinf=1.0, neginf=-1.0)
+            w_flat = torch.nan_to_num(w_flat, nan=0.0, posinf=1.0, neginf=-1.0)
+
             # Compute ΔW directly
             delta_w_flat = self.learning_rule_net(pre, post, r, w_flat, t)
             delta_w = delta_w_flat.view(self.output_dim, self.input_dim)
@@ -465,11 +556,18 @@ class PlasticLinear(torch.nn.Module):
             # Scale by plastic_lr
             delta_w *= meta["plastic_lr"]
 
-            # Normalize by presynaptic activity
-            delta_w = delta_w / (torch.norm(pre) + 1e-6)
+            # Normalize by presynaptic activity - NUMERIC SAFETY: epsilon protection
+            pre_norm = torch.norm(pre) + 1e-8
+            delta_w = delta_w / pre_norm
+            # Replace any NaN/Inf with 0
+            delta_w = torch.nan_to_num(delta_w, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Apply update
             self.plastic_weight += delta_w
+
+            # NUMERIC SAFETY: Sanitize after update to prevent NaN/Inf
+            self.plastic_weight = torch.nan_to_num(self.plastic_weight, nan=0.0, posinf=1.0, neginf=-1.0)
+
 
             # Plasticity clipping - balanced range to allow learning while preventing runaway plasticity
             self.plastic_weight = torch.clamp(
@@ -490,6 +588,7 @@ class PlasticLinear(torch.nn.Module):
             plastic_rms_norm = plastic_norm_after / math.sqrt(float(num_weights))
             PlasticLinear.plastic_norms.append(plastic_rms_norm)
 
+
             # Per-episode tracking
             delta_norm = torch.norm(delta_w).item()
             self.episode_delta_norms.append(delta_norm)
@@ -497,9 +596,15 @@ class PlasticLinear(torch.nn.Module):
 
             # DIAGNOSTIC 2: Log ||ΔW|| per timestep
             self.plastic_delta_logs.append(delta_norm)
+            
+            # CRITICAL FIX 2: Track plastic delta for instability calculation
+            self.plastic_delta_history.append(delta_norm)
+            if len(self.plastic_delta_history) > self.max_history_size:
+                self.plastic_delta_history.pop(0)
         else:
             # Fallback: no learning rule net, skip update
             pass
+
 
 
 class PlasticityRegularizer:
@@ -533,8 +638,10 @@ class ActivationMonitor:
     def __init__(self):
         self.saturation_thresholds = {
             'tanh': 0.95,
+            'tanh_scaled': 0.475,
             'sigmoid': 0.95,
-            'relu': 1000.0
+            'relu': 1000.0,
+            'leaky_relu': 1000.0
         }
 
     def check_layer(self, activations, activation_fn):
@@ -621,7 +728,7 @@ class NeuralHealthController:
         health_data = self.assess_network_health(brain)
 
         if health_data['healthy']:
-            return 0.0
+            return 1.0
 
         # Heavy penalty for dead neurons (multiplicative)
         dead_penalty = 1.0
@@ -981,7 +1088,8 @@ class TorchBrain(nn.Module):
             layer = AttentionBlock(
                 input_dim=gene.input_dim,
                 output_dim=gene.output_dim,
-                memory_size=gene.memory_size
+                memory_size=gene.memory_size,
+                history_len=getattr(gene, 'history_len', 8)
             )
 
         else:
@@ -1021,6 +1129,7 @@ class TorchBrain(nn.Module):
         """Get PyTorch activation function by name"""
         activation_map = {
             'tanh': torch.tanh,
+            'tanh_scaled': lambda x: 0.5 * torch.tanh(x),
             'relu': F.relu,
             'leaky_relu': F.leaky_relu,
             'sigmoid': torch.sigmoid,
@@ -1123,6 +1232,28 @@ class TorchBrain(nn.Module):
             
             output = self.forward(states_tensor)
             return torch.argmax(output, dim=1).cpu().numpy()
+
+    def get_stability_diagnostics(self) -> Dict[str, float]:
+        """Summarize dead/saturated activation fractions for the last forward pass."""
+        if not self.activation_stats:
+            return {
+                'avg_dead_unit_fraction': 0.0,
+                'avg_saturation_fraction': 0.0,
+                'dead_layers': 0.0,
+                'saturated_layers': 0.0
+            }
+
+        dead_ratios = [float(stats.get('dead_ratio', 0.0)) for stats in self.activation_stats]
+        saturated_ratios = [float(stats.get('saturated_ratio', 0.0)) for stats in self.activation_stats]
+        dead_layers = sum(1 for ratio in dead_ratios if ratio > 0.5)
+        saturated_layers = sum(1 for ratio in saturated_ratios if ratio > 0.5)
+
+        return {
+            'avg_dead_unit_fraction': float(np.mean(dead_ratios)) if dead_ratios else 0.0,
+            'avg_saturation_fraction': float(np.mean(saturated_ratios)) if saturated_ratios else 0.0,
+            'dead_layers': float(dead_layers),
+            'saturated_layers': float(saturated_layers)
+        }
     
     def get_architecture_summary(self) -> Dict[str, Any]:
         """Get summary of network architecture"""
@@ -1243,7 +1374,7 @@ class TorchBrain(nn.Module):
             if isinstance(layer, GRUBlock):
                 layer.reset_hidden()
             elif isinstance(layer, AttentionBlock):
-                layer.memory.zero_()
+                layer.reset_history()
 
     def reset_plasticity(self):
         """Reset plasticity for all plastic layers"""
@@ -1297,9 +1428,14 @@ class TorchBrain(nn.Module):
         plastic_layers = [layer for layer in self.layers if isinstance(layer, PlasticLinear)]
 
         if not plastic_layers:
-            return {"plastic_layers": 0, "total_plastic_delta": 0.0, "mean_plastic_delta": 0.0}
+            return {"plastic_layers": 0, "total_plastic_delta": 0.0, "mean_plastic_delta": 0.0, "instability": 0.0}
 
         plastic_deltas = [layer.plastic_delta_norm for layer in plastic_layers]
+        
+        # CRITICAL FIX 2: Calculate instability across all plastic layers
+        instabilities = [layer.get_instability_metric() for layer in plastic_layers]
+        mean_instability = float(np.mean(instabilities)) if instabilities else 0.0
+        max_instability = float(np.max(instabilities)) if instabilities else 0.0
 
         return {
             "plastic_layers": len(plastic_layers),
@@ -1307,8 +1443,13 @@ class TorchBrain(nn.Module):
             "mean_plastic_delta": float(np.mean(plastic_deltas)),
             "max_plastic_delta": float(max(plastic_deltas)),
             "min_plastic_delta": float(min(plastic_deltas)),
-            "plastic_deltas": plastic_deltas
+            "plastic_deltas": plastic_deltas,
+            # CRITICAL FIX 2: Add instability metrics
+            "instability": mean_instability,
+            "max_instability": max_instability,
+            "layer_instabilities": instabilities
         }
+
 
     def get_mean_plastic_norm(self) -> float:
         """Get the mean norm of plastic weights across all plastic layers"""

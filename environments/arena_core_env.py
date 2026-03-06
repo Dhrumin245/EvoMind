@@ -622,7 +622,7 @@ class VectorizedArenaCore:
 # Backward compatibility wrapper
 class ArenaEnvCore(VectorizedArenaCore):
     """
-    ⚠️ DEPRECATED: ArenaEnvCore is SLOW and should NOT be used.
+    DEPRECATED: ArenaEnvCore is SLOW and should NOT be used.
     
     Use DeterministicVectorizedArena instead for true NumPy vectorization.
     Import with: from deterministic_env import DeterministicVectorizedArena
