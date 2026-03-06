@@ -1815,10 +1815,10 @@ def plot_meta_gene_histograms(stats: Dict[str, Any]):
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'meta_gene_distribution_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'output_logs/meta_gene_distribution_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f"META gene histograms saved: meta_gene_distribution_gen_{generation:04d}.png")
+    print(f"META gene histograms saved: output_logs/meta_gene_distribution_gen_{generation:04d}.png")
 
 def plot_plastic_norm_evolution(generation_stats: List[Dict[str, Any]]):
     """Plot plastic weight norm evolution over generations"""
@@ -1847,10 +1847,10 @@ def plot_plastic_norm_evolution(generation_stats: List[Dict[str, Any]]):
     ax.legend()
 
     plt.tight_layout()
-    plt.savefig('plastic_norm_evolution.png', dpi=150, bbox_inches='tight')
+    plt.savefig('output_logs/plastic_norm_evolution.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print("Plastic norm evolution plot saved: plastic_norm_evolution.png")
+    print("Plastic norm evolution plot saved: output_logs/plastic_norm_evolution.png")
 
 def plot_learning_rule_stats(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]):
     """Plot learning rule parameter distributions per generation"""
@@ -1863,7 +1863,7 @@ def plot_learning_rule_stats(generation: int, prey_population: List[PreyGenome],
         plt.axvline(float(np.mean(vals).item()), color='r')
         plt.title(f"Learning Rule {k} — Gen {generation}")
     plt.tight_layout()
-    plt.savefig(f'learning_rule_stats_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'output_logs/learning_rule_stats_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
 def plot_learning_rule_vs_fitness(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]):
@@ -1883,10 +1883,10 @@ def plot_learning_rule_vs_fitness(generation: int, prey_population: List[PreyGen
         axes[i].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'learning_rule_vs_fitness_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'output_logs/learning_rule_vs_fitness_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f"Learning rule vs fitness scatter plots saved: learning_rule_vs_fitness_gen_{generation:04d}.png")
+    print(f"Learning rule vs fitness scatter plots saved: output_logs/learning_rule_vs_fitness_gen_{generation:04d}.png")
 
 def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]):
     """Plot fitness per cluster after clustering genomes by learning rule strategies (A, B, C, D, E)"""
@@ -1928,10 +1928,10 @@ def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome],
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'strategy_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'output_logs/strategy_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f"Strategy clustering plot saved: strategy_clustering_gen_{generation:04d}.png")
+    print(f"Strategy clustering plot saved: output_logs/strategy_clustering_gen_{generation:04d}.png")
 
 def compute_architecture_clustering_stats(population: List[EvolvableGenome], n_clusters: int = 3) -> Dict[str, Any]:
     """Compute architecture clustering stats using genome structural features."""
@@ -1996,10 +1996,10 @@ def plot_architecture_clustering(generation: int, prey_population: List[PreyGeno
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'architecture_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'output_logs/architecture_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f"Architecture clustering plot saved: architecture_clustering_gen_{generation:04d}.png")
+    print(f"Architecture clustering plot saved: output_logs/architecture_clustering_gen_{generation:04d}.png")
 
 def evaluate_single_episode_with_logging(genome, seed: int, max_steps: int = 50) -> Dict[str, List[float]]:
 
@@ -2091,10 +2091,10 @@ def plot_in_lifetime_learning_curve(generation: int, episode_data: Dict[str, Lis
         ax2.set_title(f'Plastic Change vs Time - Generation {generation}')
 
     plt.tight_layout()
-    plt.savefig(f'in_lifetime_learning_curve_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'output_logs/in_lifetime_learning_curve_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print(f"In-lifetime learning curve plot saved: in_lifetime_learning_curve_gen_{generation:04d}.png")
+    print(f"In-lifetime learning curve plot saved: output_logs/in_lifetime_learning_curve_gen_{generation:04d}.png")
 
 # Meta-scientist experiment runners
 def run_ablation_frozen_learning_rule(genome, generation: int, stage_config, max_steps: int) -> ExperimentReport:
@@ -2260,7 +2260,7 @@ def run_ablation_reward_weights(genome, generation: int, stage_config, max_steps
         metrics={"original_weights": original_weights, "modified_weights": modified_weights}
     )
 
-def save_coevolution_state(training_state: TrainingState, filename: str = "coevolution_state.json"):
+def save_coevolution_state(training_state: TrainingState, filename: str = "data/coevolution_state.json"):
     """Save complete co-evolution training state"""
     state = {
         'generation': training_state.generation,
@@ -2296,7 +2296,7 @@ def save_coevolution_state(training_state: TrainingState, filename: str = "coevo
     print(f"Co-evolution state saved: {filename}")
     print(f"  Preserved genome metadata: parent_ids, birth_generation, mutation_history")
 
-def load_coevolution_state(filename: str = "coevolution_state.json") -> TrainingState:
+def load_coevolution_state(filename: str = "data/coevolution_state.json") -> TrainingState:
     """Load co-evolution training state"""
     with open(filename, 'r') as f:
         state = json.load(f)
@@ -2418,13 +2418,13 @@ async def main_coevolution_async():
     )
 
     # Load checkpoint if exists
-    if os.path.exists("coevolution_state.json"):
+    if os.path.exists("data/coevolution_state.json"):
         response = os.getenv("AUTO_LOAD_COEVOLUTION_STATE")
         if response is None:
             response = input("Co-evolution state found. Load? (y/n): ")
         if response.lower() == 'y':
             training_state = load_coevolution_state()
-            evaluator.load_seeds("seed_registry.json")
+            evaluator.load_seeds("data/seed_registry.json")
 
     # Initialize meta-evolution populations
     architect_population = ArchitectPopulation(population_size=20)
@@ -2840,8 +2840,8 @@ async def main_coevolution_async():
         training_state.generation += 1
 
     # Final save
-    save_coevolution_state(training_state, "final_coevolution_state.json")
-    evaluator.save_seeds("final_seed_registry.json")
+    save_coevolution_state(training_state, "data/final_coevolution_state.json")
+    evaluator.save_seeds("data/final_seed_registry.json")
 
     # Close evaluator
     evaluator.close()
