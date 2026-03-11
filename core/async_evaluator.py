@@ -106,6 +106,12 @@ class AsyncDeterministicEvaluator:
         seed = self.seed_manager.get_seed(seed_key, offset=0)  # NO TIME OFFSET
         self.seed_registry[identifier] = seed
         return seed
+
+    def _infer_actions(self, genome, states):
+        """Run action inference on configured device path."""
+        if self.use_gpu and hasattr(genome, "act_batch_gpu"):
+            return genome.act_batch_gpu(states)
+        return genome.act_batch(states)
     
     async def evaluate_genome_async(self, 
                                    genome, 
@@ -168,8 +174,6 @@ class AsyncDeterministicEvaluator:
         """
         Process-safe evaluation (each process has its own GPU context)
         """
-        if self.use_gpu:
-            raise RuntimeError("GPU not allowed in async evaluator")
         # Each process imports its own modules
         import numpy as np
 
@@ -259,7 +263,7 @@ class AsyncDeterministicEvaluator:
             while step < self.max_steps:
                 # Get actions
                 with torch.no_grad():
-                    actions = genome.act_batch(seed_states)  # Always use CPU for process safety
+                    actions = self._infer_actions(genome, seed_states)
 
                 # We need to handle the full batch - create padded actions
                 batch_actions = np.zeros((self.envs_per_genome * 5,) + actions.shape[1:], dtype=actions.dtype)
@@ -373,14 +377,14 @@ class AsyncDeterministicEvaluator:
 
             # Get actions based on role
             if role == "prey":
-                prey_actions = prey_genome.act_batch(prey_state)
+                prey_actions = self._infer_actions(prey_genome, prey_state)
 
                 # Create dummy predator actions (opponent will be evaluated separately)
                 # Or use opponent genome if available
-                pred_actions = predator_genome.act_batch(pred_state)
+                pred_actions = self._infer_actions(predator_genome, pred_state)
             else:  # predator
-                prey_actions = prey_genome.act_batch(prey_state)
-                pred_actions = predator_genome.act_batch(pred_state)
+                prey_actions = self._infer_actions(prey_genome, prey_state)
+                pred_actions = self._infer_actions(predator_genome, pred_state)
 
             # Step the arena
             (prey_state, pred_state), r_prey, r_pred, info = arena.step(
@@ -451,8 +455,8 @@ class AsyncDeterministicEvaluator:
         
         for step in range(self.max_steps):
             # Get actions
-            prey_actions = prey_genome.act_batch(prey_state)
-            pred_actions = predator_genome.act_batch(pred_state)
+            prey_actions = self._infer_actions(prey_genome, prey_state)
+            pred_actions = self._infer_actions(predator_genome, pred_state)
 
             # Step environment
             (prey_state, pred_state), r_prey, r_pred, info = arena.step(
@@ -542,11 +546,11 @@ class AsyncDeterministicEvaluator:
             'median': float(np.median(fitness_array))
         }
     
-    def save_seeds(self, filename: str = "seed_registry.json"):
+    def save_seeds(self, filename: str = "data/seed_registry.json"):
         """Save seed registry for reproducibility"""
         self.seed_manager.save_seeds(filename)
     
-    def load_seeds(self, filename: str = "seed_registry.json"):
+    def load_seeds(self, filename: str = "data/seed_registry.json"):
         """Load seed registry"""
         self.seed_manager.load_seeds(filename)
     
@@ -652,6 +656,12 @@ class HybridEvaluator:
             seed_key += f"_{self.mode.value}"
         
         return self.seed_manager.get_seed(seed_key, offset=0)  # NO TIME OFFSET
+
+    def _infer_actions(self, genome, states):
+        """Run action inference on configured device path."""
+        if self.use_gpu and hasattr(genome, "act_batch_gpu"):
+            return genome.act_batch_gpu(states)
+        return genome.act_batch(states)
     
     def evaluate_batch(self,
                       genomes: List,
@@ -742,8 +752,7 @@ class HybridEvaluator:
                 end_idx = (i + 1) * self.envs_per_genome
                 genome_states = states[start_idx:end_idx]
 
-                # Always use CPU for batch evaluation safety
-                actions = genome.act_batch(genome_states)
+                actions = self._infer_actions(genome, genome_states)
                 batch_actions.append(actions)
 
             # Concatenate actions
@@ -822,8 +831,8 @@ class HybridEvaluator:
             
             for i, (prey_genome, pred_genome) in enumerate(zip(prey_genomes, predator_genomes)):
                 with torch.no_grad():
-                    prey_actions = prey_genome.act_batch(prey_state[i:i+1])
-                    pred_actions = pred_genome.act_batch(pred_state[i:i+1])
+                    prey_actions = self._infer_actions(prey_genome, prey_state[i:i+1])
+                    pred_actions = self._infer_actions(pred_genome, pred_state[i:i+1])
                 prey_actions_list.append(prey_actions)
                 pred_actions_list.append(pred_actions)
             

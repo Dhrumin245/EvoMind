@@ -12,6 +12,7 @@ import ast
 import re
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
+from core.numeric_safety import safe_linear_slope
 
 
 @dataclass
@@ -243,6 +244,25 @@ class LearningRuleNet(nn.Module):
         nn.init.zeros_(self.fc1.bias)
         nn.init.zeros_(self.fc2.bias)
         nn.init.zeros_(self.output.bias)
+
+        # Online optimizer: updates rule parameters within an episode via reward signal
+        self._online_optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+
+    def online_update(self, reward: float, delta_w_flat: torch.Tensor) -> None:
+        """REINFORCE-style online update: align rule parameters with reward signal.
+
+        Maximises  reward * mean(ΔW)  when reward > 0 (reinforce the update direction)
+        and minimises it when reward < 0 (suppress/reverse unhelpful updates).
+        """
+        if not math.isfinite(reward) or abs(reward) < 1e-8:
+            return
+        if not delta_w_flat.requires_grad:
+            return
+        loss = -(reward * delta_w_flat).mean()
+        self._online_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+        self._online_optimizer.step()
 
     def forward(self, pre_mean: torch.Tensor, post_mean: torch.Tensor, reward: torch.Tensor, w_flat: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
@@ -1567,8 +1587,8 @@ class EvolvableGenome:
         self.learning_curve['episode_initial_fitness'].append(initial_fitness)
         self.learning_curve['episode_final_fitness'].append(final_fitness)
 
-        # Calculate learning speed (improvement rate)
-        learning_speed = (final_fitness - initial_fitness) / max(len(plasticity_changes), 1)
+        # Calculate learning speed (non-negative magnitude of improvement rate)
+        learning_speed = max(0.0, (final_fitness - initial_fitness) / max(len(plasticity_changes), 1))
         self.learning_curve['episode_learning_speed'].append(learning_speed)
 
         # Calculate plasticity effectiveness (correlation between plasticity and improvement)
@@ -1640,7 +1660,8 @@ class EvolvableGenome:
         # Overall improvement trend (slope of learning speeds)
         if len(self.learning_curve['episode_learning_speed']) >= 5:
             speeds = np.array(self.learning_curve['episode_learning_speed'])
-            trend = np.polyfit(range(len(speeds)), speeds, 1)[0]  # Linear trend
+            x = np.arange(len(speeds), dtype=np.float64)
+            trend = safe_linear_slope(x, speeds, default_value=0.0)
         else:
             trend = 0.0
 

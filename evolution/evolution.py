@@ -919,7 +919,8 @@ class EvolutionEngine:
         if plastic_advantage is not None:
             denom = max(1.0, abs(float(reward_before)))
             delta_reward_score = float(plastic_advantage) / denom
-            delta_reward_score = max(-1.0, min(1.0, delta_reward_score))
+            # Clamp to [0, 1] — negative advantage means no improvement, score stays 0
+            delta_reward_score = max(0.0, min(1.0, delta_reward_score))
 
         # CRITICAL FIX 2: Calculate learning speed (raw plastic change magnitude)
         # High learn_speed = genome is changing a lot (not necessarily good)
@@ -932,11 +933,12 @@ class EvolutionEngine:
         stability_penalty = 0.5 * instability + 0.3 * max_instability + 0.1 * max_delta_penalty
         
         # Calculate base adaptability from delta reward (actual performance improvement)
-        base_adaptability = delta_reward_score if delta_reward_score != 0.0 else 0.0
+        # Floor at 0: negative improvement means no adaptability contribution
+        base_adaptability = max(0.0, delta_reward_score)
         
         # CRITICAL FIX 2: Combine learn speed with stability penalty
-        # Reward genomes that learn fast AND stably
-        speed_stability_score = learn_speed - stability_penalty
+        # Reward genomes that learn fast AND stably — floor at 0 so instability never drives score negative
+        speed_stability_score = max(0.0, learn_speed - stability_penalty)
         
         # META-3.2: Calculate meta-parameter effectiveness
         # Reward genomes that have well-tuned meta-parameters for their plasticity usage
@@ -976,8 +978,8 @@ class EvolutionEngine:
             bias_effectiveness * 0.05           # 5%  - meta-bias appropriateness
         )
 
-        # Clamp to valid range
-        adaptability_score = float(max(-1.0, min(1.0, adaptability_score)))
+        # Clamp to valid range — adaptability is always non-negative
+        adaptability_score = float(max(0.0, min(1.0, adaptability_score)))
         
         # Store detailed metrics for debugging
         if genome.plastic_diagnostics is not None:
@@ -1762,6 +1764,10 @@ class SpeciationManager:
         self.min_offspring_per_species = min_offspring_per_species
         self.species: List[Species] = []
         self.next_species_id = 0
+        self.max_compatibility_threshold = 5.0
+        # Prevent tiny species from dominating reproduction due to noisy mean fitness.
+        self.offspring_size_exponent = 0.7
+        self.max_offspring_multiplier = 2.0
 
     def _current_compatibility_threshold(self, generation: int) -> float:
         """Compute the dynamic compatibility threshold for this generation."""
@@ -1801,6 +1807,26 @@ class SpeciationManager:
                 self.species.append(new_species)
                 self.next_species_id += 1
 
+        # Empty species can persist indefinitely because stagnation updates only run
+        # for non-empty species. Prune them every generation.
+        pre_prune_count = len(self.species)
+        empty_species = [s for s in self.species if len(s.members) == 0]
+        empty_ratio = (len(empty_species) / max(1, pre_prune_count))
+        if empty_species:
+            self.species = [s for s in self.species if len(s.members) > 0]
+            print(f"[Speciation] Pruned {len(empty_species)} empty species before reproduction")
+
+        # If empty-species ratio is high, threshold is likely too strict; relax it.
+        if empty_ratio > 0.2:
+            old_threshold = float(self.compatibility_threshold)
+            self.compatibility_threshold = float(
+                min(old_threshold * 1.08, self.max_compatibility_threshold)
+            )
+            print(
+                f"[Speciation] Empty ratio {empty_ratio:.2f} too high; "
+                f"compatibility_threshold {old_threshold:.4f} -> {self.compatibility_threshold:.4f}"
+            )
+
         # Remove stagnant species
         self._remove_stagnant_species(generation)
 
@@ -1826,6 +1852,8 @@ class SpeciationManager:
         """Remove species that haven't improved for too long"""
         surviving_species = []
         for species in self.species:
+            if not species.members:
+                continue
             if species.stagnation_counter <= self.max_stagnation or len(species.members) >= self.min_species_size:
                 surviving_species.append(species)
             else:
@@ -1843,31 +1871,47 @@ class SpeciationManager:
         if not active_species:
             return {}
 
-        species_stats = [(species, species.get_fitness_stats()['mean']) for species in active_species]
+        # Use a size-aware reproductive score:
+        # score = max(mean_fitness, 0) * (species_size ** exponent)
+        # This keeps fitness pressure while preventing tiny species from receiving
+        # disproportionate quotas from noisy mean estimates.
+        species_stats = []
+        for species in active_species:
+            stats = species.get_fitness_stats()
+            mean_fit = float(stats.get('mean', 0.0))
+            size = max(1, int(stats.get('size', len(species.members))))
+            score = max(0.0, mean_fit) * (size ** self.offspring_size_exponent)
+            species_stats.append((species, mean_fit, size, score))
 
         min_offspring = max(1, int(self.min_offspring_per_species))
         num_species = len(species_stats)
+        species_minima = {
+            species.species_id: (min_offspring if size >= self.min_species_size else 1)
+            for species, _, size, _ in species_stats
+        }
 
         if population_size <= 0:
             return {}
 
-        if min_offspring * num_species > population_size:
+        min_total = int(sum(species_minima.values()))
+
+        if min_total > population_size:
             # Not enough slots to guarantee minimum; fall back to proportional with at least 1.
-            quotas = {species.species_id: 1 for species, _ in species_stats}
+            quotas = {species.species_id: 1 for species, _, _, _ in species_stats}
             remaining = population_size - len(quotas)
 
             if remaining > 0:
-                total_avg = sum(max(0.0, mean) for _, mean in species_stats)
-                if total_avg <= 0.0:
+                total_score = sum(score for _, _, _, score in species_stats)
+                if total_score <= 0.0:
                     for i in range(remaining):
                         quotas[species_stats[i % num_species][0].species_id] += 1
                 else:
-                    weights = [max(0.0, mean) for _, mean in species_stats]
-                    raw = [remaining * w / total_avg for w in weights]
+                    weights = [score for _, _, _, score in species_stats]
+                    raw = [remaining * w / total_score for w in weights]
                     base = [int(math.floor(r)) for r in raw]
                     remainder = remaining - sum(base)
 
-                    for (species, _), add in zip(species_stats, base):
+                    for (species, _, _, _), add in zip(species_stats, base):
                         quotas[species.species_id] += add
 
                     if remainder > 0:
@@ -1879,24 +1923,51 @@ class SpeciationManager:
                         for i in range(remainder):
                             quotas[species_stats[order[i % num_species]][0].species_id] += 1
 
+            # Apply cap: tiny species cannot produce outsized offspring counts.
+            for species, _, size, _ in species_stats:
+                cap = max(1, int(math.ceil(size * self.max_offspring_multiplier)))
+                quotas[species.species_id] = min(quotas.get(species.species_id, 0), cap)
+
+            # Redistribute any leftover slots from capping.
+            assigned = sum(quotas.values())
+            leftovers = max(0, population_size - assigned)
+            if leftovers > 0:
+                # Prefer larger/higher-score species for redistribution.
+                order = sorted(
+                    species_stats,
+                    key=lambda x: (x[3], x[2]),  # score, then size
+                    reverse=True
+                )
+                idx = 0
+                safety = 0
+                while leftovers > 0 and order and safety < population_size * 4:
+                    species, _, size, _ = order[idx % len(order)]
+                    cap = max(1, int(math.ceil(size * self.max_offspring_multiplier)))
+                    sid = species.species_id
+                    if quotas[sid] < cap:
+                        quotas[sid] += 1
+                        leftovers -= 1
+                    idx += 1
+                    safety += 1
+
             return quotas
 
         # Allocate minimum first, then distribute remainder proportionally to average fitness.
-        quotas = {species.species_id: min_offspring for species, _ in species_stats}
-        remaining = population_size - (min_offspring * num_species)
+        quotas = {species.species_id: species_minima[species.species_id] for species, _, _, _ in species_stats}
+        remaining = population_size - min_total
 
-        total_avg = sum(max(0.0, mean) for _, mean in species_stats)
+        total_score = sum(score for _, _, _, score in species_stats)
         if remaining > 0:
-            if total_avg <= 0.0:
+            if total_score <= 0.0:
                 for i in range(remaining):
                     quotas[species_stats[i % num_species][0].species_id] += 1
             else:
-                weights = [max(0.0, mean) for _, mean in species_stats]
-                raw = [remaining * w / total_avg for w in weights]
+                weights = [score for _, _, _, score in species_stats]
+                raw = [remaining * w / total_score for w in weights]
                 base = [int(math.floor(r)) for r in raw]
                 remainder = remaining - sum(base)
 
-                for (species, _), add in zip(species_stats, base):
+                for (species, _, _, _), add in zip(species_stats, base):
                     quotas[species.species_id] += add
 
                 if remainder > 0:
@@ -1907,6 +1978,31 @@ class SpeciationManager:
                     )
                     for i in range(remainder):
                         quotas[species_stats[order[i % num_species]][0].species_id] += 1
+
+        # Apply cap and redistribute leftovers.
+        for species, _, size, _ in species_stats:
+            cap = max(species_minima[species.species_id], int(math.ceil(size * self.max_offspring_multiplier)))
+            quotas[species.species_id] = min(quotas.get(species.species_id, 0), cap)
+
+        assigned = sum(quotas.values())
+        leftovers = max(0, population_size - assigned)
+        if leftovers > 0:
+            order = sorted(
+                species_stats,
+                key=lambda x: (x[3], x[2]),
+                reverse=True
+            )
+            idx = 0
+            safety = 0
+            while leftovers > 0 and order and safety < population_size * 4:
+                species, _, size, _ = order[idx % len(order)]
+                cap = max(species_minima[species.species_id], int(math.ceil(size * self.max_offspring_multiplier)))
+                sid = species.species_id
+                if quotas[sid] < cap:
+                    quotas[sid] += 1
+                    leftovers -= 1
+                idx += 1
+                safety += 1
 
         return quotas
 
@@ -1931,7 +2027,8 @@ class SpeciationManager:
             'num_species': len(active_species),
             'avg_species_size': float(np.mean(species_sizes)),
             'total_members': total_members,
-            'species_sizes': species_sizes
+            'species_sizes': species_sizes,
+            'empty_species_filtered': max(0, len(self.species) - len(active_species))
         }
 
 

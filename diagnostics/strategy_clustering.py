@@ -92,7 +92,7 @@ class StrategyClusteringLogger:
 
         plt.tight_layout()
         plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.close()
 
     @staticmethod
     def get_clustering_data() -> Dict[str, Any]:

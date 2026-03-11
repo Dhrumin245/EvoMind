@@ -4,6 +4,7 @@ import torch
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from core.genome import EvolvableGenome
+from core.numeric_safety import safe_linear_slope
 from environments.deterministic_env import DeterministicVectorizedArena
 from curriculum.curriculum import CurriculumStage, get_stage_config
 import json
@@ -249,7 +250,9 @@ class BehavioralProbe:
             score = BehavioralProbe._evaluate_episode(genome, config, seed=episode)
             baseline_scores.append(score)
 
-        baseline_mean = np.mean(baseline_scores)
+        baseline_mean = float(np.mean(baseline_scores))
+        if not np.isfinite(baseline_mean):
+            baseline_mean = 0.0
 
         # Adaptation evaluation (next 5 episodes with plasticity - reduced from 20)
         adaptation_scores = []
@@ -266,23 +269,33 @@ class BehavioralProbe:
                 learning_curve.append(recent_mean - baseline_mean)
 
         # Calculate learning speed metrics
-        adaptation_mean = np.mean(adaptation_scores)
-        improvement_rate = (adaptation_mean - baseline_mean) / (baseline_mean + 1e-6)
+        adaptation_mean = float(np.mean(adaptation_scores))
+        if not np.isfinite(adaptation_mean):
+            adaptation_mean = baseline_mean
+        improvement_rate = float((adaptation_mean - baseline_mean) / (abs(baseline_mean) + 1e-6))
+        if not np.isfinite(improvement_rate):
+            improvement_rate = 0.0
+        improvement_rate = max(0.0, improvement_rate)
 
         # Speed of adaptation (how quickly performance improves)
         if learning_curve:
-            learning_acceleration = np.polyfit(range(len(learning_curve)), learning_curve, 1)[0]
+            x = np.arange(len(learning_curve), dtype=np.float64)
+            learning_acceleration = max(0.0, safe_linear_slope(x, learning_curve, default_value=0.0))
         else:
             learning_acceleration = 0.0
 
         # Plasticity effectiveness (correlation with improvement)
         if hasattr(genome, 'brain') and genome.brain:
             plastic_diagnostics = genome.brain.get_plastic_diagnostics()
-            plasticity_effectiveness = plastic_diagnostics.get('mean_plastic_delta', 0.0)
+            plasticity_effectiveness = float(plastic_diagnostics.get('mean_plastic_delta', 0.0))
         else:
+            plasticity_effectiveness = 0.0
+        if not np.isfinite(plasticity_effectiveness):
             plasticity_effectiveness = 0.0
 
         final_score = improvement_rate + learning_acceleration + plasticity_effectiveness
+        if not np.isfinite(final_score):
+            final_score = 0.0
 
         metrics = {
             'novel_task': novel_task,

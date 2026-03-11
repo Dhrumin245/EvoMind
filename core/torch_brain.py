@@ -1,5 +1,6 @@
 import torch
 import math
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -14,11 +15,68 @@ from diagnostics.meta_gene_entropy import MetaGeneEntropyLogger
 
 # Global caches / knobs
 # Plasticity updates are noisy when rewards are near-zero.
-PLASTICITY_REWARD_EPSILON: float = 0.05
+PLASTICITY_REWARD_EPSILON: float = 0.02
+PLASTICITY_SIGNAL_CLIP: float = 1.0
+META_REWARD_GAIN_MIN: float = 0.2
+META_REWARD_GAIN_MAX: float = 3.0
+META_REWARD_BIAS_ABS_MAX: float = 0.5
+META_PLASTIC_LR_MIN: float = 0.01
+META_PLASTIC_LR_MAX: float = 1.5
+PLASTIC_WEIGHT_ABS_MAX: float = 0.9
+PLASTIC_WEIGHT_SOFT_TARGET: float = 0.85
 
 # Cache TorchBrain instances by deterministic genome signature to avoid repeated
 # torch.compile / graph build overhead across identical genomes.
 _BRAIN_CACHE: Dict[str, "TorchBrain"] = {}
+
+try:
+    import torch_directml  # type: ignore
+except Exception:
+    torch_directml = None  # type: ignore
+
+
+def _resolve_preferred_device() -> torch.device:
+    """
+    Resolve runtime device from EVOMIND_DEVICE with sane auto fallback.
+    Accepted values: auto, cpu, cuda, cuda:N, dml.
+    """
+    requested = os.getenv("EVOMIND_DEVICE", "auto").strip().lower()
+    if requested in ("", "auto"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch_directml is not None:
+            return torch_directml.device()  # type: ignore[return-value]
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if requested == "cpu":
+        return torch.device("cpu")
+
+    if requested == "cuda" or requested.startswith("cuda:"):
+        if torch.cuda.is_available():
+            return torch.device(requested)
+        logging.getLogger("TorchBrain").warning(
+            "EVOMIND_DEVICE=%s requested but CUDA is unavailable; falling back to CPU.",
+            requested,
+        )
+        return torch.device("cpu")
+
+    if requested == "dml":
+        if torch_directml is not None:
+            return torch_directml.device()  # type: ignore[return-value]
+        logging.getLogger("TorchBrain").warning(
+            "EVOMIND_DEVICE=dml requested but torch-directml is unavailable; falling back to CPU."
+        )
+        return torch.device("cpu")
+
+    logging.getLogger("TorchBrain").warning(
+        "Unsupported EVOMIND_DEVICE=%s; using auto device selection.",
+        requested,
+    )
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch_directml is not None:
+        return torch_directml.device()  # type: ignore[return-value]
+    return torch.device("cpu")
 
 def get_cached_brain(genome: EvolvableGenome) -> "TorchBrain":
     """Return a cached TorchBrain keyed by genome.signature."""
@@ -474,29 +532,31 @@ class PlasticLinear(torch.nn.Module):
         Returns:
             Instability score (0.0 = perfectly stable, higher = more unstable)
         """
+        # Handle empty history to avoid "Mean of empty slice" warning
         if len(self.plastic_delta_history) < 2:
             return 0.0
         
-        # Calculate coefficient of variation (CV) = std / mean
-        # This normalizes for different scales of plasticity
+        # Calculate robust coefficient of variation (CV) with floor on denominator.
+        # This avoids exploding instability when mean update is near zero.
         deltas = np.array(self.plastic_delta_history)
+        # Check for empty array after conversion
+        if deltas.size == 0:
+            return 0.0
+            
         mean_delta = np.mean(deltas)
         std_delta = np.std(deltas)
-        
-        if abs(mean_delta) < 1e-6:
-            # If mean is near zero, just use std as instability
-            return float(std_delta * 10.0)  # Scale up since small updates
-        
-        cv = std_delta / abs(mean_delta)
-        
+
+        cv = std_delta / (abs(mean_delta) + 0.01)
+
         # Also penalize large spikes (max delta)
         max_delta = np.max(deltas)
-        spike_penalty = max(0.0, max_delta - 0.1)  # Penalty for deltas > 0.1
+        spike_penalty = max(0.0, max_delta - 0.06)  # Penalty for larger abrupt jumps
+
+        # Combine CV and spike penalty with bounded scale.
+        instability = cv * 0.35 + spike_penalty * 1.2
+        instability = float(np.clip(instability, 0.0, 2.0))
         
-        # Combine CV and spike penalty
-        instability = cv * 0.5 + spike_penalty * 2.0
-        
-        return float(instability)
+        return instability
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -530,9 +590,14 @@ class PlasticLinear(torch.nn.Module):
         # Track plastic delta before update
         plastic_norm_before = torch.norm(self.plastic_weight).item()
 
-        # META reward modulation - remove tanh to strengthen signal
-        r = reward * meta["reward_gain"] + meta["reward_bias"]
-        r = torch.tensor(r, device=self.plastic_weight.device)
+        reward_gain = float(np.clip(meta.get("reward_gain", 1.0), META_REWARD_GAIN_MIN, META_REWARD_GAIN_MAX))
+        reward_bias = float(np.clip(meta.get("reward_bias", 0.0), -META_REWARD_BIAS_ABS_MAX, META_REWARD_BIAS_ABS_MAX))
+        plastic_lr = float(np.clip(meta.get("plastic_lr", 1.0), META_PLASTIC_LR_MIN, META_PLASTIC_LR_MAX))
+
+        # Bound reward-modulated signal to keep updates informative and stable.
+        r_value = reward * reward_gain + reward_bias
+        r_value = float(np.clip(r_value, -PLASTICITY_SIGNAL_CLIP, PLASTICITY_SIGNAL_CLIP))
+        r = torch.tensor(r_value, device=self.plastic_weight.device)
 
         # Use per-layer learning rule net to compute ΔW directly
         if self.learning_rule_net is not None:
@@ -544,23 +609,33 @@ class PlasticLinear(torch.nn.Module):
 
             pre = torch.nan_to_num(pre, nan=0.0, posinf=1.0, neginf=-1.0)
             post = torch.nan_to_num(post, nan=0.0, posinf=1.0, neginf=-1.0)
-            w_flat = torch.nan_to_num(w_flat, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Detach w_flat so gradients from the online meta-update do not
+            # flow back into base_weight (a PlasticLinear Parameter).
+            w_flat = torch.nan_to_num(w_flat.detach(), nan=0.0, posinf=1.0, neginf=-1.0)
 
-            # Compute ΔW directly
+            # Compute ΔW — keep grad so online_update can backprop through the rule net
             delta_w_flat = self.learning_rule_net(pre, post, r, w_flat, t)
-            delta_w = delta_w_flat.view(self.output_dim, self.input_dim)
+
+            # Online REINFORCE-style update of the learning rule's own parameters
+            self.learning_rule_net.online_update(r_value, delta_w_flat)
+
+            # Detach before applying to plastic weights (no grad needed here)
+            delta_w = delta_w_flat.detach().view(self.output_dim, self.input_dim)
 
             # Hard-clip plastic updates per step
-            delta_w = torch.clamp(delta_w, -0.01, 0.01)
+            delta_w = torch.clamp(delta_w, -0.008, 0.008)
 
-            # Scale by plastic_lr
-            delta_w *= meta["plastic_lr"]
+            # Scale by bounded plastic learning rate.
+            delta_w *= plastic_lr
 
             # Normalize by presynaptic activity - NUMERIC SAFETY: epsilon protection
             pre_norm = torch.norm(pre) + 1e-8
             delta_w = delta_w / pre_norm
             # Replace any NaN/Inf with 0
             delta_w = torch.nan_to_num(delta_w, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Apply mild decay to avoid long-term saturation and preserve adaptation headroom.
+            self.plastic_weight *= 0.995
 
             # Apply update
             self.plastic_weight += delta_w
@@ -572,8 +647,19 @@ class PlasticLinear(torch.nn.Module):
             # Plasticity clipping - balanced range to allow learning while preventing runaway plasticity
             self.plastic_weight = torch.clamp(
                 self.plastic_weight,
-                min=-1.0,
-                max=1.0
+                min=-PLASTIC_WEIGHT_ABS_MAX,
+                max=PLASTIC_WEIGHT_ABS_MAX
+            )
+            # Soft-target control keeps norms in a useful band and avoids ceiling saturation.
+            self.plastic_weight = torch.where(
+                self.plastic_weight > PLASTIC_WEIGHT_SOFT_TARGET,
+                self.plastic_weight * 0.985,
+                self.plastic_weight,
+            )
+            self.plastic_weight = torch.where(
+                self.plastic_weight < -PLASTIC_WEIGHT_SOFT_TARGET,
+                self.plastic_weight * 0.985,
+                self.plastic_weight,
             )
 
             # Increment timestep
@@ -909,7 +995,7 @@ class TorchBrain(nn.Module):
         # Track inference compilation state
         self._compiled_for_inference: bool = False
         self._compiled_device: Optional[str] = None
-        self.device = torch.device('cpu')
+        self.device: torch.device = _resolve_preferred_device()
 
         # META parameters from genome
         self.meta = genome.meta if genome else {
@@ -938,6 +1024,7 @@ class TorchBrain(nn.Module):
         # Build network if genome is provided
         if genome is not None:
             self.build_from_genome(genome)
+            self.to(self.device)
     
     def build_from_genome(self, genome: EvolvableGenome):
         """Build PyTorch network from genome architecture"""
@@ -964,6 +1051,7 @@ class TorchBrain(nn.Module):
 
         # Compile forward graph
         self._compile_forward_graph()
+        self.to(self.device)
 
     def _build_modular_architecture(self, genome: EvolvableGenome):
         """Build PyTorch network from modular genome architecture"""
@@ -1218,7 +1306,7 @@ class TorchBrain(nn.Module):
     def act(self, state: np.ndarray) -> int:
         """Get action for single state"""
         with torch.no_grad():
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
             output = self.forward(state_tensor)
             return int(torch.argmax(output, dim=1).item())
     
@@ -1226,9 +1314,9 @@ class TorchBrain(nn.Module):
         """Get actions for batch of states"""
         with torch.no_grad():
             if isinstance(states, np.ndarray):
-                states_tensor = torch.tensor(states, dtype=torch.float32)
+                states_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.device)
             else:
-                states_tensor = states
+                states_tensor = states.to(device=self.device, dtype=torch.float32)
             
             output = self.forward(states_tensor)
             return torch.argmax(output, dim=1).cpu().numpy()
@@ -1317,13 +1405,27 @@ class TorchBrain(nn.Module):
     
     def compile_for_inference(self, device: str = 'cuda'):
         """Compile model for fast inference"""
-        if not torch.cuda.is_available() and device == 'cuda':
-            device = 'cpu'
+        target_device: Any = device
+        target_label = device
+        if device == 'cuda' and not torch.cuda.is_available():
+            target_device = 'cpu'
+            target_label = 'cpu'
+        elif device == 'dml':
+            if torch_directml is not None:
+                target_device = torch_directml.device()
+                target_label = 'dml'
+            else:
+                target_device = 'cpu'
+                target_label = 'cpu'
 
-        if self._compiled_for_inference and self._compiled_device == device:
+        if self._compiled_for_inference and self._compiled_device == target_label:
             return self
         
-        self.to(device)
+        self.to(target_device)
+        if target_label == 'dml':
+            self.device = target_device  # type: ignore[assignment]
+        else:
+            self.device = torch.device(cast(str, target_device))
         self.eval()  # Set to evaluation mode
         
         # Use torch.compile if available (PyTorch 2.0+)
@@ -1334,7 +1436,7 @@ class TorchBrain(nn.Module):
             pass  # Silently fall back to standard forward
 
         self._compiled_for_inference = True
-        self._compiled_device = device
+        self._compiled_device = target_label
         
         return self
     
@@ -1383,10 +1485,19 @@ class TorchBrain(nn.Module):
                 layer.reset()
 
     def reset_episode_tracking(self):
-        """Reset episode tracking for all plastic layers"""
-        for layer in self.layers:
-            if isinstance(layer, PlasticLinear):
-                layer.reset_episode_tracking()
+        """Reset episode tracking for all plastic layers.
+        Flushes per-layer delta logs into PlasticityTimingLogger before clearing."""
+        plastic_layers = [layer for layer in self.layers if isinstance(layer, PlasticLinear)]
+        if plastic_layers:
+            layer_delta_logs = [
+                layer.plastic_delta_logs.copy()
+                for layer in plastic_layers
+                if layer.plastic_delta_logs
+            ]
+            if layer_delta_logs:
+                PlasticityTimingLogger.log_generation_delta_logs(layer_delta_logs)
+        for layer in plastic_layers:
+            layer.reset_episode_tracking()
 
     def get_episode_data(self) -> Dict[str, List[float]]:
         """Get episode data for plotting (averaged across plastic layers)"""
@@ -1415,13 +1526,15 @@ class TorchBrain(nn.Module):
         if done:
             return
 
+        clipped_signal = float(np.clip(reward_signal, -PLASTICITY_SIGNAL_CLIP, PLASTICITY_SIGNAL_CLIP))
+
         # Gate plasticity updates: only learn when reward is informative.
-        if abs(float(reward_signal)) <= PLASTICITY_REWARD_EPSILON:
+        if abs(clipped_signal) <= PLASTICITY_REWARD_EPSILON:
             return
 
         for layer in self.layers:
             if isinstance(layer, PlasticLinear):
-                layer.apply_plasticity(reward_signal, self.meta, state)
+                layer.apply_plasticity(clipped_signal, self.meta, state)
 
     def get_plastic_diagnostics(self) -> Dict[str, Any]:
         """Get lifetime plasticity diagnostics"""
@@ -1634,7 +1747,7 @@ class ParallelTorchBrain(nn.Module):
         Returns: shape (batch_size * num_genomes,)
         """
         with torch.no_grad():
-            states_tensor = torch.tensor(states, dtype=torch.float32)
+            states_tensor = torch.as_tensor(states, dtype=torch.float32, device=next(self.parameters()).device)
             outputs = self.forward(states_tensor)
             
             # Get actions (argmax)

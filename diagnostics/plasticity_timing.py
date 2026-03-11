@@ -44,7 +44,7 @@ class PlasticityTimingLogger:
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.close()
 
     @staticmethod
     def get_delta_logs() -> List[List[List[float]]]:

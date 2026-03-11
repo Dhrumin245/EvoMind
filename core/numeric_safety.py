@@ -290,6 +290,54 @@ def safe_std(
         return default_value
 
 
+def safe_linear_slope(
+    x: Union[np.ndarray, list, tuple],
+    y: Union[np.ndarray, list, tuple],
+    default_value: float = 0.0,
+    min_points: int = 2,
+    epsilon: float = 1e-8
+) -> float:
+    """
+    Compute slope of y vs x robustly without np.polyfit/LAPACK calls.
+
+    This avoids downstream linear algebra failures when inputs contain NaN/Inf,
+    have near-zero variance, or are otherwise degenerate.
+    """
+    try:
+        x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+
+        if x_arr.size != y_arr.size:
+            n = min(x_arr.size, y_arr.size)
+            x_arr = x_arr[:n]
+            y_arr = y_arr[:n]
+
+        finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+        x_arr = x_arr[finite_mask]
+        y_arr = y_arr[finite_mask]
+
+        if x_arr.size < min_points:
+            return float(default_value)
+
+        x_mean = float(np.mean(x_arr))
+        y_mean = float(np.mean(y_arr))
+        x_centered = x_arr - x_mean
+        y_centered = y_arr - y_mean
+
+        denom = float(np.dot(x_centered, x_centered))
+        if not np.isfinite(denom) or denom <= epsilon:
+            return float(default_value)
+
+        numer = float(np.dot(x_centered, y_centered))
+        slope = numer / denom
+        if not np.isfinite(slope):
+            return float(default_value)
+
+        return float(slope)
+    except Exception:
+        return float(default_value)
+
+
 def safe_zscore(
     arr: Union[np.ndarray, torch.Tensor],
     axis: Optional[int] = None,
