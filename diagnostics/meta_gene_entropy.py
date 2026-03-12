@@ -97,7 +97,7 @@ class MetaGeneEntropyLogger:
 
         plt.tight_layout()
         plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.close()
 
     @staticmethod
     def get_meta_entropy_data() -> Dict[str, Any]:

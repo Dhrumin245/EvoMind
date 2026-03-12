@@ -1580,7 +1580,12 @@ def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[Torch
     if brain is not None and hasattr(brain, 'neural_health_controller'):
         torch_brain = cast(TorchBrain, brain)
         health_penalty = torch_brain.neural_health_controller.get_fitness_penalty(torch_brain)  # type: ignore[attr-defined]
-        fitness *= health_penalty  # Multiplicative penalty for dead neurons
+        # Multiplicative penalty: for positive fitness, shrink it; for negative fitness,
+        # amplify the magnitude so dead neurons always make fitness worse regardless of sign.
+        if fitness >= 0:
+            fitness *= health_penalty
+        else:
+            fitness *= (2.0 - health_penalty)
 
     return float(fitness)
 
@@ -2320,6 +2325,9 @@ def _log_meta_gene_entropy(population: list) -> None:
 
 def save_coevolution_state(training_state: TrainingState, filename: str = "data/coevolution_state.json"):
     """Save complete co-evolution training state"""
+    from diagnostics.strategy_clustering import StrategyClusteringLogger
+    from diagnostics.reward_recovery import RewardRecoveryLogger
+
     state = {
         'generation': training_state.generation,
         'config': training_state.config.__dict__,
@@ -2328,6 +2336,25 @@ def save_coevolution_state(training_state: TrainingState, filename: str = "data/
         'generation_stats': training_state.generation_stats,
         'experiment_reports': [exp.__dict__ for exp in training_state.experiment_reports],
         'generalization_reports': [r.to_dict() for r in training_state.generalization_reports],
+        # Diagnostic logger states (restored on load so plots span the full run history)
+        'meta_gene_entropy_logger': {
+            'meta_gene_entropies': MetaGeneEntropyLogger.meta_gene_entropies[:],
+            'plasticity_weight_variances': MetaGeneEntropyLogger.plasticity_weight_variances[:],
+            'learning_rate_entropies': MetaGeneEntropyLogger.learning_rate_entropies[:],
+            'plastic_neuron_fractions': MetaGeneEntropyLogger.plastic_neuron_fractions[:],
+        },
+        'strategy_clustering_logger': {
+            'cluster_centers': [
+                c.tolist() if hasattr(c, 'tolist') else c
+                for c in StrategyClusteringLogger.cluster_centers
+            ],
+            'cluster_labels': StrategyClusteringLogger.cluster_labels[:],
+            'silhouette_scores': StrategyClusteringLogger.silhouette_scores[:],
+            'strategy_diversities': StrategyClusteringLogger.strategy_diversities[:],
+        },
+        'reward_recovery_logger': {
+            'recovery_records': [list(r) for r in RewardRecoveryLogger.recovery_records],
+        },
     }
 
     # Save prey population
@@ -2411,6 +2438,32 @@ def load_coevolution_state(filename: str = "data/coevolution_state.json") -> Tra
             )
         )
     
+    # Restore diagnostic logger states so plots include pre-checkpoint history
+    if 'meta_gene_entropy_logger' in state:
+        d = state['meta_gene_entropy_logger']
+        MetaGeneEntropyLogger.meta_gene_entropies = d.get('meta_gene_entropies', [])
+        MetaGeneEntropyLogger.plasticity_weight_variances = d.get('plasticity_weight_variances', [])
+        MetaGeneEntropyLogger.learning_rate_entropies = d.get('learning_rate_entropies', [])
+        MetaGeneEntropyLogger.plastic_neuron_fractions = d.get('plastic_neuron_fractions', [])
+
+    if 'strategy_clustering_logger' in state:
+        from diagnostics.strategy_clustering import StrategyClusteringLogger
+        import numpy as _np
+        d = state['strategy_clustering_logger']
+        StrategyClusteringLogger.cluster_centers = [
+            _np.array(c) for c in d.get('cluster_centers', [])
+        ]
+        StrategyClusteringLogger.cluster_labels = d.get('cluster_labels', [])
+        StrategyClusteringLogger.silhouette_scores = d.get('silhouette_scores', [])
+        StrategyClusteringLogger.strategy_diversities = d.get('strategy_diversities', [])
+
+    if 'reward_recovery_logger' in state:
+        from diagnostics.reward_recovery import RewardRecoveryLogger
+        d = state['reward_recovery_logger']
+        RewardRecoveryLogger.recovery_records = [
+            tuple(r) for r in d.get('recovery_records', [])
+        ]
+
     print(f"✅ Co-evolution state loaded from: {filename}")
     print(f"   📍 Resuming from Generation: {training_state.generation}")
     print(f"   👥 Loaded {len(training_state.prey_population)} prey agents and {len(training_state.predator_population)} predators")
@@ -2490,8 +2543,20 @@ async def main_coevolution_async():
     if os.path.exists("data/coevolution_state.json"):
         response = os.getenv("AUTO_LOAD_COEVOLUTION_STATE")
         if response is None:
-            response = input("Co-evolution state found. Load? (y/n): ")
-        if response.lower() == 'y':
+            # Flush any leftover stdin content on Windows (e.g. from terminal activation scripts)
+            try:
+                import msvcrt
+                while msvcrt.kbhit():
+                    msvcrt.getwch()
+            except ImportError:
+                pass
+            while True:
+                response = input("Co-evolution state found. Load? (y/n): ").strip().lower()
+                if response in ('y', 'n', 'yes', 'no'):
+                    response = response[0]  # normalise to 'y' or 'n'
+                    break
+                print(f"   Invalid input '{response}'. Please enter 'y' or 'n'.")
+        if response.lower().startswith('y'):
             training_state = load_coevolution_state()
             evaluator.load_seeds("data/seed_registry.json")
 
@@ -2735,6 +2800,10 @@ async def main_coevolution_async():
                 print("Predator stagnation detected - adjusting mutation...")
                 config.mutation_strength = min(config.mutation_strength * 1.1, 0.15)
 
+        # Log meta-gene entropy on the evaluated (pre-evolution) population so the data
+        # is available immediately when diagnostics/plots are generated this same generation.
+        _log_meta_gene_entropy(training_state.prey_population + training_state.predator_population)
+
         # Save checkpoint and run diagnostics on EVALUATED population (before evolution)
         # Must run before evolve_all_populations() — after evolution all genomes reset to fitness=0.0
         top_prey_genome = None
@@ -2790,9 +2859,6 @@ async def main_coevolution_async():
         evolve_all_populations(generation)
 
         print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
-
-        # Log meta-gene entropy diagnostics every generation (on newly evolved population)
-        _log_meta_gene_entropy(training_state.prey_population + training_state.predator_population)
 
         # Milestone 7: Run integrated meta-scientist experiments
 
