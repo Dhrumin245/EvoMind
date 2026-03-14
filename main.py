@@ -19,11 +19,16 @@ import warnings
 import logging
 import numpy as np
 import asyncio
+import csv
 import json
 import time
+import subprocess
+import sys
 import concurrent.futures
 import threading
+import tempfile
 from collections import OrderedDict
+from pathlib import Path
 from typing import Dict, Any, Optional, List, cast
 from dataclasses import dataclass, field
 from enum import Enum
@@ -2323,10 +2328,131 @@ def _log_meta_gene_entropy(population: list) -> None:
     )
 
 
-def save_coevolution_state(training_state: TrainingState, filename: str = "data/coevolution_state.json"):
-    """Save complete co-evolution training state"""
+def _flatten_metrics_row(value: Any, prefix: str = "") -> Dict[str, Any]:
+    """Flatten a generation-stats dict into a single-level dict for CSV output."""
+    flat: Dict[str, Any] = {}
+    if not isinstance(value, dict):
+        return flat
+
+    for key, item in value.items():
+        full_key = f"{prefix}.{key}" if prefix else str(key)
+
+        if item is None or isinstance(item, (str, int, float, bool)):
+            flat[full_key] = item
+            continue
+
+        if isinstance(item, list):
+            if len(item) <= 5 and all(v is None or isinstance(v, (str, int, float, bool)) for v in item):
+                flat[full_key] = ";".join("" if v is None else str(v) for v in item)
+            continue
+
+        if isinstance(item, dict):
+            flat.update(_flatten_metrics_row(item, full_key))
+
+    return flat
+
+
+def append_metrics_row(stats: Dict[str, Any], metrics_path: str = "data/metrices.csv") -> None:
+    """Append a single generation's flattened stats to the metrics CSV every generation."""
+    from io import StringIO
+
+    row = _flatten_metrics_row(stats)
+    if not row:
+        return
+
+    path = Path(metrics_path)
+    os.makedirs(path.parent if str(path.parent) else Path("."), exist_ok=True)
+
+    file_exists = path.exists() and path.stat().st_size > 0
+
+    # Build consistent ordered field list: generation first, stage second, rest alphabetical.
+    fieldnames: List[str] = []
+    remaining = set(row.keys())
+    for priority in ("generation", "stage"):
+        if priority in remaining:
+            fieldnames.append(priority)
+            remaining.remove(priority)
+    fieldnames.extend(sorted(remaining))
+
+    if file_exists:
+        # Read existing header to keep column order stable across generations.
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            existing_fields = next(csv.reader(f), None) or []
+        # Merge: keep existing columns first, append any new ones.
+        merged_fields = existing_fields[:]
+        for col in fieldnames:
+            if col not in merged_fields:
+                merged_fields.append(col)
+        fieldnames = merged_fields
+
+    with tempfile.NamedTemporaryFile(
+        'w', delete=False,
+        dir=path.parent if str(path.parent) else Path("."),
+        encoding='utf-8', newline=''
+    ) as tmp:
+        tmp_path = tmp.name
+        # Write header + existing rows + new row
+        if file_exists:
+            with open(path, 'r', encoding='utf-8-sig', newline='') as src:
+                existing_content = src.read()
+            tmp.write(existing_content.rstrip('\n'))
+            tmp.write('\n')
+            buf = StringIO()
+            dict_writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction='ignore')
+            dict_writer.writerow({k: row.get(k, '') for k in fieldnames})
+            tmp.write(buf.getvalue())
+        else:
+            buf = StringIO()
+            dict_writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction='ignore')
+            dict_writer.writeheader()
+            dict_writer.writerow({k: row.get(k, '') for k in fieldnames})
+            tmp.write(buf.getvalue())
+
+    os.replace(tmp_path, path)
+
+
+def save_coevolution_state(training_state: TrainingState, filename: Optional[str] = None):
+    """Save complete co-evolution training state to split files."""
     from diagnostics.strategy_clustering import StrategyClusteringLogger
     from diagnostics.reward_recovery import RewardRecoveryLogger
+
+    def _write_text_atomic(path: str, text: str) -> None:
+        target = Path(path)
+        parent = target.parent if str(target.parent) else Path(".")
+        os.makedirs(parent, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile('w', delete=False, dir=parent, encoding='utf-8', newline='') as tmp:
+            tmp.write(text)
+            tmp_path = tmp.name
+
+        os.replace(tmp_path, target)
+
+    def _write_json_atomic(path: str, payload: Any) -> None:
+        _write_text_atomic(path, json.dumps(payload, indent=2, default=str))
+
+    def _derive_split_paths(base_filename: str) -> Dict[str, str]:
+        base_path = Path(base_filename)
+        target_dir = base_path.parent if str(base_path.parent) else Path(".")
+        stem = base_path.stem
+
+        if stem == "coevolution_state":
+            config_name = "config.json"
+            metrics_name = "metrices.csv"
+            experiment_name = "expirement_state.json"
+        elif stem == "final_coevolution_state":
+            config_name = "final_config.json"
+            metrics_name = "final_metrices.csv"
+            experiment_name = "final_expirement_state.json"
+        else:
+            config_name = f"{stem}_config.json"
+            metrics_name = f"{stem}_metrices.csv"
+            experiment_name = f"{stem}_expirement_state.json"
+
+        return {
+            "config": str(target_dir / config_name),
+            "metrics": str(target_dir / metrics_name),
+            "experiment": str(target_dir / experiment_name),
+        }
 
     state = {
         'generation': training_state.generation,
@@ -2375,19 +2501,110 @@ def save_coevolution_state(training_state: TrainingState, filename: str = "data/
     state['prey_hall_of_fame'] = [g.to_dict() for g in training_state.prey_hall_of_fame]
     state['predator_hall_of_fame'] = [g.to_dict() for g in training_state.predator_hall_of_fame]
 
-    with open(filename, 'w') as f:
-        json.dump(state, f, indent=2, default=str)
+    if filename is None:
+        split_paths = {
+            "config": "data/config.json",
+            "metrics": "data/metrices.csv",
+            "experiment": "data/expirement_state.json",
+        }
+    else:
+        split_paths = _derive_split_paths(filename)
+    for path in split_paths.values():
+        parent = Path(path).parent
+        if str(parent):
+            os.makedirs(parent, exist_ok=True)
+
+    # 1) Config-only log
+    _write_json_atomic(split_paths["config"], state['config'])
+
+    # 2) Metrics-only log (CSV) — rebuild full history from all generation_stats
+    metrics_rows = []
+    for stat in training_state.generation_stats:
+        if isinstance(stat, dict):
+            metrics_rows.append(_flatten_metrics_row(stat))
+
+    if metrics_rows:
+        fieldnames_set = set()
+        for row in metrics_rows:
+            fieldnames_set.update(row.keys())
+
+        ordered_fields: List[str] = []
+        if 'generation' in fieldnames_set:
+            ordered_fields.append('generation')
+            fieldnames_set.remove('generation')
+        if 'stage' in fieldnames_set:
+            ordered_fields.append('stage')
+            fieldnames_set.remove('stage')
+        ordered_fields.extend(sorted(fieldnames_set))
+
+        from io import StringIO
+
+        buffer = StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=ordered_fields)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+        _write_text_atomic(split_paths["metrics"], buffer.getvalue())
+    else:
+        from io import StringIO
+
+        buffer = StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(['generation', 'stage'])
+        _write_text_atomic(split_paths["metrics"], buffer.getvalue())
+
+    # 3) Experiment/detailed state log (everything except config)
+    experiment_state = {k: v for k, v in state.items() if k != 'config'}
+    _write_json_atomic(split_paths["experiment"], experiment_state)
 
     print(f"\n💾 SAVING TRAINING STATE")
-    print(f"   ✅ Checkpoint saved: {filename}")
+    print(f"   ✅ Config saved: {split_paths['config']}")
+    print(f"   ✅ Metrics saved: {split_paths['metrics']}")
+    print(f"   ✅ Experiment state saved: {split_paths['experiment']}")
     print(f"   📊 Generation: {training_state.generation} | Populations: {len(training_state.prey_population)} prey + {len(training_state.predator_population)} predators")
     print(f"   🏆 Hall of Fame: {len(training_state.prey_hall_of_fame)} best prey + {len(training_state.predator_hall_of_fame)} best predators")
     print(f"   💾 Preserved: Lineage info, mutation history, learning parameters\n")
 
-def load_coevolution_state(filename: str = "data/coevolution_state.json") -> TrainingState:
-    """Load co-evolution training state"""
-    with open(filename, 'r') as f:
-        state = json.load(f)
+def load_coevolution_state(filename: Optional[str] = None) -> TrainingState:
+    """Load co-evolution training state from split files by default."""
+    legacy_file: Optional[Path] = None
+
+    def _load_json_file(path: Path) -> Dict[str, Any]:
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                return json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in checkpoint file {path}: {exc}") from exc
+
+    if filename is None:
+        config_file = Path("data/config.json")
+        experiment_file = Path("data/expirement_state.json")
+    else:
+        base_path = Path(filename)
+        target_dir = base_path.parent if str(base_path.parent) else Path(".")
+        stem = base_path.stem
+
+        if stem == "coevolution_state":
+            config_file = target_dir / "config.json"
+            experiment_file = target_dir / "expirement_state.json"
+        elif stem == "final_coevolution_state":
+            config_file = target_dir / "final_config.json"
+            experiment_file = target_dir / "final_expirement_state.json"
+        else:
+            config_file = target_dir / f"{stem}_config.json"
+            experiment_file = target_dir / f"{stem}_expirement_state.json"
+        legacy_file = base_path
+
+    if config_file.exists() and experiment_file.exists():
+        config_dict = _load_json_file(config_file)
+        state = _load_json_file(experiment_file)
+        state['config'] = config_dict
+    elif legacy_file is not None and legacy_file.exists():
+        # Backward compatibility when an explicit legacy checkpoint path is provided.
+        state = _load_json_file(legacy_file)
+    else:
+        raise FileNotFoundError(
+            f"Split checkpoint files not found: {config_file} and {experiment_file}."
+        )
     
     # Create config
     config_dict = state['config']
@@ -2417,9 +2634,9 @@ def load_coevolution_state(filename: str = "data/coevolution_state.json") -> Tra
         training_state.predator_hall_of_fame.append(genome)
     
     # Load history
-    training_state.best_prey_fitness_history = state['best_prey_fitness_history']
-    training_state.best_predator_fitness_history = state['best_predator_fitness_history']
-    training_state.generation_stats = state['generation_stats']
+    training_state.best_prey_fitness_history = state.get('best_prey_fitness_history', [])
+    training_state.best_predator_fitness_history = state.get('best_predator_fitness_history', [])
+    training_state.generation_stats = state.get('generation_stats', [])
     training_state.generalization_reports = []
     for r in state.get('generalization_reports', []):
         if isinstance(r, GeneralizationReport):
@@ -2464,7 +2681,12 @@ def load_coevolution_state(filename: str = "data/coevolution_state.json") -> Tra
             tuple(r) for r in d.get('recovery_records', [])
         ]
 
-    print(f"✅ Co-evolution state loaded from: {filename}")
+    if config_file.exists() and experiment_file.exists():
+        print(f"✅ Co-evolution state loaded from split files:")
+        print(f"   - {config_file}")
+        print(f"   - {experiment_file}")
+    else:
+        print(f"✅ Co-evolution state loaded from: {legacy_file}")
     print(f"   📍 Resuming from Generation: {training_state.generation}")
     print(f"   👥 Loaded {len(training_state.prey_population)} prey agents and {len(training_state.predator_population)} predators")
     
@@ -2488,12 +2710,12 @@ async def main_coevolution_async():
     print("="*90 + "\n")
 
     # Add watchdog thread (critical)
-    def watchdog():
-        while True:
-            print("[WATCHDOG] main loop alive")
-            time.sleep(10)
+    # def watchdog():
+    #     while True:
+    #         print("[WATCHDOG] main loop alive")
+    #         time.sleep(10)
 
-    threading.Thread(target=watchdog, daemon=True).start()
+    # threading.Thread(target=watchdog, daemon=True).start()
 
     # Initialize configuration
     config = EvolutionConfig()
@@ -2539,8 +2761,9 @@ async def main_coevolution_async():
         max_steps=config.max_steps
     )
 
-    # Load checkpoint if exists
-    if os.path.exists("data/coevolution_state.json"):
+    # Load checkpoint if split files exist
+    split_checkpoint_exists = os.path.exists("data/config.json") and os.path.exists("data/expirement_state.json")
+    if split_checkpoint_exists:
         response = os.getenv("AUTO_LOAD_COEVOLUTION_STATE")
         if response is None:
             # Flush any leftover stdin content on Windows (e.g. from terminal activation scripts)
@@ -2557,8 +2780,12 @@ async def main_coevolution_async():
                     break
                 print(f"   Invalid input '{response}'. Please enter 'y' or 'n'.")
         if response.lower().startswith('y'):
-            training_state = load_coevolution_state()
-            evaluator.load_seeds("data/seed_registry.json")
+            try:
+                training_state = load_coevolution_state()
+                evaluator.load_seeds("data/seed_registry.json")
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"⚠️ Skipping checkpoint load: {exc}")
+                print("   Starting from a fresh training state instead.")
 
     # Initialize meta-evolution populations
     architect_population = ArchitectPopulation(population_size=20)
@@ -2688,6 +2915,7 @@ async def main_coevolution_async():
             mutator_population,
         )
         training_state.generation_stats.append(stats)
+        append_metrics_row(stats)  # Write this generation's metrics immediately
         print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
 
         # Stability guardrail: damp mutation pressure when behavior/plasticity are unstable.
@@ -3049,8 +3277,14 @@ async def main_coevolution_async():
     evaluator.close()
 
     print("\nCo-evolution training completed!")
-    print(f"Best prey fitness: {max(training_state.best_prey_fitness_history):.2f}")
-    print(f"Best predator fitness: {max(training_state.best_predator_fitness_history):.2f}")
+    if training_state.best_prey_fitness_history:
+        print(f"Best prey fitness: {max(training_state.best_prey_fitness_history):.2f}")
+    else:
+        print("Best prey fitness: n/a")
+    if training_state.best_predator_fitness_history:
+        print(f"Best predator fitness: {max(training_state.best_predator_fitness_history):.2f}")
+    else:
+        print("Best predator fitness: n/a")
     print(f"Final curriculum stage: {curriculum_controller.get_current_config()['name']}")
 
 async def main_async():
@@ -3062,6 +3296,47 @@ def main():
     """Placeholder for single-agent sync training"""
     print("Single-agent sync training not implemented in this version")
     print("Use --evolution-type multi for co-evolution")
+
+
+def launch_live_dashboard(
+    enabled: bool,
+    metrics_path: str = "data/metrices.csv",
+    port: int = 8050,
+) -> Optional[subprocess.Popen]:
+    """Launch the live Plotly dashboard as a background process."""
+    if not enabled:
+        return None
+
+    workspace_root = Path(__file__).resolve().parent
+    dashboard_script = workspace_root / "live_metrics_dashboard.py"
+    if not dashboard_script.exists():
+        print(f"[Dashboard] Skipped: missing script at {dashboard_script}")
+        return None
+
+    cmd = [
+        sys.executable,
+        str(dashboard_script),
+        "--metrics-path",
+        metrics_path,
+        "--port",
+        str(port),
+    ]
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(workspace_root),
+            creationflags=creationflags,
+        )
+        print(f"[Dashboard] Started at http://127.0.0.1:{port}")
+        return proc
+    except Exception as exc:
+        print(f"[Dashboard] Failed to start: {exc}")
+        return None
 
 if __name__ == "__main__":
     import argparse
@@ -3081,6 +3356,10 @@ if __name__ == "__main__":
                        help="Number of generations")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "dml"], default="auto",
                        help="Torch device preference (auto, cpu, cuda, dml)")
+    parser.add_argument("--live-dashboard", action="store_true",
+                       help="Auto-start live Plotly dashboard during training")
+    parser.add_argument("--live-dashboard-port", type=int, default=8050,
+                       help="Port for live dashboard (used with --live-dashboard)")
     
     args = parser.parse_args()
 
@@ -3128,16 +3407,30 @@ if __name__ == "__main__":
         generations=args.generations
     )
     
-    if args.evolution_type == "multi":
-        # Run co-evolution
-        if args.mode == "async":
-            asyncio.run(main_coevolution_async())
+    dashboard_proc = launch_live_dashboard(
+        enabled=args.live_dashboard,
+        metrics_path="data/metrices.csv",
+        port=args.live_dashboard_port,
+    )
+
+    try:
+        if args.evolution_type == "multi":
+            # Run co-evolution
+            if args.mode == "async":
+                asyncio.run(main_coevolution_async())
+            else:
+                print("Co-evolution currently supports async mode only")
+                asyncio.run(main_coevolution_async())
         else:
-            print("Co-evolution currently supports async mode only")
-            asyncio.run(main_coevolution_async())
-    else:
-        # Run single-agent evolution (original code)
-        if args.mode == "async":
-            asyncio.run(main_async())
-        else:
-            main()
+            # Run single-agent evolution (original code)
+            if args.mode == "async":
+                asyncio.run(main_async())
+            else:
+                main()
+    finally:
+        if dashboard_proc is not None and dashboard_proc.poll() is None:
+            dashboard_proc.terminate()
+            try:
+                dashboard_proc.wait(timeout=5)
+            except Exception:
+                dashboard_proc.kill()

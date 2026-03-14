@@ -50,22 +50,22 @@ class HypothesisEngine:
 
     def _check_plasticity_correlation(self, failure_data: List[Dict[str, Any]]) -> bool:
         """Check if plasticity issues correlate with failures"""
-        # Simple check: if many failures have low plasticity severity
+        # failure['diagnosis'] is the _rank_causes return dict; the raw sub-dicts
+        # are nested one level deeper under the 'diagnosis' key.
         plasticity_failures = 0
         for failure in failure_data:
-            diagnosis = failure.get('diagnosis', {})
-            if diagnosis.get('learning', {}).get('severity', 0) > 0.5:
+            raw = failure.get('diagnosis', {}).get('diagnosis', {})
+            if raw.get('learning', {}).get('severity', 0) > 0.5:
                 plasticity_failures += 1
 
         return plasticity_failures > len(failure_data) * 0.3  # 30% threshold
 
     def _check_architecture_correlation(self, failure_data: List[Dict[str, Any]]) -> bool:
         """Check if architecture issues correlate with failures"""
-        # Simple check: if many failures have architectural severity
         arch_failures = 0
         for failure in failure_data:
-            diagnosis = failure.get('diagnosis', {})
-            if diagnosis.get('architectural', {}).get('severity', 0) > 0.5:
+            raw = failure.get('diagnosis', {}).get('diagnosis', {})
+            if raw.get('architectural', {}).get('severity', 0) > 0.5:
                 arch_failures += 1
 
         return arch_failures > len(failure_data) * 0.3  # 30% threshold
@@ -342,12 +342,16 @@ class ExperimentDesigner:
                 baseline_performance = rng.normal(50, 10)
                 plasticity = group_config.get('plasticity', 0.1)
                 reward_gain = group_config.get('reward_gain', 1.0)
+                architecture = group_config.get('architecture', 'standard')
                 if plasticity > 0.3:
                     performance = baseline_performance * 1.2 * reward_gain
                 elif plasticity < 0.05:
                     performance = baseline_performance * 0.8 * reward_gain
                 else:
                     performance = baseline_performance * reward_gain
+                # Architecture effect: high_capacity adds ~15% boost
+                if architecture == 'high_capacity':
+                    performance *= 1.15
                 results.append(performance)
             return np.array(results)
 

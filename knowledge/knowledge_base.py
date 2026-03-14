@@ -467,13 +467,18 @@ class KnowledgeBase:
         if len(experiment_results) < 3:
             return False
 
-        # Check for consistent performance improvements
-        performances = [exp.get('fitness_improvement', 0) for exp in experiment_results]
-        if not performances:
-            return False
+        # Experiment dicts from run_automated_experiments store support status
+        # in result['hypothesis_supported'] and effect size in result['effect_size'].
+        # Fall back to a top-level 'fitness_improvement' key for legacy callers.
+        positives = 0
+        for exp in experiment_results:
+            if isinstance(exp.get('result'), dict):
+                if exp['result'].get('hypothesis_supported', False):
+                    positives += 1
+            elif exp.get('fitness_improvement', 0) > 0:
+                positives += 1
 
-        # Require at least 70% of experiments show positive improvement
-        positive_ratio = sum(1 for p in performances if p > 0) / len(performances)
+        positive_ratio = positives / len(experiment_results)
         return positive_ratio >= 0.7
 
     def _formulate_rule(self, experiment_results: List[Dict[str, Any]]) -> str:
