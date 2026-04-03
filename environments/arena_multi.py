@@ -387,19 +387,23 @@ class MultiAgentArena:
         # Keep event rewards substantial but not saturating at ±5 clip
         self._food_reward_scale = float(self.base_config.get('food_reward_scale', 0.6))
         self._capture_reward_scale = float(self.base_config.get('capture_reward_scale', 0.5))
+        self._predator_capture_reward_scale = float(
+            self.base_config.get('predator_capture_reward_scale', max(self._capture_reward_scale, 0.7))
+        )
         # Use small step penalties so they don't dominate the signal
         self._prey_step_penalty = float(self.base_config.get('step_penalty', -0.01))
-        self._pred_step_penalty = float(self.base_config.get('predator_step_penalty', -0.01))
+        self._pred_step_penalty = float(self.base_config.get('predator_step_penalty', -0.005))
 
         # Directional shaping coefficients (per pixel improvement) - increased 5x
         self._shaping_food_scale = float(self.base_config.get('shaping_food_scale', 0.015))
         self._shaping_avoid_scale = float(self.base_config.get('shaping_avoid_scale', 0.010))
-        self._shaping_hunt_scale = float(self.base_config.get('shaping_hunt_scale', 0.015))
+        self._shaping_hunt_scale = float(self.base_config.get('shaping_hunt_scale', 0.022))
 
         # Sparse novelty reward - increased to be meaningful
         self._novelty_cell_size = int(self.base_config.get('novelty_cell_size', 60))
         self._novelty_bonus_prey = float(self.base_config.get('novelty_bonus_prey', 0.2))
-        self._novelty_bonus_predator = float(self.base_config.get('novelty_bonus_predator', 0.1))
+        self._novelty_bonus_predator = float(self.base_config.get('novelty_bonus_predator', 0.15))
+        self._predator_coordination_scale = float(self.base_config.get('predator_coordination_scale', 0.25))
         # Use plain runtime sets for broad Python compatibility.
         self._visited_prey: List[set] = []
         self._visited_predator: List[set] = []
@@ -901,7 +905,7 @@ class MultiAgentArena:
         if self.pack_system:
             for i in range(self.total_predators):
                 info['pack_coordination'][i] = self.pack_system.get_coordination_bonus(i)
-                rewards[i] += info['pack_coordination'][i] * 0.1
+                rewards[i] += info['pack_coordination'][i] * self._predator_coordination_scale
         
         # Handle actions (similar to prey)
         if actions.ndim == 1:
@@ -1090,7 +1094,9 @@ class MultiAgentArena:
             pred_capture_counts = np.sum(capture_mask, axis=0).astype(np.int32)  # [Q]
             if np.any(pred_capture_counts > 0):
                 base_pred_reward = float(self.base_config.get('predator_capture_reward', 10.0))
-                predator_rewards[active_predators] += (base_pred_reward * self._capture_reward_scale) * pred_capture_counts.astype(np.float32)
+                predator_rewards[active_predators] += (
+                    base_pred_reward * self._predator_capture_reward_scale
+                ) * pred_capture_counts.astype(np.float32)
 
                 capturing_predators = active_predators[pred_capture_counts > 0]
                 # One energy boost per predator that captured at least once this step.
@@ -1629,7 +1635,7 @@ class MultiAgentArena:
 
                 max_improvement = max(prey_improvement, food_improvement)
                 if max_improvement > 0:
-                    bonus = min(max_improvement * 0.005, 0.5)  # Scale bonus (smaller for predators)
+                    bonus = min(max_improvement * 0.01, 0.8)
                     predator_rewards[pred_idx] += bonus
 
     def close(self):

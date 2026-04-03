@@ -11,6 +11,9 @@ import csv
 import importlib
 import logging
 import time
+import urllib.error
+import urllib.request
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
@@ -126,6 +129,24 @@ def _read_numeric_rows(metrics_path: Path) -> Tuple[List[Dict[str, float]], List
 
     numeric_cols = sorted(numeric_keys)
     return numeric_rows, numeric_cols, None
+
+
+def _fetch_train_status(api_base_url: str, timeout_seconds: float = 1.5) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    base = api_base_url.rstrip("/")
+    url = f"{base}/train/status"
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+            if response.status != 200:
+                return None, f"API status error HTTP {response.status}"
+            payload = response.read().decode("utf-8")
+            return json.loads(payload), None
+    except urllib.error.HTTPError as exc:
+        return None, f"API status error HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, f"API status unavailable: {exc.reason}"
+    except Exception as exc:
+        return None, f"API status unavailable: {exc}"
 
 
 def _x_axis(rows: List[Dict[str, float]]) -> List[float]:
@@ -311,7 +332,7 @@ def _build_selected_figure(
     return fig
 
 
-def create_app(metrics_path: Path, refresh_seconds: float, max_points: int) -> Dash:
+def create_app(metrics_path: Path, refresh_seconds: float, max_points: int, api_base_url: str) -> Dash:
     app = Dash(__name__)
     theme = _build_visual_theme()
 
@@ -425,12 +446,21 @@ def create_app(metrics_path: Path, refresh_seconds: float, max_points: int) -> D
     def _update_dashboard(_ticks: int, preset: Optional[str], selected: Optional[List[str]], path_text: str):
         path = Path(path_text)
         rows, columns, err = _read_numeric_rows(path)
+        api_status, api_err = _fetch_train_status(api_base_url)
         active_preset = preset if preset in {"fitness", "diversity", "plasticity", "custom"} else "custom"
 
         options = [{"label": col, "value": col} for col in columns if col != "generation"]
 
         if err is not None:
-            status = f"Watching: {path} | {err}"
+            if api_err is not None:
+                api_text = api_err
+            else:
+                api_text = (
+                    f"API status={api_status.get('status', 'unknown')} "
+                    f"gen={api_status.get('generation', 'n/a')}"
+                )
+
+            status = f"Watching: {path} | {err} | {api_text}"
             return (
                 status,
                 options,
@@ -461,9 +491,18 @@ def create_app(metrics_path: Path, refresh_seconds: float, max_points: int) -> D
                 normalized_selection = preset_selection
 
         latest_gen = int(rows[-1].get("generation", len(rows) - 1)) if rows else -1
+        if api_err is not None:
+            api_text = api_err
+        else:
+            api_text = (
+                f"API status={api_status.get('status', 'unknown')} "
+                f"gen={api_status.get('generation', 'n/a')} "
+                f"stage={api_status.get('curriculum_stage', 'unknown')}"
+            )
+
         status = (
             f"Watching: {path} | rows={len(rows)} | latest_generation={latest_gen} "
-            f"| preset={active_preset} | refresh={refresh_seconds:.2f}s"
+            f"| preset={active_preset} | refresh={refresh_seconds:.2f}s | {api_text}"
         )
 
         overview = _build_overview_figure(rows, columns, max_points, theme)
@@ -496,6 +535,12 @@ def parse_args() -> argparse.Namespace:
         default=500,
         help="Maximum latest points per graph (<=0 means all points).",
     )
+    parser.add_argument(
+        "--api-base-url",
+        type=str,
+        default="http://127.0.0.1:8000",
+        help="EvoMind API base URL used for GET /train/status polling.",
+    )
     return parser.parse_args()
 
 
@@ -513,6 +558,7 @@ def main() -> None:
         metrics_path=metrics_path,
         refresh_seconds=args.refresh_seconds,
         max_points=args.max_points,
+        api_base_url=args.api_base_url,
     )
     app.run(host=args.host, port=args.port, debug=False)
 

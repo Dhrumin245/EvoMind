@@ -1009,7 +1009,7 @@ class MetaScientist:
                 # Decrease plasticity-related mutation rates
                 if hasattr(evolution_engine, 'architecture_mutation_rate'):
                     old_rate = evolution_engine.architecture_mutation_rate
-                    evolution_engine.architecture_mutation_rate = max(old_rate * 0.7, 0.001)
+                    evolution_engine.architecture_mutation_rate = max(old_rate * 0.7, 0.01)
                     applied_changes['mutation_rate_changes'].append({
                         'parameter': 'architecture_mutation_rate',
                         'old_value': old_rate,
@@ -1146,6 +1146,25 @@ class MetaScientist:
                     'description': f"Only {unique_recent} unique hypotheses in last 20 experiments",
                     'recommended_action': 'diversify_hypotheses'
                 })
+
+        # If experiments explicitly support higher-capacity architectures, treat
+        # that as an actionable failure pattern instead of only logging it.
+        capacity_experiments = [
+            exp for exp in experiment_results
+            if exp.get('result', {}).get('hypothesis_supported')
+            and 'architecture lacks capacity' in str(exp.get('hypothesis', '')).lower()
+        ]
+        if capacity_experiments:
+            mean_effect = float(np.mean([
+                exp.get('result', {}).get('effect_size', 0.0) for exp in capacity_experiments
+            ]))
+            patterns.append({
+                'type': 'architecture_capacity',
+                'severity': 'high' if mean_effect > 0.05 else 'medium',
+                'description': f"Supported capacity experiments indicate under-sized architectures (effect={mean_effect:.3f})",
+                'recommended_action': 'increase_capacity',
+                'effect_size': mean_effect
+            })
 
         # Check for population-level failures
         total_failures = analysis_results.get('total_failures', 0)
@@ -1349,7 +1368,7 @@ class MetaScientist:
                     # Emergency exploration boost
                     if hasattr(evolution_engine, 'mutation_rate'):
                         old_rate = evolution_engine.mutation_rate
-                        evolution_engine.mutation_rate = min(old_rate * 3.0, 0.1)
+                        evolution_engine.mutation_rate = min(0.3, old_rate * 1.2)
                         interventions['parameter_emergencies'].append({
                             'parameter': 'mutation_rate',
                             'old_value': old_rate,
@@ -1380,7 +1399,7 @@ class MetaScientist:
                     
                     if hasattr(evolution_engine, 'mutation_rate'):
                         old_rate = evolution_engine.mutation_rate
-                        new_rate = max(old_rate * reduction_factor, 0.001)  # Floor at 0.001
+                        new_rate = max(old_rate * reduction_factor, 0.1)
                         evolution_engine.mutation_rate = new_rate
                         interventions['mutation_reductions'].append({
                             'parameter': 'mutation_rate',
@@ -1395,7 +1414,7 @@ class MetaScientist:
                         old_arch_rate = evolution_engine.architecture_mutation_rate
                         # More aggressive reduction for architecture mutations
                         arch_reduction = 0.4 if severity == 'critical' else 0.6
-                        new_arch_rate = max(old_arch_rate * arch_reduction, 0.001)
+                        new_arch_rate = max(old_arch_rate * arch_reduction, 0.01)
                         evolution_engine.architecture_mutation_rate = new_arch_rate
                         interventions['mutation_reductions'].append({
                             'parameter': 'architecture_mutation_rate',
@@ -1475,6 +1494,43 @@ class MetaScientist:
                     if plasticity_hypothesis not in self.hypothesis_engine.hypothesis_templates:
                         self.hypothesis_engine.hypothesis_templates.append(plasticity_hypothesis)
 
+            elif pattern_type == 'architecture_capacity':
+                effect_size = pattern.get('effect_size', 0.0)
+                print(f"Meta-Scientist: ARCHITECTURE CAPACITY issue detected (effect: {effect_size:.3f})")
+
+                target_engines = []
+                if prey_engine is not None:
+                    target_engines.append(('prey', prey_engine))
+                if predator_engine is not None:
+                    target_engines.append(('predator', predator_engine))
+                if not target_engines and evolution_engine is not None:
+                    target_engines.append(('default', evolution_engine))
+
+                for name, engine in target_engines:
+                    if hasattr(engine, 'architecture_mutation_rate'):
+                        old_arch_rate = engine.architecture_mutation_rate
+                        new_arch_rate = min(old_arch_rate * 1.35, 0.14)
+                        engine.architecture_mutation_rate = new_arch_rate
+                        interventions['interventions_applied'].append({
+                            'species': name,
+                            'parameter': 'architecture_mutation_rate',
+                            'old_value': old_arch_rate,
+                            'new_value': new_arch_rate,
+                            'reason': f'Capacity experiment supported (effect: {effect_size:.3f})'
+                        })
+
+                    if hasattr(engine, 'mutation_strength'):
+                        old_strength = engine.mutation_strength
+                        new_strength = min(old_strength * 1.15, 0.45)
+                        engine.mutation_strength = new_strength
+                        interventions['interventions_applied'].append({
+                            'species': name,
+                            'parameter': 'mutation_strength',
+                            'old_value': old_strength,
+                            'new_value': new_strength,
+                            'reason': 'Capacity issue - favor larger functional architectural changes'
+                        })
+
             # NEUROGENESIS: Handle saturation rise
             elif pattern_type == 'saturation_rise':
                 saturation_ratio = pattern.get('saturation_ratio', 0.0)
@@ -1492,7 +1548,7 @@ class MetaScientist:
                     # Reduce architecture complexity mutations (prevent growth of dead neurons)
                     if hasattr(engine, 'architecture_mutation_rate'):
                         old_arch_rate = engine.architecture_mutation_rate
-                        new_arch_rate = max(old_arch_rate * 0.5, 0.001)  # Reduce by half
+                        new_arch_rate = max(old_arch_rate * 0.5, 0.01)  # Reduce by half
                         engine.architecture_mutation_rate = new_arch_rate
                         interventions['architecture_prunes'].append({
                             'species': name,

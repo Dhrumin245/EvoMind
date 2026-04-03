@@ -15,15 +15,19 @@ from diagnostics.meta_gene_entropy import MetaGeneEntropyLogger
 
 # Global caches / knobs
 # Plasticity updates are noisy when rewards are near-zero.
-PLASTICITY_REWARD_EPSILON: float = 0.02
+# FIX: Lowered from 0.02 to allow more frequent learning signals
+PLASTICITY_REWARD_EPSILON: float = 0.005
 PLASTICITY_SIGNAL_CLIP: float = 1.0
 META_REWARD_GAIN_MIN: float = 0.2
-META_REWARD_GAIN_MAX: float = 3.0
-META_REWARD_BIAS_ABS_MAX: float = 0.5
+META_REWARD_GAIN_MAX: float = 1.5
+META_REWARD_BIAS_ABS_MAX: float = 0.15
 META_PLASTIC_LR_MIN: float = 0.01
-META_PLASTIC_LR_MAX: float = 1.5
-PLASTIC_WEIGHT_ABS_MAX: float = 0.9
+META_PLASTIC_LR_MAX: float = 0.6
+PLASTIC_WEIGHT_ABS_MAX: float = 1.1
 PLASTIC_WEIGHT_SOFT_TARGET: float = 0.85
+PLASTIC_RETENTION_MIN: float = 0.993
+PLASTIC_RETENTION_BASE: float = 0.997
+PLASTIC_RETENTION_MAX: float = 0.9995
 
 # Cache TorchBrain instances by deterministic genome signature to avoid repeated
 # torch.compile / graph build overhead across identical genomes.
@@ -449,7 +453,10 @@ class AttentionBlock(nn.Module):
 
 
 class PlasticLinear(torch.nn.Module):
-    plastic_norms = []  # Class variable to collect norms per generation
+    # Per-episode cumulative RMS(DeltaW) used by "Average Plasticity" dashboard metric.
+    plastic_norms = []
+    # Per-update RMS(plastic_weight) to monitor accumulated plastic state.
+    plastic_weight_rms_norms = []
     recovery_times = []  # DIAGNOSTIC 3: Recovery times per generation
     meta_gene_entropies = []  # DIAGNOSTIC 5: Meta-gene entropies per generation
     plasticity_weight_variances = []  # DIAGNOSTIC 5: Plasticity weight variances per generation
@@ -622,20 +629,44 @@ class PlasticLinear(torch.nn.Module):
             # Detach before applying to plastic weights (no grad needed here)
             delta_w = delta_w_flat.detach().view(self.output_dim, self.input_dim)
 
-            # Hard-clip plastic updates per step
-            delta_w = torch.clamp(delta_w, -0.008, 0.008)
-
             # Scale by bounded plastic learning rate.
             delta_w *= plastic_lr
 
-            # Normalize by presynaptic activity - NUMERIC SAFETY: epsilon protection
-            pre_norm = torch.norm(pre) + 1e-8
-            delta_w = delta_w / pre_norm
+            # Smoothly align update direction with reward delta magnitude.
+            reward_alignment = float(np.tanh(r_value))
+            if abs(reward_alignment) <= 1e-6:
+                return
+            delta_w *= reward_alignment
+
+            # Adaptive clipping: allow stronger updates on clearer reward signals
+            # while keeping conservative limits for weak/noisy signals.
+            clip_limit = float(0.04 + 0.04 * np.clip(abs(reward_alignment), 0.0, 1.0))
+            delta_w = torch.clamp(delta_w, -clip_limit, clip_limit)
+
+            # Normalize by presynaptic activity, but cap the denominator so
+            # highly active states do not crush the plastic update to near-zero.
+            pre_scale = torch.clamp(torch.norm(pre), min=0.4, max=1.5)
+            delta_w = delta_w / pre_scale
             # Replace any NaN/Inf with 0
             delta_w = torch.nan_to_num(delta_w, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Apply mild decay to avoid long-term saturation and preserve adaptation headroom.
-            self.plastic_weight *= 0.995
+            # If recent plastic updates are already spiky, damp the next step so
+            # the population selects stable learners instead of bursty ones.
+            recent_instability = self.get_instability_metric()
+            if recent_instability > 0.30:
+                delta_w *= float(max(0.55, 1.0 / (1.0 + 1.8 * recent_instability)))
+
+            # Adaptive retention: preserve useful plastic traces while still damping
+            # saturated weights. Previous fixed decay was too aggressive.
+            num_weights = max(1, self.plastic_weight.numel())
+            pre_update_rms = torch.norm(self.plastic_weight).item() / math.sqrt(float(num_weights))
+            reward_strength = float(np.clip(abs(reward_alignment), 0.0, 1.0))
+            retention = PLASTIC_RETENTION_BASE + 0.002 * reward_strength
+            if pre_update_rms > PLASTIC_WEIGHT_SOFT_TARGET:
+                over = (pre_update_rms - PLASTIC_WEIGHT_SOFT_TARGET) / max(PLASTIC_WEIGHT_SOFT_TARGET, 1e-6)
+                retention -= 0.003 * float(np.clip(over, 0.0, 1.0))
+            retention = float(np.clip(retention, PLASTIC_RETENTION_MIN, PLASTIC_RETENTION_MAX))
+            self.plastic_weight *= retention
 
             # Apply update
             self.plastic_weight += delta_w
@@ -668,12 +699,6 @@ class PlasticLinear(torch.nn.Module):
             # Track plastic delta after update
             plastic_norm_after = torch.norm(self.plastic_weight).item()
             self.plastic_delta_norm = plastic_norm_after - plastic_norm_before
-
-            # Log per-weight RMS norm to keep values size-invariant
-            num_weights = max(1, self.plastic_weight.numel())
-            plastic_rms_norm = plastic_norm_after / math.sqrt(float(num_weights))
-            PlasticLinear.plastic_norms.append(plastic_rms_norm)
-
 
             # Per-episode tracking
             delta_norm = torch.norm(delta_w).item()
@@ -1020,6 +1045,7 @@ class TorchBrain(nn.Module):
 
         # Collapse prevention system
         self.collapse_detector = CollapseDetector()
+        self.reward_signal_history: deque[float] = deque(maxlen=256)
 
         # Build network if genome is provided
         if genome is not None:
@@ -1480,6 +1506,7 @@ class TorchBrain(nn.Module):
 
     def reset_plasticity(self):
         """Reset plasticity for all plastic layers"""
+        self.reward_signal_history.clear()
         for layer in self.layers:
             if isinstance(layer, PlasticLinear):
                 layer.reset()
@@ -1498,6 +1525,38 @@ class TorchBrain(nn.Module):
                 PlasticityTimingLogger.log_generation_delta_logs(layer_delta_logs)
         for layer in plastic_layers:
             layer.reset_episode_tracking()
+
+    def finalize_episode_plastic_norms(self) -> None:
+        """Finalize per-episode plasticity summaries into generation-level buckets."""
+        plastic_layers = [layer for layer in self.layers if isinstance(layer, PlasticLinear)]
+        if not plastic_layers:
+            return
+
+        episode_delta_rms = []
+        episode_weight_rms = []
+
+        for layer in plastic_layers:
+            num_weights = max(1, layer.plastic_weight.numel())
+            denom = math.sqrt(float(num_weights))
+
+            if layer.episode_delta_norms:
+                finite_delta = [
+                    float(v)
+                    for v in layer.episode_delta_norms
+                    if math.isfinite(float(v))
+                ]
+                if finite_delta:
+                    # Store size-invariant cumulative RMS(DeltaW) per layer for this episode.
+                    episode_delta_rms.append(float(np.sum(finite_delta)) / denom)
+
+            layer_weight_rms = torch.norm(layer.plastic_weight).item() / denom
+            if math.isfinite(layer_weight_rms):
+                episode_weight_rms.append(float(layer_weight_rms))
+
+        if episode_delta_rms:
+            PlasticLinear.plastic_norms.append(float(np.mean(episode_delta_rms)))
+        if episode_weight_rms:
+            PlasticLinear.plastic_weight_rms_norms.append(float(np.mean(episode_weight_rms)))
 
     def get_episode_data(self) -> Dict[str, List[float]]:
         """Get episode data for plotting (averaged across plastic layers)"""
@@ -1526,7 +1585,20 @@ class TorchBrain(nn.Module):
         if done:
             return
 
-        clipped_signal = float(np.clip(reward_signal, -PLASTICITY_SIGNAL_CLIP, PLASTICITY_SIGNAL_CLIP))
+        if not math.isfinite(float(reward_signal)):
+            return
+
+        # Normalize magnitude against recent history while preserving the original
+        # sign. A z-score over raw signed rewards can invert small-but-positive
+        # reward signals into negative updates, which makes plasticity unlearn
+        # useful behavior inside the same episode.
+        reward_arr = np.asarray(self.reward_signal_history, dtype=np.float32)
+        reward_magnitudes = np.abs(reward_arr) if reward_arr.size else reward_arr
+        baseline_magnitude = float(np.percentile(reward_magnitudes, 75)) if reward_magnitudes.size >= 4 else 0.0
+        scale = max(0.05, baseline_magnitude, abs(float(reward_signal)))
+        normalized_magnitude = float(np.clip(abs(float(reward_signal)) / scale, 0.0, PLASTICITY_SIGNAL_CLIP))
+        clipped_signal = math.copysign(normalized_magnitude, float(reward_signal))
+        self.reward_signal_history.append(float(reward_signal))
 
         # Gate plasticity updates: only learn when reward is informative.
         if abs(clipped_signal) <= PLASTICITY_REWARD_EPSILON:

@@ -1079,9 +1079,9 @@ class EvolvableGenome:
         # Initialize META genes
         if meta is None:
             self.meta = {
-                "reward_gain": np.random.uniform(1.0, 10.0),  # Stronger reward modulation
-                "reward_bias": np.random.uniform(-1.0, 1.0),  # Wider bias range
-                "plastic_lr": np.random.uniform(0.1, 5.0)    # Balanced learning rates
+                "reward_gain": np.random.uniform(0.5, 1.5),
+                "reward_bias": np.random.uniform(-0.1, 0.1),
+                "plastic_lr": np.random.uniform(0.03, 0.3)
             }
         else:
             self.meta = meta
@@ -2409,9 +2409,9 @@ class EvolvableGenome:
         genome.norm_fitness = data['norm_fitness']
         genome.age = data['age']
         genome.meta = data.get('meta', {
-            "reward_gain": np.random.uniform(0.1, 2.0),
-            "reward_bias": np.random.uniform(-0.5, 0.5),
-            "plastic_lr": np.random.uniform(0.01, 1.0)
+            "reward_gain": np.random.uniform(0.5, 1.5),
+            "reward_bias": np.random.uniform(-0.1, 0.1),
+            "plastic_lr": np.random.uniform(0.03, 0.3)
         })
         genome.learning_rule = data.get('learning_rule')
 

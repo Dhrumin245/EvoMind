@@ -2,6 +2,9 @@
 Plotting functions for diagnostics and visualization.
 Moved from main.py to separate diagnostics folder.
 """
+import time
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import KMeans
@@ -13,6 +16,24 @@ from genomes.genome_predator import PredatorGenome
 from core.genome import Genome as EvolvableGenome
 from diagnostics.reward_recovery import RewardRecoveryLogger
 from diagnostics.strategy_clustering import StrategyClusteringLogger
+
+
+def _safe_savefig(path: str, dpi: int = 150, bbox_inches: str = 'tight') -> str:
+    """Save plots robustly on Windows and return the written path."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        plt.savefig(str(output_path.resolve()), dpi=dpi, bbox_inches=bbox_inches)
+        return output_path.as_posix()
+    except OSError as exc:
+        fallback = output_path.with_name(
+            f"{output_path.stem}_fallback_{int(time.time())}{output_path.suffix}"
+        )
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(str(fallback.resolve()), dpi=dpi, bbox_inches=bbox_inches)
+        print(f"   [Plotting] Save fallback used due to OS error: {exc}")
+        return fallback.as_posix()
 
 
 def compute_architecture_clustering_stats(population: List[EvolvableGenome], n_clusters: int = 3) -> Dict[str, Any]:
@@ -74,45 +95,76 @@ def plot_meta_gene_histograms(stats: Dict[str, Any]) -> None:
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'output_logs/meta_gene_distribution_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    saved_path = _safe_savefig(f'output_logs/meta_gene_distribution_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"   📊 Saved: META gene distribution analysis")
-    print(f"      └─ output_logs/meta_gene_distribution_gen_{generation:04d}.png")
+    print(f"      └─ {saved_path}")
 
 
 def plot_plastic_norm_evolution(generation_stats: List[Dict[str, Any]]) -> None:
-    """Plot plastic weight norm evolution over generations"""
+    """Plot plasticity change evolution over generations."""
     if not generation_stats:
         return
 
-    generations = [stats['generation'] for stats in generation_stats if 'mean_plastic_norm' in stats]
-    mean_norms = [stats['mean_plastic_norm'] for stats in generation_stats if 'mean_plastic_norm' in stats]
-    max_norms = [stats['max_plastic_norm'] for stats in generation_stats if 'max_plastic_norm' in stats]
+    selected = [
+        stats
+        for stats in generation_stats
+        if 'mean_plastic_norm' in stats and 'max_plastic_norm' in stats
+    ]
+    generations = [stats['generation'] for stats in selected]
+    mean_norms = [stats['mean_plastic_norm'] for stats in selected]
+    max_norms = [stats['max_plastic_norm'] for stats in selected]
+    mean_weight_norms = [stats.get('mean_plastic_weight_norm', np.nan) for stats in selected]
 
     if not generations:
         return
 
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Plot mean plastic norm
-    ax.plot(generations, mean_norms, 'b-', linewidth=2, label='Mean Plastic Norm', alpha=0.8)
+    # Plot per-episode cumulative plastic change (RMS DeltaW).
+    ax.plot(
+        generations,
+        mean_norms,
+        'b-',
+        linewidth=2,
+        label='Mean Episode Cumulative Plasticity',
+        alpha=0.8,
+    )
 
-    # Plot max plastic norm
-    ax.plot(generations, max_norms, 'r--', linewidth=1.5, label='Max Plastic Norm', alpha=0.7)
+    # Plot max per-episode cumulative plastic change (RMS DeltaW).
+    ax.plot(
+        generations,
+        max_norms,
+        'r--',
+        linewidth=1.5,
+        label='Max Episode Cumulative Plasticity',
+        alpha=0.7,
+    )
 
-    ax.set_title('Plastic Weight Norm Evolution')
+    # Add accumulated plastic-weight RMS as context when available.
+    if any(np.isfinite(v) for v in mean_weight_norms):
+        ax.plot(
+            generations,
+            mean_weight_norms,
+            'g:',
+            linewidth=1.5,
+            label='Mean Plastic Weight RMS',
+            alpha=0.75,
+        )
+
+    ax.set_title('Plasticity Change Evolution')
     ax.set_xlabel('Generation')
-    ax.set_ylabel('Plastic Weight Norm')
+    ax.set_ylabel('RMS Magnitude')
     ax.grid(True, alpha=0.3)
     ax.legend()
 
     plt.tight_layout()
-    plt.savefig('output_logs/plastic_norm_evolution.png', dpi=150, bbox_inches='tight')
+    saved_path = _safe_savefig('output_logs/plastic_norm_evolution.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print("   📊 Saved: Plasticity (learning mechanisms) evolution over generations")
-    print("      └─ output_logs/plastic_norm_evolution.png")
+    print(f"      └─ {saved_path}")
 
 
 def plot_learning_rule_stats(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]) -> None:
@@ -137,7 +189,7 @@ def plot_learning_rule_stats(generation: int, prey_population: List[PreyGenome],
         axes[i].grid(True, alpha=0.3)
         axes[i].legend()
     plt.tight_layout()
-    plt.savefig(f'output_logs/learning_rule_stats_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    _safe_savefig(f'output_logs/learning_rule_stats_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -163,11 +215,11 @@ def plot_learning_rule_vs_fitness(generation: int, prey_population: List[PreyGen
         axes[i].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'output_logs/learning_rule_vs_fitness_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    saved_path = _safe_savefig(f'output_logs/learning_rule_vs_fitness_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"   📊 Saved: Learning mechanisms vs performance analysis")
-    print(f"      └─ output_logs/learning_rule_vs_fitness_gen_{generation:04d}.png")
+    print(f"      └─ {saved_path}")
 
 
 def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]) -> None:
@@ -186,8 +238,9 @@ def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome],
     # Feed into StrategyClusteringLogger for longitudinal tracking
     StrategyClusteringLogger.log_generation_strategies([x for x in X], n_clusters=3)
 
-    # Perform K-means clustering with 3 clusters
-    labels = KMeans(n_clusters=3, random_state=42).fit_predict(X)
+    # Perform K-means clustering with 3 clusters (or fewer if data has fewer distinct points)
+    n_clusters_actual = min(3, len(population_with_rules))
+    labels = KMeans(n_clusters=n_clusters_actual, random_state=42, n_init=10).fit_predict(X)
 
     # Collect fitness per cluster
     fitness_per_cluster = {0: [], 1: [], 2: []}
@@ -213,11 +266,11 @@ def plot_strategy_clustering(generation: int, prey_population: List[PreyGenome],
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'output_logs/strategy_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    saved_path = _safe_savefig(f'output_logs/strategy_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"   📊 Saved: Strategy diversity/clustering analysis")
-    print(f"      └─ output_logs/strategy_clustering_gen_{generation:04d}.png")
+    print(f"      └─ {saved_path}")
 
 
 def plot_architecture_clustering(generation: int, prey_population: List[PreyGenome], predator_population: List[PredatorGenome]) -> None:
@@ -251,11 +304,11 @@ def plot_architecture_clustering(generation: int, prey_population: List[PreyGeno
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f'output_logs/architecture_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    saved_path = _safe_savefig(f'output_logs/architecture_clustering_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"   📊 Saved: Network architecture pattern analysis")
-    print(f"      └─ output_logs/architecture_clustering_gen_{generation:04d}.png")
+    print(f"      └─ {saved_path}")
 
 
 def plot_in_lifetime_learning_curve(generation: int, episode_data: Dict[str, List[float]]) -> None:
@@ -288,11 +341,11 @@ def plot_in_lifetime_learning_curve(generation: int, episode_data: Dict[str, Lis
         ax2.set_title(f'Plastic Change vs Time - Generation {generation}')
 
     plt.tight_layout()
-    plt.savefig(f'output_logs/in_lifetime_learning_curve_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
+    saved_path = _safe_savefig(f'output_logs/in_lifetime_learning_curve_gen_{generation:04d}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"   📊 Saved: In-episode learning improvement curves")
-    print(f"      └─ output_logs/in_lifetime_learning_curve_gen_{generation:04d}.png")
+    print(f"      └─ {saved_path}")
 
 
 def evaluate_single_episode_with_logging(genome, seed: int, max_steps: int = 50) -> Dict[str, List[float]]:

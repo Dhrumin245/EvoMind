@@ -29,7 +29,7 @@ import threading
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Any, Optional, List, cast
+from typing import Dict, Any, Optional, List, Callable, cast
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -64,14 +64,120 @@ def _set_cached_fitness(cache_key: tuple, value: Dict[str, float], max_size: int
 def _get_effective_max_steps(config: "EvolutionConfig", stage_config: Optional[Dict[str, Any]], generation: int) -> int:
     stage_max_steps = int(stage_config.get("max_steps", config.max_steps)) if stage_config else config.max_steps
     max_steps = min(int(config.max_steps), stage_max_steps)
-    if config.reduce_episode_length_early and generation < config.early_curriculum_generations:
-        max_steps = max(1, int(max_steps * config.early_curriculum_reduction_factor))
+    if config.reduce_episode_length_early:
+        reduced_steps = max(1, int(round(max_steps * config.early_curriculum_reduction_factor)))
+        ramp_generations = max(10, int(config.early_curriculum_generations))
+        progress = min(1.0, max(0.0, float(generation) / float(ramp_generations)))
+        smoothed_steps = reduced_steps + (max_steps - reduced_steps) * progress
+        max_steps = int(round(smoothed_steps))
     return max_steps
 
 def _get_opponent_sample_size(num_opponents: int, partial_enabled: bool, partial_fraction: float) -> int:
     if not partial_enabled:
         return num_opponents
     return max(1, int(round(num_opponents * partial_fraction)))
+
+def _get_effective_partial_eval_fraction(config: "EvolutionConfig", max_steps: int, generation: int) -> float:
+    """Adapt partial-evaluation fraction for expensive early generations."""
+    configured = float(config.partial_eval_fraction)
+    floor = 0.55 if max_steps >= 40 else 0.65
+    ramp_generations = max(10, int(config.early_curriculum_generations))
+    progress = min(1.0, max(0.0, float(generation) / float(ramp_generations)))
+    effective = floor + (configured - floor) * progress
+    return float(np.clip(effective, min(floor, configured), max(floor, configured)))
+
+def _get_effective_opponents_per_eval(config: "EvolutionConfig", max_steps: int, generation: int) -> int:
+    """Use fewer opponents in the earliest expensive rounds to bound eval time."""
+    base = max(1, int(config.num_opponents_per_eval))
+    if base <= 1:
+        return base
+    if generation < max(8, int(config.early_curriculum_generations * 0.25)) and max_steps >= 40:
+        return max(1, base - 1)
+    return base
+
+def _safe_paired_correlation(x_values: List[float], y_values: List[float]) -> float:
+    """Return finite correlation for paired vectors, robust to size/variance edge cases."""
+    n = min(len(x_values), len(y_values))
+    if n < 2:
+        return 0.0
+    x = np.asarray(x_values[:n], dtype=np.float64)
+    y = np.asarray(y_values[:n], dtype=np.float64)
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    if int(np.sum(finite_mask)) < 2:
+        return 0.0
+    x = x[finite_mask]
+    y = y[finite_mask]
+    if float(np.std(x)) <= 1e-8 or float(np.std(y)) <= 1e-8:
+        return 0.0
+    corr = float(np.corrcoef(x, y)[0, 1])
+    return corr if np.isfinite(corr) else 0.0
+
+def _extract_energy_efficiency_cost(
+    final_info: Optional[Dict[str, Any]],
+    role: str,
+    steps_survived: int,
+    fallback_total: float = 0.0,
+) -> float:
+    """Return comparable per-step energy cost using final episode totals when available."""
+    total_used: Optional[float] = None
+    if isinstance(final_info, dict):
+        success_signals = final_info.get('success_signals', {})
+        if isinstance(success_signals, dict):
+            energy_key = f"{role}_energy_used"
+            if energy_key in success_signals:
+                try:
+                    total_used = float(success_signals.get(energy_key, 0.0))
+                except Exception:
+                    total_used = None
+
+        if total_used is None:
+            energy_usage = final_info.get('energy_usage', {})
+            if isinstance(energy_usage, dict):
+                energy_key = f"{role}_energy_used"
+                if energy_key in energy_usage:
+                    try:
+                        total_used = float(energy_usage.get(energy_key, 0.0))
+                    except Exception:
+                        total_used = None
+
+    if total_used is None or not np.isfinite(total_used):
+        total_used = float(fallback_total)
+
+    total_used = max(0.0, float(total_used))
+    return float(total_used / max(1, int(steps_survived)))
+
+def _get_effective_nonplastic_fraction(config: "EvolutionConfig", max_steps: int, generation: int) -> float:
+    """Scale non-plastic comparison budget to keep early evaluation time bounded.
+
+    Long episodes and early generations are the most expensive phase. We keep a
+    floor so adaptability remains measured, then ramp to the configured target.
+    """
+    configured = float(config.nonplastic_check_fraction)
+    if configured <= 0.0:
+        return 0.0
+
+    floor = 0.35
+    # Heavier discount for longer episodes.
+    if max_steps >= 80:
+        floor = 0.30
+    elif max_steps >= 60:
+        floor = 0.33
+    elif max_steps >= 40:
+        floor = 0.28
+
+    # Ramp to configured value over early curriculum.
+    ramp_generations = max(10, int(config.early_curriculum_generations))
+    progress = min(1.0, max(0.0, float(generation) / float(ramp_generations)))
+    # When users explicitly ask for full comparisons (e.g., 1.0), ramp faster so
+    # adaptability pressure is present early enough to shape evolution.
+    if configured >= 0.9:
+        progress = float(np.sqrt(progress))
+
+    effective = floor + (configured - floor) * progress
+    if configured >= 0.9 and generation < int(max(1, config.adaptability_boost_generations)):
+        effective = max(effective, 0.55)
+
+    return float(np.clip(effective, floor, configured))
 
 def _ensure_seed_coverage(
     evaluator: Optional["AsyncDeterministicEvaluator"],
@@ -97,6 +203,12 @@ def _ensure_seed_coverage(
             evaluator.seed_manager.get_seed(f"g{generation}_fallback_eval{i}", offset=0)
     except Exception:
         return
+
+
+def _log_heartbeat(generation: int) -> None:
+    """Print a compact heartbeat line with human-readable timestamp."""
+    stamp = time.strftime("%H:%M:%S", time.localtime())
+    print(f"💓 HEARTBEAT | Gen {generation:04d} | {stamp}")
 
 try:
     import torch
@@ -162,7 +274,7 @@ from curriculum.task_generator import DiagnosticTaskGenerator
 from meta.meta_optimizer import EvolutionModifier
 
 # Import meta-evolution populations
-from evolution.evolution import ArchitectPopulation, MutatorPopulation
+from evolution.evolution import ArchitectPopulation, MutatorPopulation, BehaviorEmbedding
 
 @dataclass
 class EpisodeMetrics:
@@ -171,13 +283,15 @@ class EpisodeMetrics:
     episode_return: float  # Total accumulated reward over the episode
     learning_speed: float  # Rate of adaptation (plasticity effectiveness over time)
     stability: float  # Consistency of performance (variance in rewards/actions)
-    energy_cost: float  # Total energy expended during episode
+    energy_cost: float  # Per-step energy expenditure for cross-stage comparability
     complexity_penalty: float  # Penalty for overly complex behaviors (optional)
     novelty: float  # Novelty score (exploration of new strategies/behaviors)
     seed: int  # Random seed used for this evaluation
     stage: str  # Curriculum stage name
     adaptability: float = 0.0  # Reward delta from lifetime learning (plastic vs non-plastic)
+    adaptability_measured: bool = True  # False when non-plastic baseline was skipped for this rollout
     opponent_id: Optional[str] = None  # ID of opponent genome (for co-evolution)
+    instability: float = 0.0  # Variance/spikiness of plastic updates
     saturation_penalty: Optional[float] = None  # Penalty for high saturation in networks
     dead_unit_penalty: Optional[float] = None  # Penalty for dead units in networks
 
@@ -200,11 +314,11 @@ class EvolutionConfig:
     population_size: int = 100
     predator_population_size: int = 80
     generations: int = 1000
-    tournament_size: int = 5
-    elite_count: int = 5
-    mutation_rate: float = 0.001
-    mutation_strength: float = 0.1
-    architecture_mutation_rate: float = 0.05
+    tournament_size: int = 6
+    elite_count: int = 2
+    mutation_rate: float = 0.25
+    mutation_strength: float = 0.4
+    architecture_mutation_rate: float = 0.15
     base_seed: int = 42
     envs_per_genome: int = 8
     batch_size: int = 2
@@ -224,39 +338,44 @@ class EvolutionConfig:
     num_prey_per_arena: int = 10
     num_predators_per_arena: int = 3
     # Co-evolution parameters
-    num_opponents_per_eval: int = 1
+    num_opponents_per_eval: int = 2
     hall_of_fame_size: int = 10
 
     # Milestone 4: Speciation + novelty archive knobs
     speciation_enabled: bool = True
-    speciation_compatibility_threshold: float = 0.85
+    speciation_compatibility_threshold: float = 2.0
     speciation_compatibility_decay_rate: float = 400.0
-    speciation_architecture_weight: float = 0.6
-    speciation_behavior_weight: float = 0.2
-    speciation_param_weight: float = 0.2
+    # CRITICAL FIX: Increase architecture weight in distance calculation
+    # behavior_weight was dominating (0.5), causing fitness convergence to cluster species
+    # Now: architecture (0.8) > behavior (0.1) = more structural diversity required
+    speciation_architecture_weight: float = 0.8  # Increased from 0.6
+    speciation_behavior_weight: float = 0.1  # Decreased from 0.2
+    speciation_param_weight: float = 0.15  # Decreased from 0.2
     speciation_min_species_size: int = 5
     speciation_max_stagnation: int = 15
     speciation_min_offspring_per_species: int = 5
-    speciation_target_species_min: int = 4
-    speciation_target_species_max: int = 7
+    speciation_target_species_min: int = 5
+    speciation_target_species_max: int = 10
     speciation_adjust_rate: float = 0.05
     speciation_threshold_min: float = 0.1
     speciation_threshold_max: float = 5.0
 
     # Prey-specific diversity controls
     prey_speciation_compatibility_threshold: float = 0.75
-    prey_novelty_weight: float = 0.6
-    prey_min_species_enforcement: int = 2
+    prey_novelty_weight: float = 0.7
+    prey_min_species_enforcement: int = 3
     prey_min_species_adjust_rate: float = 0.2
 
     # Predator-specific diversity controls (Issue 3: Fix predator monoculture)
+    # Lower compatibility threshold = stricter speciation = more species maintained.
     predator_speciation_compatibility_threshold: float = 0.75
-    predator_novelty_weight: float = 0.6
-    predator_min_species_enforcement: int = 2
+    predator_novelty_weight: float = 1.0  # Increased from 0.7 to strongly reward diversity
+    predator_min_species_enforcement: int = 3
     predator_min_species_adjust_rate: float = 0.2
 
-    # Cross-species reproduction rate (5-10% recommended to maintain speciation)
-    cross_species_reproduction_rate: float = 0.05
+    # Cross-species reproduction rate (increased to encourage diversity mixing)
+    # Higher rate helps prevent any single species from dominating
+    cross_species_reproduction_rate: float = 0.3  # Increased from 0.15 (15% to 30%)
 
     novelty_archive_enabled: bool = True
 
@@ -271,8 +390,8 @@ class EvolutionConfig:
 
     # Adaptability pressure schedule (favor learning early, then taper)
     adaptability_weight_base: float = 0.3
-    adaptability_weight_boost: float = 1.0
-    adaptability_boost_generations: int = 15
+    adaptability_weight_boost: float = 2.0
+    adaptability_boost_generations: int = 50
     adaptability_taper_generations: int = 10
     # PPO inner-loop training - DISABLED: Contradicts NeuroGenesis philosophy
     ppo_training_steps: int = 100  # Number of PPO training steps per genome
@@ -281,7 +400,7 @@ class EvolutionConfig:
     # === Performance Optimization Parameters ===
     # Early stopping: terminate episode if score is catastrophically low
     early_stopping_enabled: bool = True  # Enable early stopping
-    early_stopping_threshold: float = -30.0  # Catastrophic low score threshold
+    early_stopping_threshold: float = -100.0  # Catastrophic low score threshold
     early_stopping_patience: int = 5  # Steps to wait before terminating
 
     # Curriculum-aware episode length: reduce steps in early generations
@@ -291,7 +410,7 @@ class EvolutionConfig:
 
     # Partial evaluation: evaluate on subset of seeds
     partial_evaluation_enabled: bool = True  # Enable partial evaluation
-    partial_eval_fraction: float = 0.5  # Fraction of seeds to evaluate (0.0-1.0)
+    partial_eval_fraction: float = 0.75  # Fraction of seeds to evaluate (0.0-1.0)
 
     # Fitness caching: cache fitness for identical genomes
     fitness_cache_enabled: bool = True  # Enable fitness caching
@@ -346,6 +465,10 @@ class TrainingState:
     generation_stats: List[Dict[str, Any]] = field(default_factory=list)
     generalization_reports: List[GeneralizationReport] = field(default_factory=list)
     experiment_reports: List[ExperimentReport] = field(default_factory=list)
+    curriculum_state: Optional[Dict[str, Any]] = None
+    meta_evolution_state: Optional[Dict[str, Any]] = None
+    engine_runtime_state: Optional[Dict[str, Any]] = None
+    loop_runtime_state: Optional[Dict[str, Any]] = None
     
     def update_hall_of_fame(self):
         """Update hall of fame with best individuals"""
@@ -366,6 +489,359 @@ class TrainingState:
                 key=lambda g: g.fitness,
                 reverse=True
             )[:self.config.hall_of_fame_size]
+
+
+@dataclass(frozen=True)
+class RuntimeOverrides:
+    """Explicit runtime config overrides from CLI or environment."""
+    base_seed: Optional[int] = None
+    population_size: Optional[int] = None
+    predator_population_size: Optional[int] = None
+    generations: Optional[int] = None
+
+    def has_seed_override(self) -> bool:
+        return self.base_seed is not None
+
+
+def _set_global_random_seeds(seed: int) -> None:
+    """Apply a deterministic seed before creating random populations or controllers."""
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def _apply_runtime_overrides_to_config(
+    config: EvolutionConfig,
+    runtime_overrides: Optional[RuntimeOverrides],
+) -> List[str]:
+    """Apply explicit runtime overrides to a config and return labels for logging."""
+    if runtime_overrides is None:
+        return []
+
+    applied: List[str] = []
+    if runtime_overrides.base_seed is not None:
+        config.base_seed = runtime_overrides.base_seed
+        applied.append(f"seed={config.base_seed}")
+    if runtime_overrides.population_size is not None:
+        config.population_size = runtime_overrides.population_size
+        applied.append(f"population={config.population_size}")
+    if runtime_overrides.predator_population_size is not None:
+        config.predator_population_size = runtime_overrides.predator_population_size
+        applied.append(f"predator_population={config.predator_population_size}")
+    if runtime_overrides.generations is not None:
+        config.generations = runtime_overrides.generations
+        applied.append(f"generations={config.generations}")
+
+    config.__post_init__()
+    return applied
+
+
+def _merge_runtime_overrides(
+    primary: Optional[RuntimeOverrides],
+    fallback: Optional[RuntimeOverrides],
+) -> Optional[RuntimeOverrides]:
+    """Merge two override sets with primary taking precedence field-by-field."""
+    if primary is None and fallback is None:
+        return None
+
+    primary = primary or RuntimeOverrides()
+    fallback = fallback or RuntimeOverrides()
+    merged = RuntimeOverrides(
+        base_seed=primary.base_seed if primary.base_seed is not None else fallback.base_seed,
+        population_size=(
+            primary.population_size
+            if primary.population_size is not None
+            else fallback.population_size
+        ),
+        predator_population_size=(
+            primary.predator_population_size
+            if primary.predator_population_size is not None
+            else fallback.predator_population_size
+        ),
+        generations=primary.generations if primary.generations is not None else fallback.generations,
+    )
+    if (
+        merged.base_seed is None
+        and merged.population_size is None
+        and merged.predator_population_size is None
+        and merged.generations is None
+    ):
+        return None
+    return merged
+
+
+def _resize_population(
+    population: List[Any],
+    target_size: int,
+    factory: Callable[[], Any],
+    label: str,
+) -> None:
+    """Resize a population while keeping the strongest loaded genomes when shrinking."""
+    current_size = len(population)
+    if current_size == target_size:
+        return
+
+    if current_size > target_size:
+        population.sort(key=lambda genome: float(getattr(genome, "fitness", 0.0)), reverse=True)
+        del population[target_size:]
+        print(f"[Config] Trimmed {label} population from {current_size} to {target_size}")
+        return
+
+    additions = target_size - current_size
+    population.extend(factory() for _ in range(additions))
+    print(f"[Config] Expanded {label} population from {current_size} to {target_size}")
+
+
+def _initialize_or_resize_populations(
+    training_state: TrainingState,
+    runtime_overrides: Optional[RuntimeOverrides] = None,
+) -> List[str]:
+    """Apply config overrides and keep current populations aligned to that config."""
+    applied = _apply_runtime_overrides_to_config(training_state.config, runtime_overrides)
+    _set_global_random_seeds(training_state.config.base_seed)
+
+    _resize_population(
+        training_state.prey_population,
+        training_state.config.population_size,
+        PreyGenome.random_initialization,
+        "prey",
+    )
+    _resize_population(
+        training_state.predator_population,
+        training_state.config.predator_population_size,
+        PredatorGenome.random_initialization,
+        "predator",
+    )
+    return applied
+
+
+def _format_architecture_string(genome: Any) -> str:
+    """Return a compact architecture string like "8-32-16-4"."""
+    input_size = int(getattr(genome, "input_size", 0) or 0)
+    genes = getattr(genome, "genes", None) or []
+
+    if genes:
+        dims = [input_size] + [int(getattr(gene, "output_dim", 0) or 0) for gene in genes]
+        # Keep order while removing accidental duplicate consecutive dims from malformed genes.
+        compact_dims: List[int] = []
+        for dim in dims:
+            if not compact_dims or compact_dims[-1] != dim:
+                compact_dims.append(dim)
+        return "-".join(str(dim) for dim in compact_dims if dim > 0)
+
+    architecture = getattr(genome, "architecture", None)
+    if isinstance(architecture, list) and architecture:
+        return "-".join(str(int(dim)) for dim in architecture)
+
+    output_size = int(getattr(genome, "output_size", 0) or 0)
+    if input_size > 0 and output_size > 0:
+        return f"{input_size}-{output_size}"
+    return "unknown"
+
+
+def _extract_species_index(species_id: Optional[str]) -> Optional[int]:
+    if not species_id:
+        return None
+    tail = str(species_id).split("_")[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _find_genome_species_index(genome: Any, engine: Optional[EvolutionEngine]) -> Optional[int]:
+    """Best-effort species lookup for metadata."""
+    if engine is None:
+        return None
+    speciation_manager = getattr(engine, "speciation_manager", None)
+    if speciation_manager is None:
+        return None
+
+    genome_id = getattr(genome, "genome_id", None)
+    genome_signature = getattr(genome, "signature", None)
+
+    for species in getattr(speciation_manager, "species", []):
+        for member in getattr(species, "members", []):
+            if member is genome:
+                return _extract_species_index(getattr(species, "species_id", None))
+
+            if genome_id is not None and getattr(member, "genome_id", None) == genome_id:
+                return _extract_species_index(getattr(species, "species_id", None))
+
+            member_signature = getattr(member, "signature", None)
+            if genome_signature is not None and member_signature == genome_signature:
+                return _extract_species_index(getattr(species, "species_id", None))
+
+    return None
+
+
+def _read_existing_best_fitness(metadata_path: str) -> Optional[float]:
+    if not os.path.exists(metadata_path):
+        return None
+
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "fitness" in data:
+            return float(data["fitness"])
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+    return None
+
+
+def _save_best_agent_artifacts(
+    genome: Any,
+    role: str,
+    generation: int,
+    species_index: Optional[int],
+    models_dir: str = "models",
+) -> bool:
+    """Save best model (.pt) and metadata (.json). Returns True when updated."""
+    os.makedirs(models_dir, exist_ok=True)
+
+    model_path = os.path.join(models_dir, f"best_{role}.pt")
+    metadata_path = os.path.join(models_dir, f"best_{role}.json")
+
+    current_fitness = float(getattr(genome, "fitness", 0.0))
+    existing_fitness = _read_existing_best_fitness(metadata_path)
+
+    # Only overwrite when a new best fitness is found.
+    if existing_fitness is not None and current_fitness <= existing_fitness:
+        return False
+
+    brain = genome.get_brain()
+    brain.save_model(model_path)
+
+    architecture_summary = None
+    if hasattr(brain, "get_architecture_summary"):
+        try:
+            architecture_summary = brain.get_architecture_summary()
+        except Exception:
+            architecture_summary = None
+
+    metadata_obj = getattr(genome, "metadata", None)
+    if metadata_obj is not None:
+        parent_ids = list(getattr(metadata_obj, "parent_ids", []))
+        birth_generation = int(getattr(metadata_obj, "birth_generation", 0) or 0)
+        origin_population = str(getattr(metadata_obj, "origin_population", "unknown"))
+        mutation_history = list(getattr(metadata_obj, "mutation_history", []))
+        last_eval_metrics = getattr(metadata_obj, "last_eval_metrics", None)
+    else:
+        parent_ids = []
+        birth_generation = 0
+        origin_population = "unknown"
+        mutation_history = []
+        last_eval_metrics = None
+
+    learning_rule_net = getattr(genome, "learning_rule_net", None)
+    learning_rule_info = None
+    if learning_rule_net is not None:
+        learning_rule_info = {
+            "input_dim": int(getattr(learning_rule_net, "input_dim", 0) or 0),
+            "output_dim": int(getattr(learning_rule_net, "output_dim", 0) or 0),
+            "hidden_dim": int(getattr(learning_rule_net, "hidden_dim", 0) or 0),
+        }
+
+    species_id = f"species_{species_index}" if species_index is not None else None
+    role_prefix = "best_prey" if role == "prey" else "best_predator"
+
+    metadata = {
+        "generation": int(generation),
+        "fitness": current_fitness,
+        "species": species_index,
+        "architecture": _format_architecture_string(genome),
+        "role": role,
+        "genome_id": str(getattr(genome, "genome_id", "unknown")),
+        "genome_signature": str(getattr(genome, "signature", "unknown")),
+        "species_id": species_id,
+        "artifact_name": role_prefix,
+        "model_file": os.path.basename(model_path),
+        "model_path": model_path,
+        "metadata_file": os.path.basename(metadata_path),
+        "metadata_path": metadata_path,
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp_epoch_seconds": time.time(),
+        "input_size": int(getattr(genome, "input_size", 0) or 0),
+        "output_size": int(getattr(genome, "output_size", 0) or 0),
+        "gene_count": int(len(getattr(genome, "genes", []))),
+        "module_count": int(len(getattr(genome, "modules", []))),
+        "role_architecture_default": getattr(genome, "architecture", None),
+        "architecture_summary": architecture_summary,
+        "age": int(getattr(genome, "age", 0) or 0),
+        "norm_fitness": float(getattr(genome, "norm_fitness", 0.0) or 0.0),
+        "novelty_score": float(getattr(genome, "novelty_score", 0.0) or 0.0),
+        "novelty_score_norm": float(getattr(genome, "novelty_score_norm", 0.0) or 0.0),
+        "meta_parameters": dict(getattr(genome, "meta", {})),
+        "learning_rule": getattr(genome, "learning_rule", None),
+        "learning_rule_net": learning_rule_info,
+        "lineage": {
+            "parent_ids": parent_ids,
+            "birth_generation": birth_generation,
+            "origin_population": origin_population,
+            "mutation_history_count": int(len(mutation_history)),
+            "last_eval_metrics": last_eval_metrics,
+        },
+        "export": {
+            "save_condition": "new_best_fitness",
+            "previous_best_fitness": existing_fitness,
+            "fitness_delta_vs_previous": (
+                None if existing_fitness is None else current_fitness - float(existing_fitness)
+            ),
+        },
+    }
+
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return True
+
+
+def save_best_agents(
+    training_state: TrainingState,
+    generation: int,
+    prey_engine: Optional[EvolutionEngine],
+    predator_engine: Optional[EvolutionEngine],
+    models_dir: str = "models",
+) -> None:
+    """Persist best prey and predator agents to models/ as .pt + metadata JSON."""
+    if training_state.prey_hall_of_fame:
+        best_prey = training_state.prey_hall_of_fame[0]
+    elif training_state.prey_population:
+        best_prey = max(training_state.prey_population, key=lambda g: g.fitness)
+    else:
+        best_prey = None
+
+    if training_state.predator_hall_of_fame:
+        best_predator = training_state.predator_hall_of_fame[0]
+    elif training_state.predator_population:
+        best_predator = max(training_state.predator_population, key=lambda g: g.fitness)
+    else:
+        best_predator = None
+
+    if best_prey is not None:
+        prey_species_index = _find_genome_species_index(best_prey, prey_engine)
+        updated = _save_best_agent_artifacts(
+            genome=best_prey,
+            role="prey",
+            generation=generation,
+            species_index=prey_species_index,
+            models_dir=models_dir,
+        )
+        if updated:
+            print(f"[ModelExport] Updated best prey model at {os.path.join(models_dir, 'best_prey.pt')}")
+
+    if best_predator is not None:
+        predator_species_index = _find_genome_species_index(best_predator, predator_engine)
+        updated = _save_best_agent_artifacts(
+            genome=best_predator,
+            role="predator",
+            generation=generation,
+            species_index=predator_species_index,
+            models_dir=models_dir,
+        )
+        if updated:
+            print(f"[ModelExport] Updated best predator model at {os.path.join(models_dir, 'best_predator.pt')}")
 
 def select_multi_agent_stage(generation: int, config: EvolutionConfig) -> CurriculumStage:
     """Curriculum stage selection for multi-agent co-evolution"""
@@ -669,10 +1145,6 @@ async def train_coevolution_async(
     all_prey = training_state.prey_population + training_state.prey_hall_of_fame
     all_predators = training_state.predator_population + training_state.predator_hall_of_fame
     
-    # Sample opponents for evaluation
-    num_prey_opponents = min(training_state.config.num_opponents_per_eval, len(all_predators))
-    num_pred_opponents = min(training_state.config.num_opponents_per_eval, len(all_prey))
-
     # Reuse a single arena for serial evaluation (batch_size=1 for single prey-predator pair).
     arena = MultiAgentArena(
         batch_size=1,
@@ -681,6 +1153,42 @@ async def train_coevolution_async(
     )
 
     effective_max_steps = _get_effective_max_steps(training_state.config, stage_config, generation)
+    effective_nonplastic_fraction = _get_effective_nonplastic_fraction(
+        training_state.config,
+        effective_max_steps,
+        generation,
+    )
+    effective_partial_eval_fraction = _get_effective_partial_eval_fraction(
+        training_state.config,
+        effective_max_steps,
+        generation,
+    )
+    effective_opponents_per_eval = _get_effective_opponents_per_eval(
+        training_state.config,
+        effective_max_steps,
+        generation,
+    )
+
+    # Sample opponents for evaluation after adaptive scheduling is applied.
+    num_prey_opponents = min(effective_opponents_per_eval, len(all_predators))
+    num_pred_opponents = min(effective_opponents_per_eval, len(all_prey))
+
+    if effective_nonplastic_fraction < float(training_state.config.nonplastic_check_fraction):
+        print(
+            f"  ⏱️  Adaptive non-plastic checks: {effective_nonplastic_fraction:.2f} "
+            f"(base={training_state.config.nonplastic_check_fraction:.2f}, steps={effective_max_steps})",
+            flush=True,
+        )
+    if (
+        effective_partial_eval_fraction < float(training_state.config.partial_eval_fraction)
+        or effective_opponents_per_eval < int(training_state.config.num_opponents_per_eval)
+    ):
+        print(
+            f"  ⏱️  Adaptive eval budget: partial={effective_partial_eval_fraction:.2f} "
+            f"(base={training_state.config.partial_eval_fraction:.2f}), "
+            f"opponents={effective_opponents_per_eval}",
+            flush=True,
+        )
     
     # Evaluate prey population
     print("  ⏱️  Testing prey agents against predators...", flush=True)
@@ -696,9 +1204,9 @@ async def train_coevolution_async(
             num_prey_per_env=training_state.config.num_prey_per_arena,
             num_predators_per_env=training_state.config.num_predators_per_arena,
             num_workers=training_state.config.num_workers,
-            nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            nonplastic_check_fraction=effective_nonplastic_fraction,
             partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
-            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            partial_eval_fraction=effective_partial_eval_fraction,
             fitness_cache_enabled=training_state.config.fitness_cache_enabled,
             fitness_cache_max_size=training_state.config.fitness_cache_max_size,
             early_stopping_enabled=training_state.config.early_stopping_enabled,
@@ -714,9 +1222,9 @@ async def train_coevolution_async(
             effective_max_steps,
             num_prey_opponents,
             is_prey_evaluation=True,
-            nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            nonplastic_check_fraction=effective_nonplastic_fraction,
             partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
-            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            partial_eval_fraction=effective_partial_eval_fraction,
             fitness_cache_enabled=training_state.config.fitness_cache_enabled,
             fitness_cache_max_size=training_state.config.fitness_cache_max_size,
             early_stopping_enabled=training_state.config.early_stopping_enabled,
@@ -738,9 +1246,9 @@ async def train_coevolution_async(
             num_prey_per_env=training_state.config.num_prey_per_arena,
             num_predators_per_env=training_state.config.num_predators_per_arena,
             num_workers=training_state.config.num_workers,
-            nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            nonplastic_check_fraction=effective_nonplastic_fraction,
             partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
-            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            partial_eval_fraction=effective_partial_eval_fraction,
             fitness_cache_enabled=training_state.config.fitness_cache_enabled,
             fitness_cache_max_size=training_state.config.fitness_cache_max_size,
             early_stopping_enabled=training_state.config.early_stopping_enabled,
@@ -756,9 +1264,9 @@ async def train_coevolution_async(
             effective_max_steps,
             num_pred_opponents,
             is_prey_evaluation=False,
-            nonplastic_check_fraction=training_state.config.nonplastic_check_fraction,
+            nonplastic_check_fraction=effective_nonplastic_fraction,
             partial_evaluation_enabled=training_state.config.partial_evaluation_enabled,
-            partial_eval_fraction=training_state.config.partial_eval_fraction,
+            partial_eval_fraction=effective_partial_eval_fraction,
             fitness_cache_enabled=training_state.config.fitness_cache_enabled,
             fitness_cache_max_size=training_state.config.fitness_cache_max_size,
             early_stopping_enabled=training_state.config.early_stopping_enabled,
@@ -788,37 +1296,54 @@ async def train_coevolution_async(
     meta_gain = [g.meta["reward_gain"] for g in combined_population]
     meta_bias = [g.meta["reward_bias"] for g in combined_population]
 
-    # Log plastic weight norms per generation (sample once, not per update)
+    # Log plasticity magnitudes per generation (sample once, not per update).
+    # `plastic_norms` tracks cumulative RMS(DeltaW) per episode.
     from core.torch_brain import PlasticLinear
     # Only collect from the last evaluation to avoid O(steps × layers × population) growth
     plastic_norms = PlasticLinear.plastic_norms.copy()
+    plastic_weight_norms = PlasticLinear.plastic_weight_rms_norms.copy()
     PlasticLinear.plastic_norms.clear()  # Clear for next generation
+    PlasticLinear.plastic_weight_rms_norms.clear()  # Clear for next generation
 
     if plastic_norms:
         mean_plastic_norm = float(np.mean(plastic_norms))
         max_plastic_norm = float(np.max(plastic_norms))
         p95_plastic_norm = float(np.percentile(plastic_norms, 95))
-        print(f"Plastic Weight Norms - Mean: {mean_plastic_norm:.4f} | Max: {max_plastic_norm:.4f} | 95th: {p95_plastic_norm:.4f}")
+        mean_plastic_weight_norm = float(np.mean(plastic_weight_norms)) if plastic_weight_norms else 0.0
+        max_plastic_weight_norm = float(np.max(plastic_weight_norms)) if plastic_weight_norms else 0.0
+        p95_plastic_weight_norm = float(np.percentile(plastic_weight_norms, 95)) if plastic_weight_norms else 0.0
+        print("\n⚡ LEARNING MECHANISMS (Weight Modifications)")
+        print(f"  {'─'*86}")
+        print(f"  Plastic Delta RMS (episode cumulative): Mean {mean_plastic_norm:.4f}  |  Max {max_plastic_norm:.4f}  |  95th {p95_plastic_norm:.4f}")
+        print(f"  Plastic Weight RMS: Mean {mean_plastic_weight_norm:.4f}  |  Max {max_plastic_weight_norm:.4f}  |  95th {p95_plastic_weight_norm:.4f}")
     else:
         mean_plastic_norm = 0.0
         max_plastic_norm = 0.0
         p95_plastic_norm = 0.0
+        mean_plastic_weight_norm = 0.0
+        max_plastic_weight_norm = 0.0
+        p95_plastic_weight_norm = 0.0
 
     adaptability_scores = []
     meta_effectiveness_scores = []
     reward_before_learning = []
     reward_after_learning = []
     reward_delta_learning = []
+    reward_delta_raw_learning = []
     energy_costs = []
     learning_speeds = []
+    improving_learning_speeds = []
     stabilities = []
     novelties = []
     success_rates = []
     instability_scores = []  # CRITICAL FIX 2: Track instability
+    paired_learning_speeds = []
+    paired_reward_deltas = []
     metrics_missing = 0
 
     for genome in training_state.prey_population + training_state.predator_population:
         plastic_advantage: Optional[float] = None
+        adaptability_score: Optional[float] = None
         reward_before: float = 0.0
         reward_after: float = 0.0
         instability: float = 0.0
@@ -830,39 +1355,60 @@ async def train_coevolution_async(
                 reward_before = float(plastic_diag.get('gen_reward_before_sum', 0.0)) / float(gen_count)
                 reward_after = float(plastic_diag.get('gen_reward_after_sum', 0.0)) / float(gen_count)
                 instability = float(plastic_diag.get('gen_instability_sum', 0.0)) / float(gen_count)
+                if 'gen_adaptability_score_sum' in plastic_diag:
+                    adaptability_score = float(plastic_diag.get('gen_adaptability_score_sum', 0.0)) / float(gen_count)
+                else:
+                    adaptability_score = _compute_adaptability_score(reward_before, reward_after)
             elif plastic_diag.get('plastic_advantage_measured', False):
                 # Backward-compatible fallback for older checkpoints/paths.
                 plastic_advantage = float(plastic_diag.get('plastic_advantage', 0.0))
                 reward_before = float(plastic_diag.get('reward_before_learning', 0.0))
                 reward_after = float(plastic_diag.get('reward_after_learning', 0.0))
                 instability = float(plastic_diag.get('instability', 0.0))
+                adaptability_score = _compute_adaptability_score(reward_before, reward_after)
 
         if plastic_advantage is not None:
             instability_scores.append(float(instability))
 
-            # Calculate adaptability as improvement from plasticity — negative means no gain, floor at 0
-            denom = max(1.0, abs(float(reward_before)))
-            adaptability_score = float(plastic_advantage) / denom
+            # Use robust bounded adaptability score from paired before/after rewards.
+            if adaptability_score is None:
+                adaptability_score = _compute_adaptability_score(reward_before, reward_after)
             adaptability_scores.append(float(np.clip(adaptability_score, 0.0, 1.0)))
             reward_before_learning.append(float(reward_before))
             reward_after_learning.append(float(reward_after))
-            reward_delta_learning.append(float(plastic_advantage))
+            reward_delta_learning.append(float(max(0.0, reward_after - reward_before)))
+            reward_delta_raw_learning.append(float(plastic_advantage))
 
             # Meta-parameter effectiveness based on how well they enable plasticity
             local_meta_gain = genome.meta.get('reward_gain', 1.0)
             local_meta_bias = genome.meta.get('reward_bias', 0.0)
             plastic_lr = genome.meta.get('plastic_lr', 1.0)
 
-            # Meta-params are effective if they correlate with actual plastic improvement
-            meta_effectiveness = 0.0
-            if plastic_advantage > 0:
-                # Reward meta-params that enable positive plasticity
-                gain_effectiveness = min(abs(local_meta_gain) / 5.0, 1.0)
-                lr_effectiveness = min(plastic_lr / 10.0, 1.0)
-                meta_effectiveness = (gain_effectiveness + lr_effectiveness) / 2.0
-            else:
-                # Penalize meta-params that don't enable plasticity
-                meta_effectiveness = 0.1  # Small baseline
+            # Meta-effectiveness should reflect both observed learning outcomes and
+            # whether meta-parameters are in healthy operating ranges.
+            gain_effectiveness = 1.0 - min(abs(float(local_meta_gain) - 1.5) / 4.0, 1.0)
+            lr_effectiveness = 1.0 - min(abs(float(plastic_lr) - 1.2) / 6.0, 1.0)
+            bias_effectiveness = 1.0 - min(abs(float(local_meta_bias)) / 3.5, 1.0)
+            param_quality = float(np.clip(
+                0.45 * gain_effectiveness + 0.40 * lr_effectiveness + 0.15 * bias_effectiveness,
+                0.0,
+                1.0,
+            ))
+
+            delta_scale = max(1.0, abs(float(reward_before)), abs(float(reward_after)))
+            signed_delta = float(plastic_advantage) / delta_scale
+            delta_effectiveness = float(np.clip(0.5 + 0.5 * np.tanh(3.0 * signed_delta), 0.0, 1.0))
+            adapt_effectiveness = float(np.clip(adaptability_score if adaptability_score is not None else 0.0, 0.0, 1.0))
+            stability_effectiveness = float(np.clip(1.0 - float(instability), 0.0, 1.0))
+
+            meta_effectiveness = float(np.clip(
+                0.45 * adapt_effectiveness +
+                0.25 * delta_effectiveness +
+                0.20 * param_quality +
+                0.10 * stability_effectiveness,
+                0.0,
+                1.0,
+            ))
 
             meta_effectiveness_scores.append(float(meta_effectiveness))
         else:
@@ -871,33 +1417,59 @@ async def train_coevolution_async(
 
         last_metrics = getattr(genome, 'last_eval_metrics', None)
         if isinstance(last_metrics, dict):
+            current_learning_speed = float(last_metrics.get('learning_speed', 0.0))
+            if isinstance(plastic_diag, dict):
+                ls_count = int(plastic_diag.get('gen_learning_speed_count', 0))
+                if ls_count > 0:
+                    current_learning_speed = float(plastic_diag.get('gen_learning_speed_sum', 0.0)) / float(ls_count)
             energy_costs.append(float(last_metrics.get('energy_cost', 0.0)))
-            learning_speeds.append(float(last_metrics.get('learning_speed', 0.0)))
+            learning_speeds.append(current_learning_speed)
+            if plastic_advantage is not None and float(plastic_advantage) > 0.0:
+                improving_learning_speeds.append(current_learning_speed)
             stabilities.append(float(last_metrics.get('stability', 0.0)))
             novelties.append(float(last_metrics.get('novelty', 0.0)))
             success_rates.append(1.0 if last_metrics.get('task_success', False) else 0.0)
+            if plastic_advantage is not None:
+                paired_learning_speeds.append(current_learning_speed)
+                paired_reward_deltas.append(float(plastic_advantage))
         else:
             metrics_missing += 1
 
     if metrics_missing == len(training_state.prey_population) + len(training_state.predator_population):
-        print("[WARN] Evaluator metrics missing for all genomes; check last_eval_metrics wiring.")
+        print("⚠️  Evaluator metrics missing for all genomes; check last_eval_metrics wiring")
     elif energy_costs and learning_speeds and stabilities and novelties and success_rates:
+        print("\n📈 RAW EVALUATION SNAPSHOT (min/avg/max)")
+        print(f"  {'─'*86}")
         print(
-            "[EvalRaw] "
-            f"Energy {np.min(energy_costs):.3f}/{np.mean(energy_costs):.3f}/{np.max(energy_costs):.3f} | "
-            f"Learn {np.min(learning_speeds):.3f}/{np.mean(learning_speeds):.3f}/{np.max(learning_speeds):.3f} | "
-            f"Stability {np.min(stabilities):.3f}/{np.mean(stabilities):.3f}/{np.max(stabilities):.3f} | "
-            f"Novelty {np.min(novelties):.3f}/{np.mean(novelties):.3f}/{np.max(novelties):.3f} | "
-            f"Success {np.mean(success_rates):.3f}"
+            f"  Energy:    {np.min(energy_costs):.3f} / {np.mean(energy_costs):.3f} / {np.max(energy_costs):.3f}"
+            f"  │  Learn: {np.min(learning_speeds):.3f} / {np.mean(learning_speeds):.3f} / {np.max(learning_speeds):.3f}"
         )
+        print(
+            f"  Stability: {np.min(stabilities):.3f} / {np.mean(stabilities):.3f} / {np.max(stabilities):.3f}"
+            f"  │  Novelty: {np.min(novelties):.3f} / {np.mean(novelties):.3f} / {np.max(novelties):.3f}"
+            f"  │  Success: {np.mean(success_rates):.3f}"
+        )
+        # PLASTICITY EFFECTIVENESS DIAGNOSTIC: Track if learning is translating to performance
+        if reward_delta_learning:
+            correlation = _safe_paired_correlation(paired_learning_speeds, paired_reward_deltas)
+            print(
+                f"  Plasticity: Adaptability {np.min(adaptability_scores):.4f} / {np.mean(adaptability_scores):.4f} / {np.max(adaptability_scores):.4f}"
+                f"  │  Reward Delta(raw) {np.min(reward_delta_raw_learning):.4f} / {np.mean(reward_delta_raw_learning):.4f} / {np.max(reward_delta_raw_learning):.4f}"
+                f"  │  Reward Delta(realized) {np.min(reward_delta_learning):.4f} / {np.mean(reward_delta_learning):.4f} / {np.max(reward_delta_learning):.4f}"
+                f"  │  Learn↔Adapt Corr {correlation:.3f}"
+            )
 
     avg_adaptability = float(np.mean(adaptability_scores)) if adaptability_scores else 0.0
     avg_meta_effectiveness = float(np.mean(meta_effectiveness_scores)) if meta_effectiveness_scores else 0.0
     avg_reward_before = float(np.mean(reward_before_learning)) if reward_before_learning else 0.0
     avg_reward_after = float(np.mean(reward_after_learning)) if reward_after_learning else 0.0
     avg_reward_delta = float(np.mean(reward_delta_learning)) if reward_delta_learning else 0.0
+    avg_reward_delta_raw = float(np.mean(reward_delta_raw_learning)) if reward_delta_raw_learning else 0.0
     avg_energy_cost = float(np.mean(energy_costs)) if energy_costs else 0.0
-    avg_learning_speed = float(np.mean(learning_speeds)) if learning_speeds else 0.0
+    if improving_learning_speeds:
+        avg_learning_speed = float(np.mean(improving_learning_speeds))
+    else:
+        avg_learning_speed = float(np.mean(learning_speeds)) if learning_speeds else 0.0
     avg_stability = float(np.mean(stabilities)) if stabilities else 0.0
     avg_novelty = float(np.mean(novelties)) if novelties else 0.0
     avg_success_rate = float(np.mean(success_rates)) if success_rates else 0.0
@@ -923,11 +1495,15 @@ async def train_coevolution_async(
         'mean_plastic_norm': mean_plastic_norm,
         'max_plastic_norm': max_plastic_norm,
         'p95_plastic_norm': p95_plastic_norm,
+        'mean_plastic_weight_norm': mean_plastic_weight_norm,
+        'max_plastic_weight_norm': max_plastic_weight_norm,
+        'p95_plastic_weight_norm': p95_plastic_weight_norm,
         'avg_adaptability_score': avg_adaptability,
         'avg_meta_effectiveness': avg_meta_effectiveness,
         'avg_reward_before_learning': avg_reward_before,
         'avg_reward_after_learning': avg_reward_after,
         'avg_reward_delta': avg_reward_delta,
+        'avg_reward_delta_raw': avg_reward_delta_raw,
         'avg_energy_cost': avg_energy_cost,
         'avg_learning_speed': avg_learning_speed,
         'avg_stability': avg_stability,
@@ -993,6 +1569,32 @@ async def train_coevolution_async(
                     min_threshold=training_state.config.speciation_threshold_min,
                     max_threshold=training_state.config.speciation_threshold_max,
                 )
+            
+            # CRITICAL ALERT: Detect predator collapse early
+            if predator_species_count == 1 and len(training_state.predator_population) > 1:
+                largest_species_size = max(
+                    predator_species.get('species_sizes', [0]) if isinstance(predator_species.get('species_sizes'), list) else [0]
+                )
+                collapse_ratio = largest_species_size / max(len(training_state.predator_population), 1)
+                
+                if collapse_ratio > 0.95:
+                    print(f"\n❌ PREDATOR COLLAPSE DETECTED at Gen {generation}!")
+                    print(f"   {largest_species_size}/{len(training_state.predator_population)} agents in single species")
+                    print(f"   This will KILL co-evolution. Applying emergency recovery...")
+                    
+                    # Trigger emergency speciation reset
+                    if predator_engine.speciation_manager is not None:
+                        old_threshold = predator_engine.speciation_manager.compatibility_threshold
+                        new_threshold = max(
+                            training_state.config.speciation_threshold_min,
+                            float(old_threshold) * 0.7,
+                        )
+                        predator_engine.speciation_manager.compatibility_threshold = new_threshold
+                        print(
+                            f"   Emergency: compatibility_threshold reduced to "
+                            f"{new_threshold:.3f} (was {old_threshold:.3f})"
+                        )
+
     except Exception:
         stats['prey_species'] = {'num_species': 0, 'avg_species_size': 0.0, 'total_members': 0, 'species_sizes': []}
         stats['predator_species'] = {'num_species': 0, 'avg_species_size': 0.0, 'total_members': 0, 'species_sizes': []}
@@ -1139,16 +1741,56 @@ async def train_coevolution_async(
     # Evolve mutator population
     mutator_population.evolve_mutators(performance_data)
 
+    # Fold mutation-strategy quality into the reported meta effectiveness.
+    # This keeps the dashboard aligned with what the mutator population is doing.
+    _best_mutator_for_metrics = mutator_population.get_best_strategy()
+    if _best_mutator_for_metrics:
+        mutator_effectiveness = float(np.clip(_best_mutator_for_metrics.get('current_effectiveness', 0.5), 0.0, 1.0))
+        mutator_meta_raw = float(_best_mutator_for_metrics.get('meta_fitness', 0.0))
+        mutator_meta_score = float(np.clip(0.5 + 0.5 * np.tanh(mutator_meta_raw / 5.0), 0.0, 1.0))
+        success_values = [float(v) for v in mutation_success_rates.values()] if mutation_success_rates else []
+        mutation_success_score = float(np.clip(np.mean(success_values), 0.0, 1.0)) if success_values else 0.0
+
+        base_meta_effectiveness = float(np.clip(stats.get('avg_meta_effectiveness', 0.0), 0.0, 1.0))
+        stats['avg_meta_effectiveness'] = float(np.clip(
+            0.55 * base_meta_effectiveness +
+            0.30 * mutator_effectiveness +
+            0.10 * mutator_meta_score +
+            0.05 * mutation_success_score,
+            0.0,
+            1.0,
+        ))
+
     # Use evolved mutation strategies to adapt main evolution engines
     adaptive_rates = mutator_population.get_adaptive_rates()
     used_strategy = mutator_population.get_best_strategy()  # Track which strategy was used for effectiveness update
-    if prey_engine and adaptive_rates:
-        prey_engine.mutation_rate = adaptive_rates.get('weight_rate', prey_engine.mutation_rate)
-        prey_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', prey_engine.architecture_mutation_rate)
+    if adaptive_rates:
+        target_weight = float(adaptive_rates.get('weight_rate', training_state.config.mutation_rate))
+        target_arch = float(adaptive_rates.get('arch_rate', training_state.config.architecture_mutation_rate))
 
-    if predator_engine and adaptive_rates:
-        predator_engine.mutation_rate = adaptive_rates.get('weight_rate', predator_engine.mutation_rate)
-        predator_engine.architecture_mutation_rate = adaptive_rates.get('arch_rate', predator_engine.architecture_mutation_rate)
+        # Smooth and bound mutator-driven rate updates to avoid oscillations.
+        blend = 0.25
+        stable_weight = float(np.clip(
+            (1.0 - blend) * training_state.config.mutation_rate + blend * target_weight,
+            0.1,
+            0.3,
+        ))
+        stable_arch = float(np.clip(
+            (1.0 - blend) * training_state.config.architecture_mutation_rate + blend * target_arch,
+            0.01,
+            0.10,
+        ))
+
+        training_state.config.mutation_rate = stable_weight
+        training_state.config.architecture_mutation_rate = stable_arch
+
+        if prey_engine:
+            prey_engine.mutation_rate = stable_weight
+            prey_engine.architecture_mutation_rate = stable_arch
+
+        if predator_engine:
+            predator_engine.mutation_rate = stable_weight
+            predator_engine.architecture_mutation_rate = stable_arch
 
     def _inject_template_into_population(
         population: list,
@@ -1276,6 +1918,10 @@ def evaluate_multi_agent_pair(
         predator_genome.plastic_diagnostics['reward_after_learning'] = float(plastic_pred_reward)
 
         # Compute fitness from metrics (weighted combination)
+        plastic_prey_metrics.adaptability = 0.0
+        plastic_pred_metrics.adaptability = 0.0
+        plastic_prey_metrics.adaptability_measured = False
+        plastic_pred_metrics.adaptability_measured = False
         prey_fitness = compute_fitness_from_metrics(plastic_prey_metrics, brain=prey_genome.brain)
         predator_fitness = compute_fitness_from_metrics(plastic_pred_metrics, brain=predator_genome.brain)
         _store_last_eval_metrics(prey_genome, plastic_prey_metrics, prey_fitness)
@@ -1298,32 +1944,48 @@ def evaluate_multi_agent_pair(
     # Plastic agents must outperform non-plastic agents within the episode
     plastic_advantage_prey = plastic_prey_reward - nonplastic_prey_reward
     plastic_advantage_pred = plastic_pred_reward - nonplastic_pred_reward
+    prey_adaptability_score = _compute_adaptability_score(
+        reward_before=nonplastic_prey_reward,
+        reward_after=plastic_prey_reward,
+        learning_speed=plastic_prey_metrics.learning_speed,
+    )
+    pred_adaptability_score = _compute_adaptability_score(
+        reward_before=nonplastic_pred_reward,
+        reward_after=plastic_pred_reward,
+        learning_speed=plastic_pred_metrics.learning_speed,
+    )
 
-    plasticity_bonus_prey = np.clip(plastic_advantage_prey, -5, 5)
-    plasticity_bonus_pred = np.clip(plastic_advantage_pred, -5, 5)
-
-    final_prey_reward = plastic_prey_reward + plasticity_bonus_prey
-    final_pred_reward = plastic_pred_reward + plasticity_bonus_pred
+    # Use the paired non-plastic evaluation as a safety floor. Plasticity should
+    # improve the policy, not be allowed to drag the base task return below the
+    # known non-plastic performance for the same arena seed.
+    final_prey_reward = max(plastic_prey_reward, nonplastic_prey_reward)
+    final_pred_reward = max(plastic_pred_reward, nonplastic_pred_reward)
 
     # Store plastic advantage in diagnostics for adaptability calculation
     _accumulate_generation_plastic_diagnostics(
         prey_genome,
         plastic_advantage=float(plastic_advantage_prey),
         reward_before=float(nonplastic_prey_reward),
-        reward_after=float(plastic_prey_reward),
+        reward_after=float(final_prey_reward),
+        adaptability_score=float(prey_adaptability_score),
     )
     _accumulate_generation_plastic_diagnostics(
         predator_genome,
         plastic_advantage=float(plastic_advantage_pred),
         reward_before=float(nonplastic_pred_reward),
-        reward_after=float(plastic_pred_reward),
+        reward_after=float(final_pred_reward),
+        adaptability_score=float(pred_adaptability_score),
     )
 
     # Update metrics with final rewards and compute fitness
     plastic_prey_metrics.episode_return = final_prey_reward
     plastic_pred_metrics.episode_return = final_pred_reward
-    plastic_prey_metrics.adaptability = float(plastic_advantage_prey)
-    plastic_pred_metrics.adaptability = float(plastic_advantage_pred)
+    plastic_prey_metrics.task_success = final_prey_reward > 0
+    plastic_pred_metrics.task_success = final_pred_reward > 0
+    plastic_prey_metrics.adaptability = float(prey_adaptability_score)
+    plastic_pred_metrics.adaptability = float(pred_adaptability_score)
+    plastic_prey_metrics.adaptability_measured = True
+    plastic_pred_metrics.adaptability_measured = True
 
     prey_fitness = compute_fitness_from_metrics(plastic_prey_metrics, brain=prey_genome.brain)
     predator_fitness = compute_fitness_from_metrics(plastic_pred_metrics, brain=predator_genome.brain)
@@ -1347,8 +2009,11 @@ def _reset_generation_plastic_diagnostics(genome) -> None:
     diag["gen_plastic_adv_sum"] = 0.0
     diag["gen_reward_before_sum"] = 0.0
     diag["gen_reward_after_sum"] = 0.0
+    diag["gen_adaptability_score_sum"] = 0.0
     diag["gen_instability_sum"] = 0.0
+    diag["gen_learning_speed_sum"] = 0.0
     diag["gen_plastic_adv_count"] = 0
+    diag["gen_learning_speed_count"] = 0
     diag["plastic_advantage_measured"] = False
     diag["plastic_advantage"] = 0.0
 
@@ -1357,6 +2022,7 @@ def _accumulate_generation_plastic_diagnostics(
     plastic_advantage: float,
     reward_before: float,
     reward_after: float,
+    adaptability_score: Optional[float] = None,
 ) -> None:
     """Accumulate plasticity comparison outcomes for robust generation-level reporting."""
     if getattr(genome, "plastic_diagnostics", None) is None:
@@ -1369,6 +2035,10 @@ def _accumulate_generation_plastic_diagnostics(
     diag["gen_plastic_adv_sum"] = float(diag.get("gen_plastic_adv_sum", 0.0)) + float(plastic_advantage)
     diag["gen_reward_before_sum"] = float(diag.get("gen_reward_before_sum", 0.0)) + float(reward_before)
     diag["gen_reward_after_sum"] = float(diag.get("gen_reward_after_sum", 0.0)) + float(reward_after)
+    if adaptability_score is not None:
+        score_val = float(adaptability_score)
+        if np.isfinite(score_val):
+            diag["gen_adaptability_score_sum"] = float(diag.get("gen_adaptability_score_sum", 0.0)) + score_val
 
     instability = diag.get("instability", None)
     if isinstance(instability, (int, float)):
@@ -1399,6 +2069,44 @@ def _safe_array_mean(values: Any, default: float = 0.0) -> float:
         return float(default)
     return float(np.mean(arr))
 
+
+def _compute_adaptability_score(
+    reward_before: float,
+    reward_after: float,
+    learning_speed: Optional[float] = None,
+) -> float:
+    """
+    Compute a bounded 0-1 adaptability score from paired non-plastic/plastic rewards.
+
+    Keeps adaptability comparable across stages where reward magnitudes differ,
+    and lightly boosts the score when in-episode learning speed is higher.
+    """
+    before = float(reward_before)
+    after = float(reward_after)
+    if not (np.isfinite(before) and np.isfinite(after)):
+        return 0.0
+
+    improvement = after - before
+    if improvement <= 0.0:
+        return 0.0
+
+    # Use reward-scale-aware normalization. A hard 1.0 floor can suppress
+    # adaptability in early stages where reward magnitudes are naturally < 1.
+    scale = max(0.5, abs(before), abs(after))
+    gain_ratio = float(max(0.0, improvement / scale))
+    gain_score = float(gain_ratio / (gain_ratio + 0.2)) if gain_ratio > 0.0 else 0.0
+
+    if learning_speed is None:
+        return float(np.clip(gain_score, 0.0, 1.0))
+
+    speed_val = float(learning_speed)
+    if not np.isfinite(speed_val):
+        return float(np.clip(gain_score, 0.0, 1.0))
+
+    speed = float(np.clip(speed_val, 0.0, 1.0))
+    # Blend realized reward improvement with in-episode learning speed.
+    return float(np.clip(0.85 * gain_score + 0.15 * speed, 0.0, 1.0))
+
 def _compute_episode_learning_speed(rewards: List[float]) -> float:
     """
     Measure in-lifetime adaptation from reward improvement within one episode.
@@ -1411,15 +2119,44 @@ def _compute_episode_learning_speed(rewards: List[float]) -> float:
     if len(rewards) < 6:
         return 0.0
 
-    window = max(3, len(rewards) // 5)
-    early = float(np.mean(rewards[:window]))
-    late = float(np.mean(rewards[-window:]))
-    delta = late - early
-    # Handle potential NaN values
+    arr = np.asarray(rewards, dtype=np.float32)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 6:
+        return 0.0
+
+    window = max(3, len(arr) // 5)
+    early = float(np.mean(arr[:window]))
+    late = float(np.mean(arr[-window:]))
     if not np.isfinite(early) or not np.isfinite(late):
         return 0.0
-    scale = max(1.0, abs(early), abs(late), float(np.std(rewards)))
-    return float(np.clip(delta / scale, 0.0, 1.0))
+
+    delta = late - early
+    x = np.arange(len(arr), dtype=np.float32)
+    slope = float(np.polyfit(x, arr, 1)[0]) if len(arr) >= 3 else 0.0
+
+    # Use reward variability (not absolute reward level) so high baseline reward
+    # does not suppress measurable in-episode improvement.
+    reward_std = float(np.std(arr))
+    reward_iqr = float(np.percentile(arr, 75) - np.percentile(arr, 25))
+    step_deltas = np.diff(arr)
+    step_noise = float(np.std(step_deltas)) if step_deltas.size > 0 else reward_std
+    adaptive_floor = max(1e-5, step_noise * 0.25)
+    scale = max(adaptive_floor, reward_std, reward_iqr)
+
+    delta_ratio = max(0.0, delta / scale)
+    trend_ratio = max(0.0, slope * len(arr) / scale)
+
+    # Bounded index with better sensitivity in low-improvement regimes.
+    delta_score = delta_ratio / (delta_ratio + 0.08) if delta_ratio > 0.0 else 0.0
+    trend_score = trend_ratio / (trend_ratio + 0.08) if trend_ratio > 0.0 else 0.0
+
+    # Sparse-reward uplift: increased positive-reward hit rate later in episode.
+    hit_eps = max(1e-5, scale * 0.1)
+    early_hits = float(np.mean(arr[:window] > hit_eps))
+    late_hits = float(np.mean(arr[-window:] > hit_eps))
+    hit_improvement = max(0.0, late_hits - early_hits)
+
+    return float(np.clip(0.65 * delta_score + 0.25 * trend_score + 0.10 * hit_improvement, 0.0, 1.0))
 
 def _compute_behavioral_stability(rewards: List[float]) -> float:
     """
@@ -1462,7 +2199,19 @@ def _store_last_eval_metrics(genome, metrics: EpisodeMetrics, fitness: float) ->
         'stage': str(metrics.stage),
         'opponent_id': metrics.opponent_id,
         'adaptability': float(metrics.adaptability),
+        'adaptability_measured': bool(metrics.adaptability_measured),
+        'instability': float(metrics.instability),
     }
+
+    # Aggregate learning-speed signal across all opponent rollouts in this
+    # generation so reporting is not biased by the last evaluated opponent.
+    if getattr(genome, 'plastic_diagnostics', None) is None:
+        genome.plastic_diagnostics = {}
+    diag = genome.plastic_diagnostics
+    ls_val = float(metrics.learning_speed)
+    if np.isfinite(ls_val):
+        diag['gen_learning_speed_sum'] = float(diag.get('gen_learning_speed_sum', 0.0)) + ls_val
+        diag['gen_learning_speed_count'] = int(diag.get('gen_learning_speed_count', 0)) + 1
 
 def _get_adaptability_weight() -> float:
     config = _ACTIVE_CONFIG
@@ -1508,11 +2257,16 @@ def _update_learning_speed_stats(learning_speeds: List[float]) -> None:
     if not learning_speeds:
         return
     
-    speeds = np.array(learning_speeds, dtype=np.float32)
+    speeds = np.asarray(learning_speeds, dtype=np.float32)
+    speeds = speeds[np.isfinite(speeds)]
+    if speeds.size == 0:
+        return
+    speeds = np.clip(speeds, 0.0, None)
+
     _LEARNING_SPEED_STATS['min'] = float(np.min(speeds))
     _LEARNING_SPEED_STATS['max'] = float(np.max(speeds))
     _LEARNING_SPEED_STATS['mean'] = float(np.mean(speeds))
-    _LEARNING_SPEED_STATS['std'] = float(np.std(speeds)) if len(speeds) > 1 else 1.0
+    _LEARNING_SPEED_STATS['std'] = float(np.std(speeds)) if speeds.size > 1 else 1.0
     _LEARNING_SPEED_STATS['initialized'] = True
 
 
@@ -1522,7 +2276,7 @@ def _normalize_learning_speed(learning_speed: float) -> float:
     
     if not _LEARNING_SPEED_STATS['initialized']:
         # Fallback: if not initialized, use raw value capped at reasonable range
-        return float(np.clip(learning_speed / 10.0, 0.0, 2.0))
+        return float(np.clip(learning_speed, 0.0, 2.0))
     
     # Z-score normalization: (x - mean) / std
     std = max(_LEARNING_SPEED_STATS['std'], 1e-6)
@@ -1550,17 +2304,28 @@ def compute_fitness_from_metrics(metrics: EpisodeMetrics, brain: "Optional[Torch
     if metrics.task_success:
         fitness += 1.0
 
-    # TEMPORARY FIX: Learning speed bonus with strong weight
-    # Issue: Adaptability collapsed to 0.002 while LearnSpeed is 1.493
-    # Learning happens but is not rewarded enough in fitness
-    # Fix: Enforce fitness = reward + 2.0 * normalized_learn_speed
+    # Learning speed should only help if it translates into better reward.
+    # Otherwise, fast but harmful plastic updates are selected and avg_reward_delta goes negative.
     normalized_learn_speed = _normalize_learning_speed(metrics.learning_speed)
-    # Keep learning-speed pressure, but only fully reward it when plasticity helps.
-    learn_speed_gate = 1.0 if metrics.adaptability > 0.0 else 0.25
-    fitness += normalized_learn_speed * _TEMPORARY_LEARN_SPEED_WEIGHT * learn_speed_gate
+    instability_penalty = float(max(0.0, metrics.instability))
+    if not metrics.adaptability_measured:
+        # Neutral path: comparison was intentionally skipped, so avoid injecting
+        # either reward or penalty from adaptability-coupled learning-speed terms.
+        pass
+    elif metrics.adaptability > 0.0:
+        # Reward learning speed only when plasticity is helping reward within-lifetime.
+        helpfulness = float(np.clip(metrics.adaptability, 0.0, 1.0))
+        fitness += normalized_learn_speed * (0.8 + 0.7 * helpfulness)
+        fitness += metrics.learning_speed * (0.8 + 1.2 * helpfulness)
+    else:
+        # Penalize "learning" signatures that coincide with non-positive adaptability.
+        fitness -= normalized_learn_speed * 0.8
+        fitness -= max(0.0, metrics.learning_speed) * 0.6
+        fitness -= abs(min(0.0, metrics.adaptability)) * 0.6
+        fitness -= instability_penalty * 0.45
 
-    # Legacy learning speed bonus (kept for backward compatibility, now redundant with temp fix)
-    # fitness += metrics.learning_speed * 0.1
+    # Even helpful plasticity should prefer stable learners over spiky ones.
+    fitness -= instability_penalty * 0.2
 
     # Stability bonus (metrics.stability is a 0-1 consistency score).
     fitness += metrics.stability * 0.2
@@ -1631,6 +2396,7 @@ def evaluate_with_plasticity(
     predator_brain = PredatorPackBrain(predator_genome)
 
     catastrophic_steps = 0
+    final_info: Optional[Dict[str, Any]] = None
 
     for step in range(max_steps):
         # Get actions from genomes
@@ -1646,6 +2412,7 @@ def evaluate_with_plasticity(
         (prey_state, pred_state), r_prey, r_pred, info = arena.step(
             prey_actions, pred_actions
         )
+        final_info = info
 
         # Use rewards directly (no inverted multiplier that destroys signal)
         prey_reward = _to_numpy(r_prey)
@@ -1659,11 +2426,14 @@ def evaluate_with_plasticity(
         prey_reward_ema = (1.0 - ema_alpha) * prey_reward_ema + ema_alpha * prey_r
         pred_reward_ema = (1.0 - ema_alpha) * pred_reward_ema + ema_alpha * pred_r
 
-        prey_signal = float(np.clip(prey_adv, -1.0, 1.0))
-        pred_signal = float(np.clip(pred_adv, -1.0, 1.0))
-        if abs(prey_signal) > 0.02:
+        # Conservative plasticity gate: update on clear positive surprise.
+        # Keep the threshold slightly permissive to avoid learning stalls when
+        # rewards are low-magnitude, while still avoiding noisy micro-updates.
+        prey_signal = float(np.clip(prey_adv, 0.0, 1.0))
+        pred_signal = float(np.clip(pred_adv, 0.0, 1.0))
+        if prey_signal > 0.002:
             prey_genome.brain.update_plasticity(prey_signal, done=False)
-        if abs(pred_signal) > 0.02:
+        if pred_signal > 0.002:
             predator_genome.brain.update_plasticity(pred_signal, done=False)
 
         prey_total_reward += float(np.sum(prey_reward))
@@ -1706,10 +2476,14 @@ def evaluate_with_plasticity(
         if 'mean_plastic_delta' in plastic_diag:
             prey_genome.plastic_diagnostics['mean_final_plastic_delta'] = float(plastic_diag['mean_plastic_delta'])
         prey_genome.plastic_diagnostics['episode_reward_learning_speed'] = float(prey_learning_speed)
+    prey_instability = float(prey_genome.plastic_diagnostics.get('instability', 0.0)) if prey_genome.plastic_diagnostics else 0.0
 
     # Compute metrics
     prey_action_entropy = _action_entropy(prey_action_counts)
     pred_action_entropy = _action_entropy(pred_action_counts)
+
+    prey_energy_cost = _extract_energy_efficiency_cost(final_info, "prey", steps_survived, prey_energy_cost)
+    predator_energy_cost = _extract_energy_efficiency_cost(final_info, "predator", steps_survived, predator_energy_cost)
 
     prey_genome.behavior_stats = {
         'mean_reward': float(np.mean(prey_rewards)) if prey_rewards else 0.0,
@@ -1728,6 +2502,8 @@ def evaluate_with_plasticity(
         'episode_return': float(predator_total_reward),
     }
 
+    success_signals = final_info.get('success_signals', {}) if isinstance(final_info, dict) else {}
+    predator_captures = int(success_signals.get('predator_captures', 0)) if isinstance(success_signals, dict) else 0
     prey_stability = prey_genome.brain.get_stability_diagnostics()
     predator_stability = predator_genome.brain.get_stability_diagnostics()
     prey_saturation_penalty = float(prey_stability.get('avg_saturation_fraction', 0.0)) * 0.5
@@ -1746,6 +2522,7 @@ def evaluate_with_plasticity(
         seed=seed or 0,
         stage=stage_name,
         opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None,
+        instability=prey_instability,
         saturation_penalty=prey_saturation_penalty,
         dead_unit_penalty=prey_dead_unit_penalty
     )
@@ -1759,9 +2536,10 @@ def evaluate_with_plasticity(
         if 'mean_plastic_delta' in plastic_diag:
             predator_genome.plastic_diagnostics['mean_final_plastic_delta'] = float(plastic_diag['mean_plastic_delta'])
         predator_genome.plastic_diagnostics['episode_reward_learning_speed'] = float(predator_learning_speed)
+    predator_instability = float(predator_genome.plastic_diagnostics.get('instability', 0.0)) if predator_genome.plastic_diagnostics else 0.0
 
     predator_metrics = EpisodeMetrics(
-        task_success=predator_total_reward > 0,
+        task_success=(predator_total_reward > 0) or (predator_captures > 0),
         episode_return=predator_total_reward,
         learning_speed=predator_learning_speed,
         stability=_compute_behavioral_stability(predator_rewards),
@@ -1771,6 +2549,7 @@ def evaluate_with_plasticity(
         seed=seed or 0,
         stage=stage_name,
         opponent_id=prey_genome.genome_id if hasattr(prey_genome, 'genome_id') else None,
+        instability=predator_instability,
         saturation_penalty=predator_saturation_penalty,
         dead_unit_penalty=predator_dead_unit_penalty
     )
@@ -1812,6 +2591,7 @@ def evaluate_without_plasticity(
     predator_brain = PredatorPackBrain(predator_genome)
 
     catastrophic_steps = 0
+    final_info: Optional[Dict[str, Any]] = None
 
     for step in range(max_steps):
         # Get actions from genomes (plasticity not updated)
@@ -1824,6 +2604,7 @@ def evaluate_without_plasticity(
         (prey_state, pred_state), r_prey, r_pred, info = arena.step(
             prey_actions, pred_actions
         )
+        final_info = info
 
         # Use rewards directly (no pressure injection multiplier)
         prey_reward = _to_numpy(r_prey)
@@ -1859,11 +2640,16 @@ def evaluate_without_plasticity(
     if hasattr(predator_genome.brain, 'finalize_episode_plastic_norms'):
         predator_genome.brain.finalize_episode_plastic_norms()
 
+    prey_energy_cost = _extract_energy_efficiency_cost(final_info, "prey", steps_survived, prey_energy_cost)
+    predator_energy_cost = _extract_energy_efficiency_cost(final_info, "predator", steps_survived, predator_energy_cost)
+
     # Compute metrics (no learning speed for non-plastic)
     prey_action_entropy = _action_entropy(prey_action_counts)
     pred_action_entropy = _action_entropy(pred_action_counts)
     prey_stability = prey_genome.brain.get_stability_diagnostics()
     predator_stability = predator_genome.brain.get_stability_diagnostics()
+    success_signals = final_info.get('success_signals', {}) if isinstance(final_info, dict) else {}
+    predator_captures = int(success_signals.get('predator_captures', 0)) if isinstance(success_signals, dict) else 0
     prey_saturation_penalty = float(prey_stability.get('avg_saturation_fraction', 0.0)) * 0.5
     prey_dead_unit_penalty = float(prey_stability.get('avg_dead_unit_fraction', 0.0)) * 0.3
     predator_saturation_penalty = float(predator_stability.get('avg_saturation_fraction', 0.0)) * 0.5
@@ -1880,12 +2666,13 @@ def evaluate_without_plasticity(
         seed=seed or 0,
         stage=stage_name,
         opponent_id=predator_genome.genome_id if hasattr(predator_genome, 'genome_id') else None,
+        instability=0.0,
         saturation_penalty=prey_saturation_penalty,
         dead_unit_penalty=prey_dead_unit_penalty
     )
 
     predator_metrics = EpisodeMetrics(
-        task_success=predator_total_reward > 0,
+        task_success=(predator_total_reward > 0) or (predator_captures > 0),
         episode_return=predator_total_reward,
         learning_speed=0.0,
         stability=_compute_behavioral_stability(predator_rewards),
@@ -1895,6 +2682,7 @@ def evaluate_without_plasticity(
         seed=seed or 0,
         stage=stage_name,
         opponent_id=prey_genome.genome_id if hasattr(prey_genome, 'genome_id') else None,
+        instability=0.0,
         saturation_penalty=predator_saturation_penalty,
         dead_unit_penalty=predator_dead_unit_penalty
     )
@@ -1930,8 +2718,26 @@ def log_coevolution_generation(stats: Dict[str, Any]):
     # --- POPULATION STATUS ---
     print(f"\n👥 POPULATION STATUS")
     print(f"  {'─'*86}")
-    print(f"  Prey Population:      {stats['prey_population_size']:4d} agents")
-    print(f"  Predator Population:  {stats['predator_population_size']:4d} agents")
+    print(f"  Prey Population:      {stats['prey_population_size']:4d} agents", end="")
+    if 'prey_species' in stats:
+        prey_num_species = int(stats['prey_species'].get('num_species', 0))
+        print(f"  │  Species: {prey_num_species}", end="")
+    print()
+    print(f"  Predator Population:  {stats['predator_population_size']:4d} agents", end="")
+    if 'predator_species' in stats:
+        predator_num_species = int(stats['predator_species'].get('num_species', 0))
+        predator_size = int(stats['predator_population_size'])
+        if predator_num_species == 1 and predator_size > 1:
+            print(f"  │  Species: {predator_num_species} ⚠️ COLLAPSE!", end="")
+        else:
+            print(f"  │  Species: {predator_num_species}", end="")
+        
+        # Show species breakdown for predators
+        species_sizes = stats['predator_species'].get('species_sizes', [])
+        if species_sizes and len(species_sizes) <= 5:
+            breakdown = ", ".join(str(s) for s in sorted(species_sizes, reverse=True))
+            print(f"  ({breakdown})", end="")
+    print()
     print(f"  Evaluation Time:      {stats['eval_time']:6.2f} seconds")
     
     # --- LEARNING & ADAPTATION ---
@@ -1939,7 +2745,8 @@ def log_coevolution_generation(stats: Dict[str, Any]):
         print(f"\n🧠 LEARNING & ADAPTATION")
         print(f"  {'─'*86}")
         adapt_score = stats['avg_adaptability_score']
-        adapt_indicator = "🟢" if adapt_score > 0.7 else "🟡" if adapt_score > 0.4 else "🔴"
+        # Practical bands tuned to observed project scale (roughly p25~0.14, p75~0.20).
+        adapt_indicator = "🟢" if adapt_score >= 0.20 else "🟡" if adapt_score >= 0.14 else "🔴"
         print(f"  Adaptability Score:   {adapt_score:.3f}  (How quickly agents learn)  {adapt_indicator}")
         print(f"  Meta Effectiveness:   {stats['avg_meta_effectiveness']:.3f}  (Quality of evolution)")
         print(f"  Performance Change:   {stats.get('avg_reward_delta', 0.0):.3f}  (Reward improvement)")
@@ -1950,10 +2757,12 @@ def log_coevolution_generation(stats: Dict[str, Any]):
         print(f"\n⚡ LEARNING MECHANISMS (Weight Modifications)")
         print(f"  {'─'*86}")
         mean_norm = stats['mean_plastic_norm']
-        norm_indicator = "🟢" if 0.1 < mean_norm < 1.0 else "🟡"
-        print(f"  Average Plasticity:   {mean_norm:.4f}  (Average weight change magnitude)  {norm_indicator}")
-        print(f"  Maximum Plasticity:   {stats['max_plastic_norm']:.4f}  (Largest weight change)")
+        norm_indicator = "🟢" if 0.05 < mean_norm < 1.50 else "🟡" if mean_norm >= 0.01 else "🔴"
+        print(f"  Average Plasticity:   {mean_norm:.4f}  (Per-episode cumulative RMS ΔW)  {norm_indicator}")
+        print(f"  Maximum Plasticity:   {stats['max_plastic_norm']:.4f}  (Largest episode cumulative RMS ΔW)")
         print(f"  95th Percentile:      {stats['p95_plastic_norm']:.4f}")
+        if 'mean_plastic_weight_norm' in stats:
+            print(f"  Plastic Weight RMS:   {stats['mean_plastic_weight_norm']:.4f}  (Accumulated plastic state)")
     
     # --- BEHAVIORAL METRICS ---
     if 'avg_energy_cost' in stats:
@@ -1966,7 +2775,8 @@ def log_coevolution_generation(stats: Dict[str, Any]):
         success = stats['avg_success_rate']
         
         energy_indicator = "🟢" if energy < 0.5 else "🟡" if energy < 0.7 else "🔴"
-        speed_indicator = "🟢" if speed > 0.6 else "🟡" if speed > 0.3 else "🔴"
+        # Learning speed is bounded [0,1], but practical early-training values are much smaller.
+        speed_indicator = "🟢" if speed > 0.08 else "🟡" if speed > 0.03 else "🔴"
         stability_indicator = "🟢" if stability > 0.7 else "🟡" if stability > 0.4 else "🔴"
         novelty_indicator = "🟢" if novelty > 0.5 else "🟡"
         success_indicator = "🟢" if success > 0.7 else "🟡" if success > 0.4 else "🔴"
@@ -2411,7 +3221,253 @@ def append_metrics_row(stats: Dict[str, Any], metrics_path: str = "data/metrices
     os.replace(tmp_path, path)
 
 
-def save_coevolution_state(training_state: TrainingState, filename: Optional[str] = None):
+def _serialize_curriculum_controller_state(curriculum_controller: CurriculumController) -> Dict[str, Any]:
+    """Serialize curriculum controller to JSON-safe checkpoint payload."""
+    adapted_thresholds: Dict[str, Dict[str, float]] = {}
+    for stage, thresholds in curriculum_controller.adapted_thresholds.items():
+        stage_name = stage.name if hasattr(stage, "name") else str(stage)
+        adapted_thresholds[stage_name] = {
+            str(k): float(v) for k, v in dict(thresholds).items()
+        }
+
+    transition_history = []
+    for t in curriculum_controller.transition_history[-200:]:
+        transition_history.append(
+            {
+                "from_stage": t.from_stage.name,
+                "to_stage": t.to_stage.name,
+                "reason": t.reason.value,
+                "timestamp": float(t.timestamp),
+                "generation": int(t.generation),
+                "performance_stats": {str(k): float(v) for k, v in dict(t.performance_stats).items()},
+            }
+        )
+
+    current_perf = curriculum_controller.current_performance
+    return {
+        "current_stage": curriculum_controller.current_stage.name,
+        "generation": int(curriculum_controller.generation),
+        "last_transition_generation": int(curriculum_controller.last_transition_generation),
+        "min_generations_per_stage": int(curriculum_controller.min_generations_per_stage),
+        "transition_cooldown_generations": int(curriculum_controller.transition_cooldown_generations),
+        "current_performance": {
+            "generations_in_stage": int(current_perf.generations_in_stage),
+            "best_fitness_achieved": float(current_perf.best_fitness_achieved),
+            "stagnation_count": int(current_perf.stagnation_count),
+            "fitness_history": [float(x) for x in current_perf.fitness_history[-200:]],
+            "diversity_history": [float(x) for x in current_perf.diversity_history[-200:]],
+            "success_rate_history": [float(x) for x in current_perf.success_rate_history[-200:]],
+        },
+        "adapted_thresholds": adapted_thresholds,
+        "transition_history": transition_history,
+    }
+
+
+def _restore_curriculum_controller_state(
+    curriculum_controller: CurriculumController,
+    state: Optional[Dict[str, Any]],
+) -> None:
+    """Restore curriculum controller from a serialized checkpoint payload."""
+    if not state:
+        return
+
+    try:
+        stage_name = str(state.get("current_stage", curriculum_controller.current_stage.name))
+        curriculum_controller.current_stage = CurriculumStage[stage_name]
+    except Exception:
+        pass
+
+    try:
+        curriculum_controller.generation = int(state.get("generation", curriculum_controller.generation))
+    except Exception:
+        pass
+
+    try:
+        curriculum_controller.last_transition_generation = int(
+            state.get("last_transition_generation", curriculum_controller.last_transition_generation)
+        )
+    except Exception:
+        pass
+
+    try:
+        curriculum_controller.min_generations_per_stage = int(
+            state.get("min_generations_per_stage", curriculum_controller.min_generations_per_stage)
+        )
+    except Exception:
+        pass
+
+    try:
+        curriculum_controller.transition_cooldown_generations = int(
+            state.get("transition_cooldown_generations", curriculum_controller.transition_cooldown_generations)
+        )
+    except Exception:
+        pass
+
+    # Restore threshold adaptations
+    adapted_thresholds = state.get("adapted_thresholds", {})
+    if isinstance(adapted_thresholds, dict):
+        for stage_name, thresholds in adapted_thresholds.items():
+            if not isinstance(thresholds, dict):
+                continue
+            try:
+                stage = CurriculumStage[str(stage_name)]
+            except Exception:
+                continue
+            curriculum_controller.adapted_thresholds[stage] = {
+                str(k): float(v) for k, v in thresholds.items()
+            }
+
+    # Restore current stage performance context
+    current_perf = state.get("current_performance", {})
+    if isinstance(current_perf, dict):
+        cp = curriculum_controller.current_performance
+        cp.stage = curriculum_controller.current_stage
+        cp.generations_in_stage = int(current_perf.get("generations_in_stage", cp.generations_in_stage))
+        cp.best_fitness_achieved = float(current_perf.get("best_fitness_achieved", cp.best_fitness_achieved))
+        cp.stagnation_count = int(current_perf.get("stagnation_count", cp.stagnation_count))
+        cp.fitness_history = [float(x) for x in current_perf.get("fitness_history", [])]
+        cp.diversity_history = [float(x) for x in current_perf.get("diversity_history", [])]
+        cp.success_rate_history = [float(x) for x in current_perf.get("success_rate_history", [])]
+
+
+def _serialize_architect_population_state(architect_population: ArchitectPopulation) -> Dict[str, Any]:
+    """Serialize architect meta-population state for checkpointing."""
+    return {
+        "generation": int(getattr(architect_population, "generation", 0)),
+        "meta_fitness_history": [float(x) for x in getattr(architect_population, "meta_fitness_history", [])],
+        "architecture_templates": list(getattr(architect_population, "architecture_templates", [])),
+        "shared_templates": list(getattr(architect_population, "shared_templates", [])),
+    }
+
+
+def _restore_architect_population_state(
+    architect_population: ArchitectPopulation,
+    state: Optional[Dict[str, Any]],
+) -> None:
+    """Restore architect meta-population state from checkpoint payload."""
+    if not isinstance(state, dict):
+        return
+
+    architect_population.generation = int(state.get("generation", getattr(architect_population, "generation", 0)))
+    architect_population.meta_fitness_history = [
+        float(x) for x in state.get("meta_fitness_history", [])
+    ]
+    architect_population.architecture_templates = list(state.get("architecture_templates", []))
+    architect_population.shared_templates = list(state.get("shared_templates", []))
+
+
+def _serialize_mutator_population_state(mutator_population: MutatorPopulation) -> Dict[str, Any]:
+    """Serialize mutator meta-population state for checkpointing."""
+    return {
+        "generation": int(getattr(mutator_population, "generation", 0)),
+        "meta_fitness_history": [float(x) for x in getattr(mutator_population, "meta_fitness_history", [])],
+        "mutation_strategies": list(getattr(mutator_population, "mutation_strategies", [])),
+    }
+
+
+def _restore_mutator_population_state(
+    mutator_population: MutatorPopulation,
+    state: Optional[Dict[str, Any]],
+) -> None:
+    """Restore mutator meta-population state from checkpoint payload."""
+    if not isinstance(state, dict):
+        return
+
+    mutator_population.generation = int(state.get("generation", getattr(mutator_population, "generation", 0)))
+    mutator_population.meta_fitness_history = [
+        float(x) for x in state.get("meta_fitness_history", [])
+    ]
+    mutator_population.mutation_strategies = list(state.get("mutation_strategies", []))
+
+
+def _serialize_engine_runtime_state(engine: EvolutionEngine) -> Dict[str, Any]:
+    """Serialize mutable engine runtime state that is not part of TrainingState genomes."""
+    runtime: Dict[str, Any] = {
+        "last_speciated_generation": int(getattr(engine, "_last_speciated_generation", -1)),
+    }
+
+    speciation_manager = getattr(engine, "speciation_manager", None)
+    if speciation_manager is not None:
+        runtime["speciation"] = {
+            "compatibility_threshold": float(speciation_manager.compatibility_threshold),
+            "next_species_id": int(getattr(speciation_manager, "next_species_id", 0)),
+        }
+
+    novelty_archive = getattr(engine, "novelty_archive", None)
+    if novelty_archive is not None:
+        archive_items = []
+        for emb in novelty_archive.archive:
+            archive_items.append(
+                {
+                    "genome_id": str(getattr(emb, "genome_id", "unknown")),
+                    "fitness": float(getattr(emb, "fitness", 0.0)),
+                    "generation": int(getattr(emb, "generation", 0)),
+                    "embedding": np.asarray(getattr(emb, "embedding", []), dtype=np.float32).tolist(),
+                }
+            )
+        runtime["novelty_archive"] = {
+            "archive": archive_items,
+            "max_size": int(getattr(novelty_archive, "max_size", len(archive_items))),
+            "novelty_threshold": float(getattr(novelty_archive, "novelty_threshold", 0.1)),
+        }
+
+    return runtime
+
+
+def _restore_engine_runtime_state(engine: EvolutionEngine, state: Optional[Dict[str, Any]]) -> None:
+    """Restore mutable engine runtime state from checkpoint payload."""
+    if not isinstance(state, dict):
+        return
+
+    engine._last_speciated_generation = int(state.get("last_speciated_generation", -1))
+
+    speciation = state.get("speciation")
+    speciation_manager = getattr(engine, "speciation_manager", None)
+    if isinstance(speciation, dict) and speciation_manager is not None:
+        if "compatibility_threshold" in speciation:
+            speciation_manager.compatibility_threshold = float(speciation["compatibility_threshold"])
+        if "next_species_id" in speciation:
+            speciation_manager.next_species_id = int(speciation["next_species_id"])
+
+    novelty_archive_state = state.get("novelty_archive")
+    novelty_archive = getattr(engine, "novelty_archive", None)
+    if isinstance(novelty_archive_state, dict) and novelty_archive is not None:
+        archive_items = novelty_archive_state.get("archive", [])
+        restored_archive: List[BehaviorEmbedding] = []
+        for item in archive_items:
+            if not isinstance(item, dict):
+                continue
+            vec = np.asarray(item.get("embedding", []), dtype=np.float32)
+            if vec.size == 0:
+                continue
+            restored_archive.append(
+                BehaviorEmbedding(
+                    genome_id=str(item.get("genome_id", "unknown")),
+                    fitness=float(item.get("fitness", 0.0)),
+                    embedding=vec,
+                    generation=int(item.get("generation", 0)),
+                    genome=None,
+                )
+            )
+
+        max_size = int(novelty_archive_state.get("max_size", novelty_archive.max_size))
+        novelty_archive.max_size = max(1, max_size)
+        novelty_archive.novelty_threshold = float(
+            novelty_archive_state.get("novelty_threshold", novelty_archive.novelty_threshold)
+        )
+        novelty_archive.archive = restored_archive[-novelty_archive.max_size:]
+
+
+def save_coevolution_state(
+    training_state: TrainingState,
+    filename: Optional[str] = None,
+    curriculum_controller: Optional[CurriculumController] = None,
+    architect_population: Optional[ArchitectPopulation] = None,
+    mutator_population: Optional[MutatorPopulation] = None,
+    prey_engine: Optional[EvolutionEngine] = None,
+    predator_engine: Optional[EvolutionEngine] = None,
+    loop_runtime_state: Optional[Dict[str, Any]] = None,
+):
     """Save complete co-evolution training state to split files."""
     from diagnostics.strategy_clustering import StrategyClusteringLogger
     from diagnostics.reward_recovery import RewardRecoveryLogger
@@ -2482,6 +3538,45 @@ def save_coevolution_state(training_state: TrainingState, filename: Optional[str
             'recovery_records': [list(r) for r in RewardRecoveryLogger.recovery_records],
         },
     }
+
+    if curriculum_controller is not None:
+        state['curriculum_controller_state'] = _serialize_curriculum_controller_state(curriculum_controller)
+    elif training_state.curriculum_state is not None:
+        state['curriculum_controller_state'] = training_state.curriculum_state
+
+    if architect_population is not None or mutator_population is not None:
+        state['meta_evolution_state'] = {
+            'architect_population': (
+                _serialize_architect_population_state(architect_population)
+                if architect_population is not None
+                else None
+            ),
+            'mutator_population': (
+                _serialize_mutator_population_state(mutator_population)
+                if mutator_population is not None
+                else None
+            ),
+        }
+    elif training_state.meta_evolution_state is not None:
+        state['meta_evolution_state'] = training_state.meta_evolution_state
+
+    if prey_engine is not None or predator_engine is not None:
+        state['engine_runtime_state'] = {
+            'prey_engine': _serialize_engine_runtime_state(prey_engine) if prey_engine is not None else None,
+            'predator_engine': _serialize_engine_runtime_state(predator_engine) if predator_engine is not None else None,
+        }
+    elif training_state.engine_runtime_state is not None:
+        state['engine_runtime_state'] = training_state.engine_runtime_state
+
+    if loop_runtime_state is not None:
+        _last_combined_best_raw = loop_runtime_state.get('last_combined_best')
+        _last_combined_best = None if _last_combined_best_raw is None else float(_last_combined_best_raw)
+        state['loop_runtime_state'] = {
+            'stagnation_generations': int(loop_runtime_state.get('stagnation_generations', 0)),
+            'last_combined_best': _last_combined_best,
+        }
+    elif training_state.loop_runtime_state is not None:
+        state['loop_runtime_state'] = training_state.loop_runtime_state
 
     # Save prey population
     state['prey_population'] = []
@@ -2556,13 +3651,20 @@ def save_coevolution_state(training_state: TrainingState, filename: Optional[str
     experiment_state = {k: v for k, v in state.items() if k != 'config'}
     _write_json_atomic(split_paths["experiment"], experiment_state)
 
-    print(f"\n💾 SAVING TRAINING STATE")
-    print(f"   ✅ Config saved: {split_paths['config']}")
-    print(f"   ✅ Metrics saved: {split_paths['metrics']}")
-    print(f"   ✅ Experiment state saved: {split_paths['experiment']}")
-    print(f"   📊 Generation: {training_state.generation} | Populations: {len(training_state.prey_population)} prey + {len(training_state.predator_population)} predators")
-    print(f"   🏆 Hall of Fame: {len(training_state.prey_hall_of_fame)} best prey + {len(training_state.predator_hall_of_fame)} best predators")
-    print(f"   💾 Preserved: Lineage info, mutation history, learning parameters\n")
+    print("\n💾 CHECKPOINT SAVE")
+    print(f"  {'─'*86}")
+    print(f"  ✅ Config:            {split_paths['config']}")
+    print(f"  ✅ Metrics:           {split_paths['metrics']}")
+    print(f"  ✅ Experiment State:  {split_paths['experiment']}")
+    print(
+        f"  📊 Generation {training_state.generation} | "
+        f"Populations: prey={len(training_state.prey_population)}, predator={len(training_state.predator_population)}"
+    )
+    print(
+        f"  🏆 Hall of Fame: prey={len(training_state.prey_hall_of_fame)}, "
+        f"predator={len(training_state.predator_hall_of_fame)}"
+    )
+    print("  💾 Preserved: lineage, mutation history, learning parameters\n")
 
 def load_coevolution_state(filename: Optional[str] = None) -> TrainingState:
     """Load co-evolution training state from split files by default."""
@@ -2637,6 +3739,10 @@ def load_coevolution_state(filename: Optional[str] = None) -> TrainingState:
     training_state.best_prey_fitness_history = state.get('best_prey_fitness_history', [])
     training_state.best_predator_fitness_history = state.get('best_predator_fitness_history', [])
     training_state.generation_stats = state.get('generation_stats', [])
+    training_state.curriculum_state = state.get('curriculum_controller_state')
+    training_state.meta_evolution_state = state.get('meta_evolution_state')
+    training_state.engine_runtime_state = state.get('engine_runtime_state')
+    training_state.loop_runtime_state = state.get('loop_runtime_state')
     training_state.generalization_reports = []
     for r in state.get('generalization_reports', []):
         if isinstance(r, GeneralizationReport):
@@ -2681,18 +3787,23 @@ def load_coevolution_state(filename: Optional[str] = None) -> TrainingState:
             tuple(r) for r in d.get('recovery_records', [])
         ]
 
+    print("\n📂 CHECKPOINT LOAD")
+    print(f"  {'─'*86}")
     if config_file.exists() and experiment_file.exists():
-        print(f"✅ Co-evolution state loaded from split files:")
-        print(f"   - {config_file}")
-        print(f"   - {experiment_file}")
+        print("  ✅ Loaded split checkpoint files")
+        print(f"  • {config_file}")
+        print(f"  • {experiment_file}")
     else:
-        print(f"✅ Co-evolution state loaded from: {legacy_file}")
-    print(f"   📍 Resuming from Generation: {training_state.generation}")
-    print(f"   👥 Loaded {len(training_state.prey_population)} prey agents and {len(training_state.predator_population)} predators")
+        print(f"  ✅ Loaded legacy checkpoint: {legacy_file}")
+    print(f"  📍 Resume Generation: {training_state.generation}")
+    print(
+        f"  👥 Populations: prey={len(training_state.prey_population)}, "
+        f"predator={len(training_state.predator_population)}"
+    )
     
     return training_state
 
-async def main_coevolution_async():
+async def main_coevolution_async(runtime_overrides: Optional[RuntimeOverrides] = None):
     """Main async co-evolution training loop with adaptive curriculum"""
     # Configure logging for immediate visibility
     logging.basicConfig(
@@ -2703,11 +3814,9 @@ async def main_coevolution_async():
         ]
     )
 
-    print("\n" + "="*90)
-    print("🧬 EVOLUTIONARY AI TRAINING SYSTEM")
-    print("="*90)
-    print("Co-Evolution Training with Adaptive Curriculum & Plasticity")
-    print("="*90 + "\n")
+    print("\n🧬 EVOLUTIONARY AI TRAINING SYSTEM")
+    print(f"  {'─'*86}")
+    print("  Co-evolution training with adaptive curriculum and plasticity\n")
 
     # Add watchdog thread (critical)
     # def watchdog():
@@ -2724,28 +3833,31 @@ async def main_coevolution_async():
     # Example (PowerShell):
     #   $env:MAX_GENERATIONS=1; $env:AUTO_LOAD_COEVOLUTION_STATE='n'; python main.py
     max_gens_env = os.getenv("MAX_GENERATIONS")
+    env_runtime_overrides: Optional[RuntimeOverrides] = None
     if max_gens_env:
         try:
-            config.generations = int(max_gens_env)
+            env_runtime_overrides = RuntimeOverrides(generations=int(max_gens_env))
         except ValueError:
             pass
+    runtime_overrides = _merge_runtime_overrides(runtime_overrides, env_runtime_overrides)
 
     # Initialize training state
     training_state = TrainingState(config=config)
 
     # Initialize populations
-    print("\n📝 Creating initial agent populations...")
-    print(f"   🎯 Generating {config.population_size} prey agents...")
+    print("\n📝 POPULATION INITIALIZATION")
+    print(f"  {'─'*86}")
+    print(f"  🎯 Generating prey agents: {config.population_size}")
     training_state.prey_population = [
         PreyGenome.random_initialization()
         for _ in range(config.population_size)
     ]
-    print(f"   🎯 Generating {config.predator_population_size} predator agents...")
+    print(f"  🎯 Generating predator agents: {config.predator_population_size}")
     training_state.predator_population = [
         PredatorGenome.random_initialization()
         for _ in range(config.predator_population_size)
     ]
-    print(f"   ✅ Total {len(training_state.prey_population) + len(training_state.predator_population)} agents initialized\n")
+    print(f"  ✅ Total initialized: {len(training_state.prey_population) + len(training_state.predator_population)} agents\n")
 
     # Initialize curriculum controller
     curriculum_controller = CurriculumController()
@@ -2763,6 +3875,7 @@ async def main_coevolution_async():
 
     # Load checkpoint if split files exist
     split_checkpoint_exists = os.path.exists("data/config.json") and os.path.exists("data/expirement_state.json")
+    loaded_checkpoint = False
     if split_checkpoint_exists:
         response = os.getenv("AUTO_LOAD_COEVOLUTION_STATE")
         if response is None:
@@ -2778,14 +3891,60 @@ async def main_coevolution_async():
                 if response in ('y', 'n', 'yes', 'no'):
                     response = response[0]  # normalise to 'y' or 'n'
                     break
-                print(f"   Invalid input '{response}'. Please enter 'y' or 'n'.")
+                print(f"  Invalid input '{response}'. Please enter 'y' or 'n'.")
         if response.lower().startswith('y'):
             try:
                 training_state = load_coevolution_state()
+                loaded_checkpoint = True
+                # Keep runtime config alias consistent with restored checkpoint config.
+                config = training_state.config
                 evaluator.load_seeds("data/seed_registry.json")
+                _restore_curriculum_controller_state(curriculum_controller, training_state.curriculum_state)
+                print(
+                    f"🧭 Curriculum restored | stage={curriculum_controller.current_stage.name}, "
+                    f"controller_gen={curriculum_controller.generation}"
+                )
             except (FileNotFoundError, ValueError) as exc:
-                print(f"⚠️ Skipping checkpoint load: {exc}")
-                print("   Starting from a fresh training state instead.")
+                print(f"⚠️  Checkpoint load skipped: {exc}")
+                print("  Starting from a fresh training state instead.")
+
+    if not loaded_checkpoint:
+        # Discard the speculative fresh populations created before runtime overrides were resolved.
+        training_state.prey_population = []
+        training_state.predator_population = []
+
+    # Re-apply runtime overrides after any restore so CLI values remain authoritative.
+    config = training_state.config
+    applied_runtime_overrides = _initialize_or_resize_populations(training_state, runtime_overrides)
+    config = training_state.config
+
+    if applied_runtime_overrides:
+        print(f"⚙️  Runtime overrides applied: {', '.join(applied_runtime_overrides)}")
+
+    print("\n👥 POPULATION READINESS")
+    print(f"  {'─'*86}")
+    print(f"  Prey Population:      {len(training_state.prey_population)}")
+    print(f"  Predator Population:  {len(training_state.predator_population)}")
+    print(
+        f"  Seed {config.base_seed} | Generation cap {config.generations} | "
+        f"Total agents {len(training_state.prey_population) + len(training_state.predator_population)}\n"
+    )
+
+    # Rebuild evaluator from the final resolved config so seed and generation overrides stick.
+    evaluator.close()
+    requested_device = os.getenv("EVOMIND_DEVICE", "auto").strip().lower()
+    use_gpu = torch.cuda.is_available() and requested_device in ("auto", "cuda")
+    evaluator = AsyncDeterministicEvaluator(
+        base_seed=config.base_seed,
+        num_workers=config.num_workers,
+        use_gpu=use_gpu,
+        envs_per_genome=config.envs_per_genome,
+        max_steps=config.max_steps
+    )
+    if loaded_checkpoint and not (runtime_overrides and runtime_overrides.has_seed_override()):
+        evaluator.load_seeds("data/seed_registry.json")
+    elif loaded_checkpoint and runtime_overrides and runtime_overrides.has_seed_override():
+        print("⚙️  Seed registry load skipped: runtime seed override is active")
 
     # Initialize meta-evolution populations
     architect_population = ArchitectPopulation(population_size=20)
@@ -2850,6 +4009,33 @@ async def main_coevolution_async():
         mutator_population=mutator_population,
     )
 
+    # Restore additional resume state for continuity across restarts.
+    if training_state.meta_evolution_state:
+        _restore_architect_population_state(
+            architect_population,
+            training_state.meta_evolution_state.get('architect_population')
+            if isinstance(training_state.meta_evolution_state, dict)
+            else None,
+        )
+        _restore_mutator_population_state(
+            mutator_population,
+            training_state.meta_evolution_state.get('mutator_population')
+            if isinstance(training_state.meta_evolution_state, dict)
+            else None,
+        )
+        print(
+            f"[Meta] Restored architect_gen={architect_population.generation}, "
+            f"mutator_gen={mutator_population.generation}"
+        )
+
+    if training_state.engine_runtime_state and isinstance(training_state.engine_runtime_state, dict):
+        _restore_engine_runtime_state(prey_engine, training_state.engine_runtime_state.get('prey_engine'))
+        _restore_engine_runtime_state(predator_engine, training_state.engine_runtime_state.get('predator_engine'))
+        print(
+            f"[Engine] Restored thresholds: prey={prey_engine.get_speciation_threshold():.4f}, "
+            f"predator={predator_engine.get_speciation_threshold():.4f}"
+        )
+
 
     # Initialize meta-scientist systems
     meta_scientist = MetaScientist()
@@ -2857,8 +4043,9 @@ async def main_coevolution_async():
     diagnostic_task_generator = DiagnosticTaskGenerator()
 
     def evolve_all_populations(gen: int) -> None:
-        print(f"\n🧬 EVOLVING POPULATIONS for Generation {gen}")
-        print(f"   Applying mutations and crossover...")
+        print(f"\n🧬 EVOLUTION PHASE - GENERATION {gen:04d}")
+        print(f"  {'─'*86}")
+        print("  Applying mutations and crossover for prey + predator populations...")
 
         if prey_engine:
             start = time.time()
@@ -2866,7 +4053,7 @@ async def main_coevolution_async():
                 training_state.prey_population, gen, pop_name="prey"
             )
             if time.time() - start > 30:
-                print("   ⚠️  Evolution step is taking longer than expected")
+                print("  ⚠️  Prey evolution step is taking longer than expected")
             training_state.prey_population = prey_population.genomes
 
         if predator_engine:
@@ -2875,15 +4062,21 @@ async def main_coevolution_async():
                 training_state.predator_population, gen, pop_name="predator"
             )
             if time.time() - start > 30:
-                print("   ⚠️  Evolution step is taking longer than expected")
+                print("  ⚠️  Predator evolution step is taking longer than expected")
             training_state.predator_population = predator_population.genomes
 
-        print(f"   ✅ Evolution complete - new generation created")
+        print("  ✅ Evolution complete - new generation created")
 
     # Training loop
     MAX_GEN_TIME = 300  # Maximum time per generation in seconds
-    stagnation_generations = 0
-    last_combined_best = None
+    restored_loop_state = training_state.loop_runtime_state if isinstance(training_state.loop_runtime_state, dict) else {}
+    stagnation_generations = int(restored_loop_state.get('stagnation_generations', 0))
+    last_combined_best = restored_loop_state.get('last_combined_best')
+    if last_combined_best is not None:
+        try:
+            last_combined_best = float(last_combined_best)
+        except Exception:
+            last_combined_best = None
     stagnation_epsilon = 1e-3
     for generation in range(training_state.generation, config.generations):
         gen_start = time.time()
@@ -2916,39 +4109,42 @@ async def main_coevolution_async():
         )
         training_state.generation_stats.append(stats)
         append_metrics_row(stats)  # Write this generation's metrics immediately
-        print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
+        _log_heartbeat(generation)
 
-        # Stability guardrail: damp mutation pressure when behavior/plasticity are unstable.
+        # Stability guardrail: preserve exploration while easing selection pressure on instability.
         avg_instability = float(stats.get('avg_instability', 0.0))
-        avg_stability = float(stats.get('avg_stability', 0.5))
-        if avg_instability > 0.45 or avg_stability < 0.25:
-            config.mutation_rate = max(config.mutation_rate * 0.9, 0.0005)
-            config.architecture_mutation_rate = max(config.architecture_mutation_rate * 0.9, 0.02)
-            config.mutation_strength = max(config.mutation_strength * 0.9, 0.03)
+        if avg_instability > 0.6:
+            prey_selection_pressure = None
+            predator_selection_pressure = None
 
-            if prey_engine:
-                prey_engine.mutation_rate = config.mutation_rate
-                prey_engine.architecture_mutation_rate = config.architecture_mutation_rate
-                prey_engine.mutation_strength = config.mutation_strength
-            if predator_engine:
-                predator_engine.mutation_rate = config.mutation_rate
-                predator_engine.architecture_mutation_rate = config.architecture_mutation_rate
-                predator_engine.mutation_strength = config.mutation_strength
+            if prey_engine and hasattr(prey_engine, 'reduce_selection_pressure'):
+                prey_selection_pressure = prey_engine.reduce_selection_pressure(factor=0.9, min_pressure=0.5)
+            if predator_engine and hasattr(predator_engine, 'reduce_selection_pressure'):
+                predator_selection_pressure = predator_engine.reduce_selection_pressure(factor=0.9, min_pressure=0.5)
 
             print(
-                f"[StabilityGuard] High instability ({avg_instability:.3f}) / low stability ({avg_stability:.3f}) "
-                f"-> mutation_rate={config.mutation_rate:.4f}, arch_rate={config.architecture_mutation_rate:.4f}, "
-                f"mutation_strength={config.mutation_strength:.4f}"
+                f"⚖️  Stability Guard: high instability={avg_instability:.3f} | "
+                f"selection pressure reduced (prey={prey_selection_pressure}, predator={predator_selection_pressure}) | "
+                f"mutation_rate={config.mutation_rate:.4f}, mutation_strength={config.mutation_strength:.4f}"
             )
 
         skip_diagnostics = False
         gen_elapsed = time.time() - gen_start
         if gen_elapsed > MAX_GEN_TIME:
-            print(f"[WARN] Generation exceeded MAX_GEN_TIME ({MAX_GEN_TIME}s) at {gen_elapsed:.1f}s — skipping diagnostics")
+            print(
+                f"⚠️  Diagnostics Skipped: generation time {gen_elapsed:.1f}s exceeded limit {MAX_GEN_TIME}s"
+            )
             skip_diagnostics = True
 
         # Update hall of fame
         training_state.update_hall_of_fame()
+        save_best_agents(
+            training_state=training_state,
+            generation=generation,
+            prey_engine=prey_engine,
+            predator_engine=predator_engine,
+            models_dir="models",
+        )
 
         # Meta-stagnation: if no improvement for several generations, boost exploration
         if training_state.best_prey_fitness_history and training_state.best_predator_fitness_history:
@@ -2965,26 +4161,55 @@ async def main_coevolution_async():
                 stagnation_generations = 0
 
             if stagnation_generations > 5:
-                old_mutation_rate = config.mutation_rate
-                old_arch_rate = config.architecture_mutation_rate
-                # Keep exploration increases bounded to avoid destabilizing behavior.
-                config.mutation_rate = min(config.mutation_rate * 1.1, 0.02)
-                config.architecture_mutation_rate = min(config.architecture_mutation_rate * 1.1, 0.08)
+                prey_species_now = int(stats.get('prey_species', {}).get('num_species', 0))
+                predator_species_now = int(stats.get('predator_species', {}).get('num_species', 0))
+                total_species_now = prey_species_now + predator_species_now
+                avg_instability_now = float(stats.get('avg_instability', 0.0))
+                dead_units_now = int(stats.get('neural_health', {}).get('dead_layers', 0))
 
-                if prey_engine:
-                    prey_engine.mutation_rate = config.mutation_rate
-                    prey_engine.architecture_mutation_rate = config.architecture_mutation_rate
-                if predator_engine:
-                    predator_engine.mutation_rate = config.mutation_rate
-                    predator_engine.architecture_mutation_rate = config.architecture_mutation_rate
+                # If the system is already fragmented or unstable, do not answer
+                # stagnation by blindly increasing mutation. That worsens species
+                # spread, dead units, and architecture chaos.
+                if avg_instability_now > 0.16 or total_species_now > 20 or dead_units_now > 20:
+                    old_mutation_rate = config.mutation_rate
+                    old_arch_rate = config.architecture_mutation_rate
+                    config.mutation_rate = max(config.mutation_rate * 0.95, 0.08)
+                    config.architecture_mutation_rate = max(config.architecture_mutation_rate * 0.95, 0.03)
 
-                print(
-                    "Meta-Scientist: Stagnation > 5 generations. "
-                    f"Increasing mutation rate {old_mutation_rate:.4f} -> {config.mutation_rate:.4f} "
-                    f"and architecture mutation {old_arch_rate:.4f} -> {config.architecture_mutation_rate:.4f}"
-                )
+                    if prey_engine:
+                        prey_engine.mutation_rate = config.mutation_rate
+                        prey_engine.architecture_mutation_rate = config.architecture_mutation_rate
+                    if predator_engine:
+                        predator_engine.mutation_rate = config.mutation_rate
+                        predator_engine.architecture_mutation_rate = config.architecture_mutation_rate
 
-                stagnation_generations = 0
+                    print(
+                        "🧪 Meta-scientist: stagnation under high instability/diversity. "
+                        f"Reducing mutation rate {old_mutation_rate:.4f} -> {config.mutation_rate:.4f} "
+                        f"and architecture mutation {old_arch_rate:.4f} -> {config.architecture_mutation_rate:.4f}"
+                    )
+                    stagnation_generations = 0
+                else:
+                    old_mutation_rate = config.mutation_rate
+                    old_arch_rate = config.architecture_mutation_rate
+                    # Keep exploration increases bounded to avoid destabilizing behavior.
+                    config.mutation_rate = min(config.mutation_rate * 1.1, 0.3)
+                    config.architecture_mutation_rate = min(config.architecture_mutation_rate * 1.1, 0.08)
+
+                    if prey_engine:
+                        prey_engine.mutation_rate = config.mutation_rate
+                        prey_engine.architecture_mutation_rate = config.architecture_mutation_rate
+                    if predator_engine:
+                        predator_engine.mutation_rate = config.mutation_rate
+                        predator_engine.architecture_mutation_rate = config.architecture_mutation_rate
+
+                    print(
+                        "🧪 Meta-scientist: stagnation > 5 generations. "
+                        f"Increasing mutation rate {old_mutation_rate:.4f} -> {config.mutation_rate:.4f} "
+                        f"and architecture mutation {old_arch_rate:.4f} -> {config.architecture_mutation_rate:.4f}"
+                    )
+
+                    stagnation_generations = 0
 
         # Compute diversity score from population
         from core.population import Population
@@ -2995,6 +4220,7 @@ async def main_coevolution_async():
         # Compute success rate (fraction of positive fitness scores)
         all_fitnesses = [g.fitness for g in training_state.prey_population + training_state.predator_population]
         success_rate = float(np.mean([1.0 if f > 0 else 0.0 for f in all_fitnesses])) if all_fitnesses else 0.0
+        success_rate = float(stats.get('avg_success_rate', success_rate))
 
         # Update curriculum controller with performance metrics
         if all_fitnesses:
@@ -3020,13 +4246,24 @@ async def main_coevolution_async():
             recent_predator = training_state.best_predator_fitness_history[-50:]
 
             if max(recent_prey) - min(recent_prey) < 0.1:
-                print("Prey stagnation detected - adjusting mutation...")
-                config.mutation_rate = min(config.mutation_rate * 1.25, 0.02)
+                print("📉 Prey stagnation detected: adjusting mutation parameters")
+                config.mutation_rate = min(config.mutation_rate * 1.25, 0.3)
                 config.architecture_mutation_rate = min(config.architecture_mutation_rate * 1.25, 0.08)
 
             if max(recent_predator) - min(recent_predator) < 0.1:
-                print("Predator stagnation detected - adjusting mutation...")
-                config.mutation_strength = min(config.mutation_strength * 1.1, 0.15)
+                print("📉 Predator stagnation detected: adjusting mutation strength")
+                config.mutation_strength = min(config.mutation_strength * 1.1, 0.4)
+
+        # Critical floor guardrail: never allow mutation exploration to collapse.
+        config.mutation_rate = max(0.1, float(config.mutation_rate))
+        config.mutation_strength = max(0.15, float(config.mutation_strength))
+
+        if prey_engine:
+            prey_engine.mutation_rate = config.mutation_rate
+            prey_engine.mutation_strength = config.mutation_strength
+        if predator_engine:
+            predator_engine.mutation_rate = config.mutation_rate
+            predator_engine.mutation_strength = config.mutation_strength
 
         # Log meta-gene entropy on the evaluated (pre-evolution) population so the data
         # is available immediately when diagnostics/plots are generated this same generation.
@@ -3036,7 +4273,18 @@ async def main_coevolution_async():
         # Must run before evolve_all_populations() — after evolution all genomes reset to fitness=0.0
         top_prey_genome = None
         if not skip_diagnostics and config.plot_every > 0 and generation % config.plot_every == 0:
-            save_coevolution_state(training_state)
+            save_coevolution_state(
+                training_state,
+                curriculum_controller=curriculum_controller,
+                architect_population=architect_population,
+                mutator_population=mutator_population,
+                prey_engine=prey_engine,
+                predator_engine=predator_engine,
+                loop_runtime_state={
+                    'stagnation_generations': stagnation_generations,
+                    'last_combined_best': last_combined_best,
+                },
+            )
             evaluator.save_seeds()
             plot_meta_gene_histograms(stats)
             plot_plastic_norm_evolution(training_state.generation_stats)
@@ -3080,19 +4328,19 @@ async def main_coevolution_async():
                 filename=f"diagnostics/strategy_clustering_trends_gen{generation:04d}.png"
             )
 
-        print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
+        _log_heartbeat(generation)
 
         # Evolve populations (single controller)
-        print("Evolving populations...")
+        print("\n🔁 Running population evolution step...")
         evolve_all_populations(generation)
 
-        print(f"[Heartbeat] Gen {generation} still alive at {time.time()}")
+        _log_heartbeat(generation)
 
         # Milestone 7: Run integrated meta-scientist experiments
 
         # Reduced frequency: every 10 generations instead of 20, skip after gen 300
         if generation % 10 == 0 and generation <= 300:
-            print("Running integrated meta-scientist experiments...")
+            print("\n🧪 Meta-scientist: running integrated experiments")
             
             # Analyze population failures and generate hypotheses
             combined_population = cast(List[EvolvableGenome], training_state.prey_population + training_state.predator_population)
@@ -3144,7 +4392,7 @@ async def main_coevolution_async():
                         threshold = population_stats['mean'] * 0.5
                         if worst_stage.fitness < threshold:
                             print(
-                                f"[Curriculum] Diagnostic focus: {stage_name_candidate} "
+                                f"🧭 Curriculum diagnostic focus: {stage_name_candidate} "
                                 f"(fitness {worst_stage.fitness:.2f} < {threshold:.2f})"
                             )
                             curriculum_controller.reset_to_stage(CurriculumStage[stage_name_candidate])
@@ -3211,7 +4459,7 @@ async def main_coevolution_async():
                     len(interventions.get('species_rebalances', []))
                 )
                 if total_interventions > 0:
-                    print(f"Meta-Scientist NeuroGenesis: Applied {total_interventions} specialized interventions")
+                    print(f"🧠 NeuroGenesis: applied {total_interventions} specialized interventions")
 
             # Apply meta-optimizer changes to evolution engines
             if experiment_results:
@@ -3257,45 +4505,58 @@ async def main_coevolution_async():
                 training_state.experiment_reports.append(exp_report)
 
             # Log experiment results
-            print(f"Meta-scientist experiments completed for generation {generation}:")
+            print(f"🧪 Meta-scientist completed (generation {generation})")
             for exp in experiment_results:
                 hypothesis = exp.get('hypothesis', 'unknown')[:50]
                 result = exp.get('result', {}).get('hypothesis_supported', False)
-                print(f"  {hypothesis}... -> {'SUPPORTED' if result else 'NOT SUPPORTED'}")
+                print(f"  • {hypothesis}... -> {'SUPPORTED' if result else 'NOT SUPPORTED'}")
         else:
-            print(f"Meta-scientist: Skipped (gen {generation} > 300 or not multiple of 10)")
+            print(f"🧪 Meta-scientist: skipped (generation {generation} not scheduled)")
 
 
 
         training_state.generation += 1
 
     # Final save
-    save_coevolution_state(training_state, "data/final_coevolution_state.json")
+    save_coevolution_state(
+        training_state,
+        "data/final_coevolution_state.json",
+        curriculum_controller=curriculum_controller,
+        architect_population=architect_population,
+        mutator_population=mutator_population,
+        prey_engine=prey_engine,
+        predator_engine=predator_engine,
+        loop_runtime_state={
+            'stagnation_generations': stagnation_generations,
+            'last_combined_best': last_combined_best,
+        },
+    )
     evaluator.save_seeds("data/final_seed_registry.json")
 
     # Close evaluator
     evaluator.close()
 
-    print("\nCo-evolution training completed!")
+    print("\n✅ CO-EVOLUTION TRAINING COMPLETED")
+    print(f"  {'─'*86}")
     if training_state.best_prey_fitness_history:
-        print(f"Best prey fitness: {max(training_state.best_prey_fitness_history):.2f}")
+        print(f"  Best Prey Fitness:      {max(training_state.best_prey_fitness_history):.2f}")
     else:
-        print("Best prey fitness: n/a")
+        print("  Best Prey Fitness:      n/a")
     if training_state.best_predator_fitness_history:
-        print(f"Best predator fitness: {max(training_state.best_predator_fitness_history):.2f}")
+        print(f"  Best Predator Fitness:  {max(training_state.best_predator_fitness_history):.2f}")
     else:
-        print("Best predator fitness: n/a")
-    print(f"Final curriculum stage: {curriculum_controller.get_current_config()['name']}")
+        print("  Best Predator Fitness:  n/a")
+    print(f"  Final Curriculum Stage: {curriculum_controller.get_current_config()['name']}")
 
 async def main_async():
     """Placeholder for single-agent async training"""
-    print("Single-agent async training not implemented in this version")
-    print("Use --evolution-type multi for co-evolution")
+    print("ℹ️  Single-agent async training is not implemented in this version")
+    print("   Use --evolution-type multi for co-evolution")
 
 def main():
     """Placeholder for single-agent sync training"""
-    print("Single-agent sync training not implemented in this version")
-    print("Use --evolution-type multi for co-evolution")
+    print("ℹ️  Single-agent sync training is not implemented in this version")
+    print("   Use --evolution-type multi for co-evolution")
 
 
 def launch_live_dashboard(
@@ -3310,7 +4571,7 @@ def launch_live_dashboard(
     workspace_root = Path(__file__).resolve().parent
     dashboard_script = workspace_root / "live_metrics_dashboard.py"
     if not dashboard_script.exists():
-        print(f"[Dashboard] Skipped: missing script at {dashboard_script}")
+        print(f"📈 Dashboard skipped: missing script at {dashboard_script}")
         return None
 
     cmd = [
@@ -3332,10 +4593,10 @@ def launch_live_dashboard(
             cwd=str(workspace_root),
             creationflags=creationflags,
         )
-        print(f"[Dashboard] Started at http://127.0.0.1:{port}")
+        print(f"📈 Dashboard started: http://127.0.0.1:{port}")
         return proc
     except Exception as exc:
-        print(f"[Dashboard] Failed to start: {exc}")
+        print(f"📈 Dashboard failed to start: {exc}")
         return None
 
 if __name__ == "__main__":
@@ -3346,13 +4607,13 @@ if __name__ == "__main__":
                        help="Training mode (async, sync, or coevolution)")
     parser.add_argument("--evolution-type", choices=["single", "multi"], default="multi",
                        help="Evolution type (single-agent or multi-agent)")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=None,
                        help="Random seed for determinism")
-    parser.add_argument("--population", type=int, default=100,
+    parser.add_argument("--population", type=int, default=None,
                        help="Prey population size")
-    parser.add_argument("--predator-population", type=int, default=80,
+    parser.add_argument("--predator-population", type=int, default=None,
                        help="Predator population size")
-    parser.add_argument("--generations", type=int, default=1000,
+    parser.add_argument("--generations", type=int, default=None,
                        help="Number of generations")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "dml"], default="auto",
                        help="Torch device preference (auto, cpu, cuda, dml)")
@@ -3375,14 +4636,14 @@ if __name__ == "__main__":
     else:
         selected_runtime_device = args.device
     print(
-        f"[Device] requested={args.device} "
+        f"🖥️  Device: requested={args.device} "
         f"torch={torch.__version__} "
         f"torch.cuda={torch.version.cuda} "
         f"cuda_available={cuda_available} "
         f"dml_available={dml_available}"
     )
     if cuda_available:
-        print(f"[Device] gpu={torch.cuda.get_device_name(0)}")
+        print(f"🖥️  GPU: {torch.cuda.get_device_name(0)}")
     elif args.device == "cuda":
         raise RuntimeError(
             "CUDA was requested but is unavailable in this Python environment. "
@@ -3396,15 +4657,14 @@ if __name__ == "__main__":
         )
     else:
         print(
-            f"[Device] Running with runtime device preference: {selected_runtime_device}"
+            f"🖥️  Runtime device preference: {selected_runtime_device}"
         )
     
-    # Update configuration using dataclass
-    config = EvolutionConfig(
+    runtime_overrides = RuntimeOverrides(
         base_seed=args.seed,
         population_size=args.population,
         predator_population_size=args.predator_population,
-        generations=args.generations
+        generations=args.generations,
     )
     
     dashboard_proc = launch_live_dashboard(
@@ -3417,10 +4677,10 @@ if __name__ == "__main__":
         if args.evolution_type == "multi":
             # Run co-evolution
             if args.mode == "async":
-                asyncio.run(main_coevolution_async())
+                asyncio.run(main_coevolution_async(runtime_overrides=runtime_overrides))
             else:
-                print("Co-evolution currently supports async mode only")
-                asyncio.run(main_coevolution_async())
+                print("ℹ️  Co-evolution currently supports async mode only")
+                asyncio.run(main_coevolution_async(runtime_overrides=runtime_overrides))
         else:
             # Run single-agent evolution (original code)
             if args.mode == "async":

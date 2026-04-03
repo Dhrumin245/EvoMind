@@ -899,8 +899,12 @@ class HybridEvaluator:
         
         # Store metrics in genomes for later retrieval
         for i, (prey_genome, pred_genome) in enumerate(zip(prey_genomes, predator_genomes)):
-            prey_energy_cost = _get_per_env_value(per_env_energy.get('prey_energy_used', []), i, 0.0)
-            predator_energy_cost = _get_per_env_value(per_env_energy.get('predator_energy_used', []), i, 0.0)
+            prey_energy_total = _get_per_env_value(per_env_energy.get('prey_energy_used', []), i, 0.0)
+            predator_energy_total = _get_per_env_value(per_env_energy.get('predator_energy_used', []), i, 0.0)
+            prey_steps = max(1, len(prey_reward_steps[i]))
+            predator_steps = max(1, len(predator_reward_steps[i]))
+            prey_energy_cost = float(max(0.0, prey_energy_total) / prey_steps)
+            predator_energy_cost = float(max(0.0, predator_energy_total) / predator_steps)
             prey_novelty = _get_per_env_value(per_env_novelty, i, 0.0)
             predator_novelty = _get_per_env_value(per_env_novelty, i, 0.0)
 
@@ -918,8 +922,8 @@ class HybridEvaluator:
                     'food_collected': _get_per_env_value(per_env_signals.get('food_collected', []), i, 0.0),
                     'predator_captures': _get_per_env_value(per_env_signals.get('predator_captures', []), i, 0.0),
                     'prey_alive': _get_per_env_value(per_env_signals.get('prey_alive', []), i, 0.0),
-                    'prey_energy_used': prey_energy_cost,
-                    'predator_energy_used': predator_energy_cost,
+                    'prey_energy_used': prey_energy_total,
+                    'predator_energy_used': predator_energy_total,
                 }
                 try:
                     prey_success = bool(success_definition['prey_success'](signals))

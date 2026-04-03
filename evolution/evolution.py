@@ -1,3 +1,4 @@
+from __future__ import annotations
 import random
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional, cast
@@ -6,6 +7,17 @@ from core.population import Population
 from core.numeric_safety import safe_mean, safe_std, safe_zscore, sanitize_array
 import math
 from dataclasses import dataclass, field
+
+
+_LOG_DIVIDER_WIDTH = 86
+
+
+def _log_divider() -> str:
+    return f"  {'─' * _LOG_DIVIDER_WIDTH}"
+
+
+def _chunked(items: List[str], chunk_size: int) -> List[List[str]]:
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 class EvolutionMetrics:
     """Track evolution metrics and statistics"""
@@ -231,7 +243,7 @@ class EvolutionMetrics:
 class TournamentSelection:
     """Tournament selection with configurable strategies"""
     
-    def __init__(self, tournament_size: int = 5, selection_pressure: float = 1.0):
+    def __init__(self, tournament_size: int = 3, selection_pressure: float = 1.0):
         self.tournament_size = tournament_size
         self.selection_pressure = selection_pressure
     
@@ -242,12 +254,30 @@ class TournamentSelection:
         else:
             # Select random contenders without replacement
             contenders = random.sample(genomes, self.tournament_size)
-        
-        # Select based on fitness (normalized or raw)
+
+        if not contenders:
+            raise ValueError("Cannot select from an empty genome list")
+
+        # Lower selection_pressure (<1.0) increases exploration, higher pressure increases exploitation.
         if use_norm_fitness:
-            return max(contenders, key=lambda g: g.norm_fitness)
+            scores = np.asarray([float(g.norm_fitness) for g in contenders], dtype=np.float32)
         else:
-            return max(contenders, key=lambda g: g.fitness)
+            scores = np.asarray([float(g.fitness) for g in contenders], dtype=np.float32)
+
+        if not np.all(np.isfinite(scores)):
+            return max(contenders, key=lambda g: g.norm_fitness if use_norm_fitness else g.fitness)
+
+        pressure = max(float(self.selection_pressure), 1e-3)
+        temperature = 1.0 / pressure
+        centered = scores - float(np.max(scores))
+        probs = np.exp(centered / max(temperature, 1e-6))
+        prob_sum = float(np.sum(probs))
+        if prob_sum <= 0.0 or not np.isfinite(prob_sum):
+            return max(contenders, key=lambda g: g.norm_fitness if use_norm_fitness else g.fitness)
+
+        probs = probs / prob_sum
+        selected_idx = int(np.random.choice(len(contenders), p=probs))
+        return contenders[selected_idx]
 
 
 class RankBasedSelection:
@@ -657,12 +687,17 @@ class EvolutionEngine:
         self.mutation_strength = mutation_strength
         self.architecture_mutation_rate = architecture_mutation_rate
         self.genome_cls = genome_cls
-        self.selector = TournamentSelection(tournament_size)
+        self.selector = TournamentSelection(tournament_size, selection_pressure=1.35)
         self.metrics = EvolutionMetrics()
         self.best_fitness_history = []
         self.stagnation_counter = 0
         self.generation = 0
         self.mutator = None
+        self.base_mutation_rate = float(mutation_rate)
+        self.base_architecture_mutation_rate = float(architecture_mutation_rate)
+        self._smoothed_weight_rate = float(mutation_rate)
+        self._smoothed_arch_rate = float(architecture_mutation_rate)
+        self._smoothed_layer_rate = float(architecture_mutation_rate)
 
         # Speciation components
         self.speciation_enabled = speciation_enabled
@@ -676,6 +711,18 @@ class EvolutionEngine:
             else None
         )
         self.distance_calculator = distance_calculator
+        
+        # Predator-specific distance calculator for stricter architecture-based speciation
+        # Architecture dominates (0.85) to force diversity; behavior minimal (0.05)
+        self.predator_distance_calculator = (
+            GenomeDistance(
+                architecture_weight=0.85,
+                behavior_weight=0.05,
+                param_weight=0.1,
+            )
+            if speciation_enabled
+            else None
+        )
         self.speciation_manager = (
             SpeciationManager(
                 distance_calculator=distance_calculator,
@@ -777,9 +824,13 @@ class EvolutionEngine:
     def _build_novelty_embedding(self, genome: 'EvolvableGenome', generation: int) -> 'BehaviorEmbedding':
         """Build a stable, fixed-size embedding for novelty scoring.
 
-        Note: this is a lightweight proxy embedding (architecture + meta + fitness),
+        Note: this is a lightweight proxy embedding (architecture + meta + behavior),
         suitable for novelty tracking/logging even before richer behavior features exist.
         """
+        def _bounded(value: float, scale: float = 1.0) -> float:
+            scale = max(float(scale), 1e-6)
+            return float(np.tanh(float(value) / scale))
+
         meta = getattr(genome, 'meta', {}) or {}
         reward_gain = float(meta.get('reward_gain', 0.0))
         reward_bias = float(meta.get('reward_bias', 0.0))
@@ -798,20 +849,28 @@ class EvolutionEngine:
         steps_survived = float(behavior.get('steps_survived', 0.0))
         action_entropy = float(behavior.get('action_entropy', 0.0))
         energy_cost = float(behavior.get('energy_cost', 0.0))
+        episode_return = float(behavior.get('episode_return', 0.0))
+
+        # Keep novelty features on comparable scales and avoid a circular
+        # fitness -> novelty -> fitness feedback loop.
+        scaled_num_layers = min(num_layers, 12.0) / 12.0
+        scaled_total_params = float(np.clip(np.log1p(max(total_params, 0.0)) / 8.0, 0.0, 1.5))
+        scaled_steps = float(np.clip(steps_survived / 100.0, 0.0, 1.0))
+        scaled_entropy = float(np.clip(action_entropy / 3.0, 0.0, 1.0))
 
         embedding = np.array(
             [
-                float(getattr(genome, 'fitness', 0.0)),
-                reward_gain,
-                reward_bias,
-                plastic_lr,
-                num_layers,
-                total_params,
-                mean_reward,
-                reward_std,
-                steps_survived,
-                action_entropy,
-                energy_cost,
+                _bounded(reward_gain - 1.0, scale=1.0),
+                _bounded(reward_bias, scale=1.0),
+                _bounded(plastic_lr, scale=3.0),
+                scaled_num_layers,
+                scaled_total_params,
+                _bounded(mean_reward, scale=20.0),
+                _bounded(reward_std, scale=10.0),
+                scaled_steps,
+                scaled_entropy,
+                _bounded(energy_cost, scale=2.0),
+                _bounded(episode_return, scale=25.0),
             ],
             dtype=np.float32,
         )
@@ -852,10 +911,25 @@ class EvolutionEngine:
         embeddings = [self._build_novelty_embedding(g, generation) for g in genomes]
         raw_scores = [self.novelty_archive.get_novelty_score(e) for e in embeddings]
         scores = [float(s) if np.isfinite(s) else 0.0 for s in raw_scores]
+        score_array = np.asarray(scores, dtype=np.float32)
+
+        if score_array.size >= 4:
+            low = float(np.percentile(score_array, 10))
+            high = float(np.percentile(score_array, 90))
+            span = max(high - low, 1e-6)
+            norm_scores = [float(np.clip((score - low) / span, 0.0, 1.0)) for score in scores]
+        elif score_array.size > 1:
+            min_score = float(np.min(score_array))
+            max_score = float(np.max(score_array))
+            span = max(max_score - min_score, 1e-6)
+            norm_scores = [float((score - min_score) / span) for score in scores]
+        else:
+            norm_scores = [0.0 for _ in scores]
 
         # Store novelty scores on genomes for selection
-        for genome, novelty_score in zip(genomes, scores):
+        for genome, novelty_score, novelty_norm in zip(genomes, scores, norm_scores):
             genome.novelty_score = novelty_score
+            genome.novelty_score_norm = novelty_norm
 
         # Update archive with top-K by novelty score.
         if add_top_k_to_archive and add_top_k_to_archive > 0:
@@ -863,13 +937,42 @@ class EvolutionEngine:
             for _, emb in top:
                 self.novelty_archive.add_behavior(emb)
 
-        arr = np.asarray(scores, dtype=np.float32)
+        arr = score_array
         return {
             'mean': float(np.mean(arr)) if arr.size else 0.0,
             'max': float(np.max(arr)) if arr.size else 0.0,
             'p95': float(np.percentile(arr, 95)) if arr.size else 0.0,
             'archive': self.novelty_archive.get_archive_stats(),
         }
+
+    def _clip_population_fitness_outliers(self, genomes: List['EvolvableGenome']) -> None:
+        """Robustly clip extreme post-evaluation fitness outliers."""
+        if not genomes:
+            return
+
+        raw_fitnesses = sanitize_array(
+            np.asarray([float(getattr(g, "fitness", 0.0)) for g in genomes], dtype=np.float32),
+            nan_replace=0.0,
+            posinf_replace=1e6,
+            neginf_replace=-1e6,
+        )
+        if raw_fitnesses.size == 0:
+            return
+
+        if raw_fitnesses.size < 4:
+            finite_max = float(np.max(raw_fitnesses)) if raw_fitnesses.size else 0.0
+            finite_min = float(np.min(raw_fitnesses)) if raw_fitnesses.size else 0.0
+            for genome, fitness in zip(genomes, raw_fitnesses):
+                genome.fitness = float(np.clip(fitness, finite_min, finite_max))
+            return
+
+        q1 = float(np.percentile(raw_fitnesses, 25))
+        q3 = float(np.percentile(raw_fitnesses, 75))
+        iqr = max(q3 - q1, 1.0)
+        lower = q1 - 4.0 * iqr
+        upper = q3 + 4.0 * iqr
+        for genome, fitness in zip(genomes, raw_fitnesses):
+            genome.fitness = float(np.clip(fitness, lower, upper))
 
     def _calculate_adaptability_score(self, genome: EvolvableGenome, plastic_usage: float) -> float:
         """
@@ -1017,8 +1120,8 @@ class EvolutionEngine:
         Returns:
             Effective fitness value
         """
-        # META-3.2: Base fitness plus adaptability bonus
-        effective_fitness = raw_fitness + meta_gain * adaptability_score
+        # Selection bias toward effective learners.
+        effective_fitness = raw_fitness + 0.3 * adaptability_score
 
         # Stability penalty for poor adaptation — uses the threshold parameter
         if adaptability_score < threshold:  # Very poor adaptation
@@ -1062,7 +1165,8 @@ class EvolutionEngine:
             genomes = cast(List[EvolvableGenome], population.genomes)
             resolved_name = pop_name or population.name
 
-        print(f"[EVOLVE] {resolved_name} Generation {generation} START")
+        print(f"\n🧬 EVOLUTION CYCLE - {resolved_name.upper()} (Gen {generation})")
+        print(_log_divider())
 
         # ----------------------------
         # SAFETY CHECK
@@ -1073,6 +1177,10 @@ class EvolutionEngine:
                 size=self.population_size,
                 name=pop_name or "population"
             )
+
+        # Clamp pathological fitness outliers before speciation/selection so a
+        # single extreme score cannot hijack offspring quotas or elite cloning.
+        self._clip_population_fitness_outliers(genomes)
 
         # Calculate effective fitness before normalization
         for genome in genomes:
@@ -1109,8 +1217,10 @@ class EvolutionEngine:
 
         if self.novelty_fitness_beta > 0.0:
             for genome in genomes:
-                novelty_score = float(getattr(genome, 'novelty_score', 0.0))
+                novelty_score = float(getattr(genome, 'novelty_score_norm', 0.0))
                 genome.fitness += self.novelty_fitness_beta * novelty_score
+
+        self._clip_population_fitness_outliers(genomes)
 
         normalize_fitness(genomes)
         self._apply_novelty_pressure(genomes)
@@ -1125,18 +1235,62 @@ class EvolutionEngine:
             _meta_rates = self.mutator_population.get_adaptive_rates()
         else:
             _meta_rates = {}
-        _weight_rate      = _meta_rates.get('weight_rate',  self.mutation_rate)
+
+        _weight_target = float(_meta_rates.get('weight_rate', self.mutation_rate))
+        _arch_target = float(_meta_rates.get('arch_rate', self.architecture_mutation_rate))
+        _layer_target = float(_meta_rates.get('layer_rate', self.architecture_mutation_rate))
+
+        # Smooth meta-rate handoff so rates cannot jump abruptly generation to generation.
+        _smooth_alpha = 0.3
+        self._smoothed_weight_rate = (1.0 - _smooth_alpha) * self._smoothed_weight_rate + _smooth_alpha * _weight_target
+        self._smoothed_arch_rate = (1.0 - _smooth_alpha) * self._smoothed_arch_rate + _smooth_alpha * _arch_target
+        self._smoothed_layer_rate = (1.0 - _smooth_alpha) * self._smoothed_layer_rate + _smooth_alpha * _layer_target
+
+        # Keep adaptive rates in a safe operating band around configured baselines.
+        _weight_rate = float(np.clip(
+            self._smoothed_weight_rate,
+            max(0.001, self.base_mutation_rate * 0.5),
+            min(0.2, self.base_mutation_rate * 4.0),
+        ))
+        _arch_rate = float(np.clip(
+            self._smoothed_arch_rate,
+            max(0.001, self.base_architecture_mutation_rate * 0.5),
+            min(0.15, self.base_architecture_mutation_rate * 3.0),
+        ))
+        _layer_rate = float(np.clip(
+            self._smoothed_layer_rate,
+            max(0.001, self.base_architecture_mutation_rate * 0.5),
+            min(0.12, self.base_architecture_mutation_rate * 2.5),
+        ))
         _weight_strength  = self.mutation_strength  # strength not overridden by meta (yet)
-        _arch_rate        = _meta_rates.get('arch_rate',   self.architecture_mutation_rate)
-        _layer_rate       = _meta_rates.get('layer_rate',  self.architecture_mutation_rate)
 
         # ----------------------------
         # TRUE SPECIATION: Speciate population into species
         # ----------------------------
         if self.speciation_enabled and self.speciation_manager is not None:
+            # Use predator-specific distance calculator for predator populations
+            # to enforce architecture-based diversity and prevent monoculture
+            original_distance_calc = self.speciation_manager.distance_calculator
+            if resolved_name.lower() == "predator" and self.predator_distance_calculator is not None:
+                self.speciation_manager.distance_calculator = self.predator_distance_calculator
+            
             species_list = self.speciation_manager.speciate_population(genomes, generation)
             self._last_speciated_generation = generation
-            print(f"[Speciation] {len(species_list)} species formed")
+            print(f"  Species Formed: {len(species_list)}")
+            
+            # Restore original distance calculator
+            self.speciation_manager.distance_calculator = original_distance_calc
+            
+            # CRITICAL FIX: Prevent monoculture by enforcing minimum species diversity
+            # This addresses the predator collapse issue (77/80 in one species)
+            species_list = self._enforce_minimum_species_diversity(
+                species_list, genomes, generation, min_species=3
+            )
+
+            # Keep manager state aligned with diversity-enforced species. If this
+            # is not synced, offspring quotas are computed from stale species and
+            # newly created species receive 0 offspring.
+            self.speciation_manager.species = species_list
         else:
             # Fallback: single species containing all genomes
             dummy_species = Species(
@@ -1187,7 +1341,7 @@ class EvolutionEngine:
         # ----------------------------
         # PER-SPECIES OFFSPRING GENERATION
         # ----------------------------
-        print("[Evolution] Per-species selection and crossover start")
+        print("  Reproduction: Per-species selection + crossover")
 
         # Calculate offspring quotas per species based on fitness
         if self.speciation_enabled and self.speciation_manager is not None:
@@ -1197,11 +1351,16 @@ class EvolutionEngine:
             offspring_quotas = {species_list[0].species_id: self.population_size - len(new_genomes)}
 
         if len(species_list) > 1:
-            quota_summary = ", ".join(
-                f"{species.species_id}={offspring_quotas.get(species.species_id, 0)}"
+            quota_entries = [
+                f"{species.species_id}:{offspring_quotas.get(species.species_id, 0)}"
                 for species in species_list
-            )
-            print(f"[Speciation] Offspring quotas: {quota_summary}")
+            ]
+            print("\n  Offspring Quotas")
+            print(_log_divider())
+            for quota_row in _chunked(quota_entries, 4):
+                print(f"  {'  |  '.join(quota_row)}")
+
+        species_plan_lines: List[str] = []
 
         for species in species_list:
             if not species.members or species.species_id not in offspring_quotas:
@@ -1211,31 +1370,68 @@ class EvolutionEngine:
             species_genomes = species.members
 
             if len(species_genomes) < 2:
+                # Bootstrap newly formed species for a short grace period to avoid
+                # immediate extinction after diversity-enforcement splits.
                 if offspring_needed > 0:
-                    print(f"[Speciation] Species {species.species_id}: {len(species_genomes)} member, cloning {offspring_needed} offspring")
-                    parent = species_genomes[0]
-                    for _ in range(offspring_needed):
-                        child = parent.copy()
-                        child.set_parents([parent.genome_id], generation)
-                        mutated = child.mutate(
-                            weight_mutation_rate=_weight_rate,
-                            weight_mutation_strength=_weight_strength,
-                            architecture_mutation_rate=_arch_rate,
-                            layer_mutation_rate=_layer_rate
+                    single_member = species_genomes[0]
+                    # Check if this member is elite (in top 10% of all genomes)
+                    all_fitness_values = [g.fitness for g in genomes]
+                    if all_fitness_values:
+                        elite_threshold = float(np.percentile(all_fitness_values, 90))
+                    else:
+                        elite_threshold = 0.0
+                    
+                    is_elite = single_member.fitness >= elite_threshold
+                    species_age = generation - int(getattr(species, "created_generation", generation))
+                    is_new_species = species_age <= 2
+                    
+                    if is_elite or is_new_species:
+                        # Elite or newly created single-member species can clone to
+                        # preserve innovation and prevent immediate collapse.
+                        reason = "ELITE" if is_elite else f"NEW(age={species_age})"
+                        species_plan_lines.append(
+                            f"• {species.species_id:<12} NEW/ELITE  members=1  offspring={offspring_needed:<3d}  "
+                            f"fitness={single_member.fitness:>7.3f}  ({reason})"
                         )
-                        if mutated is None or isinstance(mutated, bool):
-                            mutated = child.copy()
-                        self._track_mutation(mutated)
-                        mutated.fitness = 0.0
-                        mutated.norm_fitness = 0.0
-                        new_genomes.append(mutated)
-                        if len(new_genomes) >= self.population_size:
-                            break
+                        parent = single_member
+                        for _ in range(offspring_needed):
+                            child = parent.copy()
+                            child.set_parents([parent.genome_id], generation)
+                            mutated = child.mutate(
+                                weight_mutation_rate=_weight_rate,
+                                weight_mutation_strength=_weight_strength,
+                                architecture_mutation_rate=_arch_rate,
+                                layer_mutation_rate=_layer_rate
+                            )
+                            if mutated is None or isinstance(mutated, bool):
+                                mutated = child.copy()
+                            self._track_mutation(mutated)
+                            mutated.fitness = 0.0
+                            mutated.norm_fitness = 0.0
+                            new_genomes.append(mutated)
+                            if len(new_genomes) >= self.population_size:
+                                break
+                    else:
+                            # Mature weak single-member species can die out naturally.
+                        species_plan_lines.append(
+                            f"• {species.species_id:<12} WEAK      members=1  offspring={offspring_needed:<3d}  "
+                            f"fitness={single_member.fitness:>7.3f}  (extinction)"
+                        )
                 continue
 
-            print(f"[Speciation] Species {species.species_id}: {len(species_genomes)} members, {offspring_needed} offspring")
+            species_plan_lines.append(
+                f"• {species.species_id:<12} ACTIVE    members={len(species_genomes):<3d} offspring={offspring_needed:<3d}"
+            )
 
             offspring_count = 0
+            effective_cross_species_rate = float(self.cross_species_reproduction_rate)
+            if len(species_list) >= 12:
+                effective_cross_species_rate *= 0.35
+            elif len(species_list) >= 9:
+                effective_cross_species_rate *= 0.5
+            elif len(species_list) >= 6:
+                effective_cross_species_rate *= 0.75
+
             while offspring_count < offspring_needed and len(new_genomes) < self.population_size:
                 # Per-species selection: tournament within species
                 parent1 = self._select_within_species(species_genomes)
@@ -1246,7 +1442,7 @@ class EvolutionEngine:
                     parent2 = self._select_within_species(species_genomes)
 
                 # Rare cross-species reproduction (configurable, default 5%)
-                if random.random() < self.cross_species_reproduction_rate and len(species_list) > 1:
+                if random.random() < effective_cross_species_rate and len(species_list) > 1:
 
                     other_candidates = [s for s in species_list if s != species and s.members]
                     if other_candidates:
@@ -1336,8 +1532,9 @@ class EvolutionEngine:
                 new_population.genomes = self.novelty_injector.inject_from_archive(
                     new_population.genomes, injection_rate=self.immigration_rate
                 )
-                print(f"[EVOLVE] {resolved_name} novelty injection triggered "
-                      f"(diversity={pre_diversity:.3f})")
+                print(
+                    f"  ✨ Novelty injection triggered | diversity={pre_diversity:.3f}"
+                )
 
                 # Measure post-injection state and update effectiveness record.
                 post_diversity = self.novelty_injector._calculate_population_diversity(
@@ -1349,7 +1546,14 @@ class EvolutionEngine:
                     pre_fitness, post_fitness, pre_diversity, post_diversity
                 )
 
-        print(f"[EVOLVE] {resolved_name} Generation {generation} END - {len(species_list)} species")
+        if species_plan_lines:
+            print("\n  Species Reproduction Plan")
+            print(_log_divider())
+            for line in species_plan_lines:
+                print(f"  {line}")
+
+        print(f"\n  ✅ Evolution Complete: {resolved_name} generation {generation} finalized")
+        print(f"  Species Count: {len(species_list)}")
 
         # ----------------------------
         # META-EVOLUTION: Drive mutator population only.
@@ -1380,6 +1584,106 @@ class EvolutionEngine:
             self.mutator_population.evolve_mutators(mutation_effectiveness)
 
         return new_population
+
+    def _enforce_minimum_species_diversity(
+        self, 
+        species_list: List[Species], 
+        all_genomes: List[EvolvableGenome],
+        generation: int,
+        min_species: int = 3
+    ) -> List[Species]:
+        """
+        CRITICAL FIX: Prevent monoculture by forcing minimum species diversity.
+        
+        If we have fewer species than minimum, split the largest species by:
+        1. Ranking members by architectural distance from representative
+        2. Creating new species from diverse members
+        3. Gradually moving threshold down if needed
+        
+        This specifically fixes the predator collapse issue where 77/80 agents
+        converge to a single species, killing co-evolution.
+        
+        Args:
+            species_list: Current list of species
+            all_genomes: All genomes in the population
+            generation: Current generation
+            min_species: Minimum number of species to maintain
+            
+        Returns:
+            Updated species list with diversity enforced
+        """
+        if len(species_list) >= min_species:
+            return species_list
+        
+        shortage = min_species - len(species_list)
+        print(
+            f"  [Diversity] minimum-species guard: only {len(species_list)} species, creating {shortage}"
+        )
+        
+        # Find the largest species
+        largest_species = max(species_list, key=lambda s: len(s.members))
+        
+        if len(largest_species.members) <= min_species:
+            # Not enough members to split; reduce threshold to create more species
+            if self.speciation_manager is not None:
+                old_threshold = self.speciation_manager.compatibility_threshold
+                new_threshold = old_threshold * 0.7  # Reduce threshold by 30%
+                self.speciation_manager.compatibility_threshold = max(0.1, new_threshold)
+                print(f"  [Diversity] threshold reduced: {old_threshold:.4f} -> {new_threshold:.4f}")
+                
+                # Re-speciate with stricter threshold
+                species_list = self.speciation_manager.speciate_population(all_genomes, generation)
+                self._last_speciated_generation = generation
+                print(f"  [Diversity] re-speciated: now {len(species_list)} species")
+                
+                return species_list
+        
+        # Split largest species by architectural distance
+        members = largest_species.members
+        representative = largest_species.representative
+        
+        # Calculate architectural distance for each member from representative
+        distances = []
+        for member in members:
+            if self.speciation_manager is not None:
+                dist = self.speciation_manager.distance_calculator._architecture_distance(
+                    member, representative
+                )
+            else:
+                dist = 0.0
+            distances.append((member, dist))
+        
+        # Sort by distance (farthest first)
+        distances.sort(key=lambda x: x[1], reverse=True)
+        
+        # Create new species from diverse members
+        new_species_list = list(species_list)
+        members_to_remove = []
+        
+        for i in range(shortage):
+            if i < len(distances):
+                new_member, _ = distances[i]
+                
+                # Create new species with this member as representative
+                new_species = Species(
+                    species_id=f"species_{self.speciation_manager.next_species_id if self.speciation_manager else 1000+i}",
+                    representative=new_member.copy(),
+                    created_generation=generation
+                )
+                new_species.add_member(new_member)
+                new_species_list.append(new_species)
+                members_to_remove.append(new_member)
+                
+                if self.speciation_manager is not None:
+                    self.speciation_manager.next_species_id += 1
+        
+        # Remove split members from largest species
+        largest_species.members = [m for m in largest_species.members if m not in members_to_remove]
+        
+        print(f"  [Diversity] split largest species: {len(members)} -> {len(largest_species.members)} members")
+        print(f"  [Diversity] total species after split: {len(new_species_list)}")
+        
+        return new_species_list
 
     def _track_mutation(self, genome: 'EvolvableGenome') -> None:
         """Read the latest mutation event stored on *genome* and update metrics.
@@ -1412,24 +1716,52 @@ class EvolutionEngine:
             # Weight fitness more heavily but include novelty bonus
             return fitness_score + self.novelty_weight * novelty_score
 
-        return max(contenders, key=selection_score)
+        # Stochastic tournament improves exploration and avoids repeatedly cloning
+        # the same winner when scores are close.
+        scores = np.array([selection_score(g) for g in contenders], dtype=np.float32)
+        if not np.all(np.isfinite(scores)):
+            return max(contenders, key=selection_score)
+
+        # More exploration under stagnation, more exploitation when improving.
+        base_temperature = 1.2 if self.stagnation_counter >= 8 else 0.8
+        pressure = max(float(getattr(self.selector, 'selection_pressure', 1.0)), 0.1)
+        temperature = base_temperature / pressure
+        centered = scores - float(np.max(scores))
+        probs = np.exp(centered / max(temperature, 1e-6))
+        prob_sum = float(np.sum(probs))
+        if prob_sum <= 0.0 or not np.isfinite(prob_sum):
+            return max(contenders, key=selection_score)
+
+        probs = probs / prob_sum
+        chosen_idx = int(np.random.choice(len(contenders), p=probs))
+        return contenders[chosen_idx]
+
+    def reduce_selection_pressure(self, factor: float = 0.9, min_pressure: float = 0.5) -> float:
+        """Reduce selection pressure to encourage exploration during instability."""
+        current_pressure = float(getattr(self.selector, 'selection_pressure', 1.0))
+        new_pressure = max(float(min_pressure), current_pressure * float(factor))
+        self.selector.selection_pressure = float(new_pressure)
+
+        if hasattr(self.selector, 'tournament_size'):
+            current_tournament = int(getattr(self.selector, 'tournament_size', self.tournament_size))
+            reduced_tournament = max(2, int(math.floor(current_tournament * float(factor))))
+            self.selector.tournament_size = reduced_tournament
+            self.tournament_size = reduced_tournament
+
+        return float(new_pressure)
 
     def _apply_novelty_pressure(self, genomes: List[EvolvableGenome]) -> None:
         if not genomes or not self.novelty_archive_enabled or self.novelty_weight <= 0.0:
             return
 
-        novelty_scores = [float(getattr(g, 'novelty_score', 0.0)) for g in genomes]
-        min_score = min(novelty_scores)
-        max_score = max(novelty_scores)
-        span = max_score - min_score
-
-        if span <= 1e-9:
+        novelty_scores = [float(getattr(g, 'novelty_score_norm', 0.0)) for g in genomes]
+        if not any(np.isfinite(novelty_scores)):
             for g in genomes:
                 g.novelty_score_norm = 0.0
             return
 
-        for g, score in zip(genomes, novelty_scores):
-            novelty_norm = (score - min_score) / span
+        for g, novelty_norm in zip(genomes, novelty_scores):
+            novelty_norm = float(np.clip(novelty_norm, 0.0, 1.0))
             g.novelty_score_norm = novelty_norm
             g.norm_fitness += self.novelty_weight * novelty_norm
 
@@ -1462,6 +1794,7 @@ class EvolutionEngine:
     def _check_stagnation(self, population: List[EvolvableGenome]):
         """Check for stagnation and adjust parameters if needed"""
         current_best = max(g.fitness for g in population)
+        self.generation += 1
         
         if not self.best_fitness_history:
             self.best_fitness_history.append(current_best)
@@ -1473,18 +1806,31 @@ class EvolutionEngine:
             self.stagnation_counter += 1
         else:
             self.stagnation_counter = 0
+            # Improvement observed: slowly relax rates back toward stable baselines.
+            self.mutation_rate = float(np.clip(
+                0.9 * self.mutation_rate + 0.1 * self.base_mutation_rate,
+                0.001,
+                0.2,
+            ))
+            self.architecture_mutation_rate = float(np.clip(
+                0.9 * self.architecture_mutation_rate + 0.1 * self.base_architecture_mutation_rate,
+                0.001,
+                0.15,
+            ))
         
         self.best_fitness_history.append(current_best)
         
         # If stagnating for too long, increase mutation rates directly on the engine
         # (self.mutator is unused; adjust the engine's own rate fields which serve as
         #  fallback rates when no mutator_population is attached)
-        if self.stagnation_counter > 50:
+        if self.stagnation_counter > 12:
             _max_rate = 0.5
             self.architecture_mutation_rate = min(self.architecture_mutation_rate * 1.5, _max_rate)
             self.mutation_rate = min(self.mutation_rate * 1.5, _max_rate)
-            print(f"Stagnation detected (gen {self.generation}), increasing mutation rates: "
-                  f"weight={self.mutation_rate:.4f}, arch={self.architecture_mutation_rate:.4f}")
+            print(
+                f"⚠️  Evolution stagnation (gen {self.generation}): "
+                f"increasing mutation rates | weight={self.mutation_rate:.4f}, arch={self.architecture_mutation_rate:.4f}"
+            )
     
     def get_evolution_summary(self) -> Dict[str, Any]:
         """Get summary of evolution progress"""
@@ -1753,12 +2099,14 @@ class SpeciationManager:
                  distance_calculator: GenomeDistance,
                  compatibility_threshold: float = 3.0,
                  compatibility_threshold_decay_rate: float = 200.0,
+                 min_compatibility_threshold: float = 0.1,
                  min_species_size: int = 5,
                  max_stagnation: int = 15,
                  min_offspring_per_species: int = 5):
         self.distance_calculator = distance_calculator
         self.compatibility_threshold = compatibility_threshold
         self.compatibility_threshold_decay_rate = compatibility_threshold_decay_rate
+        self.min_compatibility_threshold = float(min_compatibility_threshold)
         self.min_species_size = min_species_size
         self.max_stagnation = max_stagnation
         self.min_offspring_per_species = min_offspring_per_species
@@ -1814,17 +2162,18 @@ class SpeciationManager:
         empty_ratio = (len(empty_species) / max(1, pre_prune_count))
         if empty_species:
             self.species = [s for s in self.species if len(s.members) > 0]
-            print(f"[Speciation] Pruned {len(empty_species)} empty species before reproduction")
+            print(f"  [Speciation] Pruned empty species: {len(empty_species)}")
 
-        # If empty-species ratio is high, threshold is likely too strict; relax it.
+        # If empty-species ratio is high, one/few species are typically absorbing members.
+        # Tighten threshold to encourage splitting into more species.
         if empty_ratio > 0.2:
             old_threshold = float(self.compatibility_threshold)
             self.compatibility_threshold = float(
-                min(old_threshold * 1.08, self.max_compatibility_threshold)
+                max(old_threshold * 0.92, self.min_compatibility_threshold)
             )
             print(
-                f"[Speciation] Empty ratio {empty_ratio:.2f} too high; "
-                f"compatibility_threshold {old_threshold:.4f} -> {self.compatibility_threshold:.4f}"
+                f"  [Speciation] Empty-ratio guard: {empty_ratio:.2f} "
+                f"| threshold {old_threshold:.4f} -> {self.compatibility_threshold:.4f}"
             )
 
         # Remove stagnant species
@@ -1857,9 +2206,54 @@ class SpeciationManager:
             if species.stagnation_counter <= self.max_stagnation or len(species.members) >= self.min_species_size:
                 surviving_species.append(species)
             else:
-                print(f"Removing stagnant species {species.species_id} (stagnation: {species.stagnation_counter})")
+                print(
+                    f"  [Speciation] removed stagnant species {species.species_id} "
+                    f"(stagnation={species.stagnation_counter})"
+                )
 
         self.species = surviving_species
+
+    def _redistribute_if_dominant(
+        self,
+        quotas: Dict[str, int],
+        population_size: int,
+        species_minima: Dict[str, int],
+        dominant_species_ratio_threshold: float = 0.6,
+    ) -> Dict[str, int]:
+        """Redistribute offspring if one species dominates too strongly."""
+        if not quotas or population_size <= 0 or len(quotas) <= 1:
+            return quotas
+
+        dominant_sid, dominant_count = max(quotas.items(), key=lambda item: item[1])
+        dominant_ratio = float(dominant_count) / float(max(1, population_size))
+        if dominant_ratio <= dominant_species_ratio_threshold:
+            return quotas
+
+        # Clamp dominant species to threshold and spread excess to the weakest species.
+        dominant_cap = int(math.floor(dominant_species_ratio_threshold * population_size))
+        transferable = max(0, dominant_count - dominant_cap)
+        if transferable <= 0:
+            return quotas
+
+        recipients = [sid for sid in quotas.keys() if sid != dominant_sid]
+        if not recipients:
+            return quotas
+
+        idx = 0
+        while transferable > 0 and recipients:
+            recipients.sort(key=lambda sid: quotas[sid])
+            sid = recipients[idx % len(recipients)]
+            quotas[dominant_sid] -= 1
+            quotas[sid] += 1
+            transferable -= 1
+            idx += 1
+
+        # Safety: keep each species at least at configured minimum when feasible.
+        if sum(species_minima.values()) <= population_size:
+            for sid, min_value in species_minima.items():
+                quotas[sid] = max(quotas.get(sid, 0), int(min_value))
+
+        return quotas
 
     def get_offspring_quotas(self, population_size: int) -> Dict[str, int]:
         """Calculate offspring quotas for each species based on fitness"""
@@ -1885,9 +2279,16 @@ class SpeciationManager:
 
         min_offspring = max(1, int(self.min_offspring_per_species))
         num_species = len(species_stats)
+        # Do not let species floors consume most of the generation when the
+        # population is already highly fragmented. Reserve at most ~40% of slots
+        # for guaranteed survival so the rest can follow fitness pressure.
+        adaptive_floor = min(
+            min_offspring,
+            max(1, int(population_size * 0.4 / max(1, num_species)))
+        )
         species_minima = {
-            species.species_id: (min_offspring if size >= self.min_species_size else 1)
-            for species, _, size, _ in species_stats
+            species.species_id: adaptive_floor
+            for species, _, _, _ in species_stats
         }
 
         if population_size <= 0:
@@ -1896,9 +2297,11 @@ class SpeciationManager:
         min_total = int(sum(species_minima.values()))
 
         if min_total > population_size:
-            # Not enough slots to guarantee minimum; fall back to proportional with at least 1.
-            quotas = {species.species_id: 1 for species, _, _, _ in species_stats}
-            remaining = population_size - len(quotas)
+            # Not enough slots to satisfy configured minimum for every species.
+            # Best-effort fallback: equal floor across species, then proportional remainder.
+            feasible_floor = max(1, population_size // max(1, num_species))
+            quotas = {species.species_id: feasible_floor for species, _, _, _ in species_stats}
+            remaining = population_size - sum(quotas.values())
 
             if remaining > 0:
                 total_score = sum(score for _, _, _, score in species_stats)
@@ -1923,9 +2326,9 @@ class SpeciationManager:
                         for i in range(remainder):
                             quotas[species_stats[order[i % num_species]][0].species_id] += 1
 
-            # Apply cap: tiny species cannot produce outsized offspring counts.
+            # Apply cap while respecting floor.
             for species, _, size, _ in species_stats:
-                cap = max(1, int(math.ceil(size * self.max_offspring_multiplier)))
+                cap = max(quotas[species.species_id], int(math.ceil(size * self.max_offspring_multiplier)))
                 quotas[species.species_id] = min(quotas.get(species.species_id, 0), cap)
 
             # Redistribute any leftover slots from capping.
@@ -1949,6 +2352,13 @@ class SpeciationManager:
                         leftovers -= 1
                     idx += 1
                     safety += 1
+
+            quotas = self._redistribute_if_dominant(
+                quotas=quotas,
+                population_size=population_size,
+                species_minima=species_minima,
+                dominant_species_ratio_threshold=0.6,
+            )
 
             return quotas
 
@@ -2004,6 +2414,13 @@ class SpeciationManager:
                 idx += 1
                 safety += 1
 
+        quotas = self._redistribute_if_dominant(
+            quotas=quotas,
+            population_size=population_size,
+            species_minima=species_minima,
+            dominant_species_ratio_threshold=0.6,
+        )
+
         return quotas
 
     def get_species_stats(self) -> Dict[str, Any]:
@@ -2021,7 +2438,9 @@ class SpeciationManager:
 
         # Consistency check: log warning if bookkeeping seems off
         if len(active_species) != len(self.species):
-            print(f"[Speciation Warning] {len(self.species) - len(active_species)} empty species filtered from stats")
+            print(
+                f"  [Speciation] warning: filtered {len(self.species) - len(active_species)} empty species from stats"
+            )
 
         return {
             'num_species': len(active_species),
@@ -2572,34 +2991,51 @@ class MutatorPopulation:
         rates = {}
 
         if not self.mutation_strategies:
-            return {'weight_rate': 0.1, 'arch_rate': 0.05, 'layer_rate': 0.02}
+            return {'weight_rate': 0.06, 'arch_rate': 0.04, 'layer_rate': 0.02}
+
+        ranked = sorted(
+            self.mutation_strategies,
+            key=lambda s: (
+                float(s.get('current_effectiveness', 0.5)),
+                float(s.get('meta_fitness', 0.0)),
+            ),
+            reverse=True,
+        )
 
         # Aggregate rates from best strategies
-        for strategy in self.mutation_strategies[:5]:  # Use top 5 strategies
+        for strategy in ranked[:5]:  # Use top 5 strategies
             params = strategy['parameters']
-            effectiveness = strategy.get('current_effectiveness', 0.5)
+            effectiveness = float(strategy.get('current_effectiveness', 0.5))
 
             if 'rate' in params:
                 strategy_type = params.get('type', 'weight')
+                raw_rate = float(params['rate'])
+                if not np.isfinite(raw_rate):
+                    continue
                 if strategy_type not in rates:
                     rates[strategy_type] = []
-                rates[strategy_type].append(params['rate'] * effectiveness)
+                rates[strategy_type].append((raw_rate, max(0.0, effectiveness)))
 
         # Average rates by type
         final_rates = {}
         for strategy_type, rate_list in rates.items():
             if rate_list:
-                avg_rate = np.mean(rate_list)
+                values = np.asarray([r for r, _ in rate_list], dtype=np.float32)
+                weights = np.asarray([w for _, w in rate_list], dtype=np.float32)
+                if float(np.sum(weights)) > 1e-8:
+                    avg_rate = float(np.average(values, weights=weights))
+                else:
+                    avg_rate = float(np.mean(values))
                 if strategy_type == 'weight':
-                    final_rates['weight_rate'] = np.clip(avg_rate, 0.01, 0.3)
+                    final_rates['weight_rate'] = float(np.clip(avg_rate, 0.005, 0.12))
                 elif strategy_type == 'arch':
-                    final_rates['arch_rate'] = np.clip(avg_rate, 0.001, 0.1)
+                    final_rates['arch_rate'] = float(np.clip(avg_rate, 0.002, 0.08))
                 elif strategy_type == 'layer':
-                    final_rates['layer_rate'] = np.clip(avg_rate, 0.001, 0.05)
+                    final_rates['layer_rate'] = float(np.clip(avg_rate, 0.002, 0.06))
 
         # Fill in defaults for missing types
-        final_rates.setdefault('weight_rate', 0.1)
-        final_rates.setdefault('arch_rate', 0.05)
+        final_rates.setdefault('weight_rate', 0.06)
+        final_rates.setdefault('arch_rate', 0.04)
         final_rates.setdefault('layer_rate', 0.02)
 
         return final_rates

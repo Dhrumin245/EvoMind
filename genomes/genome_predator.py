@@ -123,6 +123,69 @@ class PredatorPackBrain:
         return self._coordinate_pack_actions(actions)
 
     def _coordinate_pack_actions(self, actions):
-        # Add predator-specific coordination logic
-        # Example: assign roles, coordinate attacks
+        """Add role diversity to predator pack actions.
+        
+        Discrete actions: 0=forward, 1=left, 2=right
+        
+        Roles:
+        - leader (20%): High aggression, direct approach
+        - flanker (30%): Moderate aggression, side approach
+        - support (50%): Low aggression, defensive/support
+        
+        This creates behavioral diversity which increases structural distance during speciation.
+        """
+        if actions is None or len(actions) == 0:
+            return actions
+        
+        # Convert to numpy if needed
+        if not isinstance(actions, np.ndarray):
+            try:
+                actions = np.array(actions)
+            except:
+                return actions
+        
+        # If actions are continuous (2D), apply role biases
+        # If actions are discrete (1D), just return as-is (bincount will handle role diversity)
+        if actions.ndim == 1:
+            # Discrete actions: already processed, return as-is
+            return actions
+        
+        # For continuous actions (shouldn't reach here with act_batch)
+        # Make a copy to avoid modifying the original
+        actions = actions.copy()
+        
+        num_predators = len(actions)
+        action_dims = actions.shape[1]
+        
+        # Assign roles probabilistically
+        num_leaders = max(1, int(num_predators * 0.2))
+        num_flankers = max(1, int(num_predators * 0.3))
+        num_support = num_predators - num_leaders - num_flankers
+        
+        # Create role assignments
+        role_indices = (
+            list(range(num_leaders)) +
+            list(range(num_leaders, num_leaders + num_flankers)) +
+            list(range(num_leaders + num_flankers, num_predators))
+        )
+        random.shuffle(role_indices)
+        
+        # Apply role-specific biases to actions
+        for i, role_idx in enumerate(role_indices):
+            if i < num_leaders:
+                # Leader: high forward/aggressive motion
+                if action_dims > 2:
+                    actions[role_idx, 0] += 0.3 * np.sign(actions[role_idx, 0] + 0.1)
+                    actions[role_idx, 1] += 0.2 * np.sign(actions[role_idx, 1] + 0.05)
+            elif i < num_leaders + num_flankers:
+                # Flanker: side movement emphasis
+                if action_dims > 2:
+                    actions[role_idx, 1] += 0.2 * np.sign(actions[role_idx, 1] + 0.1)
+                    actions[role_idx, 2] = actions[role_idx, 2] * 0.8  # Reduce attack
+            else:
+                # Support: defensive, reduced aggression
+                if action_dims > 2:
+                    actions[role_idx, 0] = actions[role_idx, 0] * 0.6
+                    actions[role_idx, 2] = actions[role_idx, 2] * 0.5
+        
         return actions
