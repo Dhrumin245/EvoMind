@@ -135,6 +135,9 @@ class CurriculumController:
 
         # Current generation counter
         self.generation = 0
+        self.min_generations_per_stage = 5
+        self.transition_cooldown_generations = 4
+        self.last_transition_generation = -10**9
         
     def update(self, 
                population_stats: Dict[str, float],
@@ -185,7 +188,18 @@ class CurriculumController:
         """
         current_thresholds = self.adapted_thresholds.get(self.current_stage, {})
         upper_thresholds, lower_thresholds = self._get_hysteresis_thresholds(current_thresholds)
-        
+
+        generations_in_stage = int(self.current_performance.generations_in_stage)
+        in_cooldown = (self.generation - self.last_transition_generation) < self.transition_cooldown_generations
+        catastrophic_regression = self._is_catastrophic_regression(
+            population_stats, diversity_score, success_rate, lower_thresholds
+        )
+
+        # Prevent rapid stage flip-flopping. Only catastrophic regressions can
+        # bypass the dwell-time/cooldown guardrails.
+        if (generations_in_stage < self.min_generations_per_stage or in_cooldown) and not catastrophic_regression:
+            return None
+
         # Check if we should advance
         if self._should_advance(population_stats, diversity_score, success_rate, upper_thresholds):
             next_stage = self._get_next_stage(self.current_stage)
@@ -199,6 +213,18 @@ class CurriculumController:
                 return prev_stage
         
         return None
+
+    def _is_catastrophic_regression(self,
+                                    population_stats: Dict[str, float],
+                                    diversity_score: float,
+                                    success_rate: float,
+                                    thresholds: Dict[str, float]) -> bool:
+        min_mean = float(thresholds.get('min_mean_fitness', 0.0))
+        return (
+            diversity_score < 0.03 or
+            success_rate < 0.05 or
+            population_stats.get('mean', 0.0) < min_mean * 0.35
+        )
     
     def _should_advance(self,
                        population_stats: Dict[str, float],
@@ -347,6 +373,7 @@ class CurriculumController:
         # Update to new stage
         old_stage = self.current_stage
         self.current_stage = new_stage
+        self.last_transition_generation = self.generation
         
         # Create new performance tracker
         self.current_performance = StagePerformance(
