@@ -39,9 +39,12 @@ class EvoTrainer:
     - resume(checkpoint) → load and continue
     """
     
-    def __init__(self, config_path: str = "data/config.json"):
-        self.config_path = Path(config_path)
-        self.checkpoint_dir = Path("data/checkpoints")
+    def __init__(self, base_dir: str = "data", config_path: Optional[str] = None):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.state_base_path = self.base_dir / "coevolution_state.json"
+        self.config_path = Path(config_path) if config_path is not None else (self.base_dir / "config.json")
+        self.checkpoint_dir = self.base_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Training state
@@ -66,18 +69,16 @@ class EvoTrainer:
             "last_update": ""
         }
 
-    @staticmethod
-    def _split_state_exists() -> bool:
-        return Path("data/config.json").exists() and Path("data/expirement_state.json").exists()
+    def _split_state_exists(self) -> bool:
+        return (self.base_dir / "config.json").exists() and (self.base_dir / "expirement_state.json").exists()
 
-    @staticmethod
-    def _metrics_file_candidates() -> List[Path]:
+    def _metrics_file_candidates(self) -> List[Path]:
         # Keep backward compatibility with historical typo-based filenames.
         return [
+            self.base_dir / "metrices.csv",
+            self.base_dir / "metrics.csv",
             Path("data/metrices.csv"),
             Path("data/metrics.csv"),
-            Path("metrices.csv"),
-            Path("metrics.csv"),
         ]
 
     def get_metrics_file(self) -> Optional[Path]:
@@ -245,6 +246,91 @@ class EvoTrainer:
             "diversity_trend": diversity_trend,
             "learning_trend": learning_trend,
         }
+
+    def get_metrics_payload(
+        self,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        since_generation: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return paginated raw metric rows, preferring live in-memory stats."""
+        source = "none"
+        rows: List[Dict[str, Any]] = []
+
+        if self.state and self.state.generation_stats:
+            source = "memory"
+            rows = []
+            for stat in self.state.generation_stats:
+                if not isinstance(stat, dict):
+                    continue
+                generation = self._as_int(stat.get("generation"), self._as_int(stat.get("gen"), 0))
+                if since_generation is not None and generation < since_generation:
+                    continue
+                rows.append(stat)
+        else:
+            csv_rows = self.get_metrics_rows(limit=None, offset=0, since_generation=since_generation)
+            if csv_rows:
+                source = "metrics_csv"
+                rows = csv_rows
+
+        total = len(rows)
+        safe_offset = max(0, int(offset))
+        if safe_offset >= total:
+            paged_rows: List[Dict[str, Any]] = []
+        else:
+            paged_rows = rows[safe_offset:]
+
+        if limit is not None:
+            safe_limit = max(0, int(limit))
+            paged_rows = paged_rows[:safe_limit]
+
+        return {
+            "source": source,
+            "total": total,
+            "count": len(paged_rows),
+            "limit": limit,
+            "offset": safe_offset,
+            "since_generation": since_generation,
+            "items": paged_rows,
+        }
+
+    def list_checkpoints(self, limit: Optional[int] = 20) -> List[Dict[str, Any]]:
+        """List checkpoint marker files and their associated artifacts."""
+        if not self.checkpoint_dir.exists():
+            return []
+
+        checkpoint_items: List[Dict[str, Any]] = []
+        marker_files = sorted(
+            (
+                path for path in self.checkpoint_dir.glob("checkpoint_gen_*.json")
+                if not path.name.endswith("_config.json")
+                and not path.name.endswith("_expirement_state.json")
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+
+        for marker_path in marker_files:
+            try:
+                marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception:
+                marker_payload = {}
+
+            checkpoint_items.append({
+                "checkpoint_path": str(marker_path),
+                "generation": self._as_int(marker_payload.get("generation"), 0),
+                "saved_at_utc": str(marker_payload.get("saved_at_utc", "")),
+                "config_path": str(marker_payload.get("config", "")) or None,
+                "experiment_path": str(marker_payload.get("experiment", "")) or None,
+                "metrics_path": str(marker_payload.get("metrics", "")) or None,
+                "marker_exists": marker_path.exists(),
+            })
+
+        if limit is None:
+            return checkpoint_items
+
+        safe_limit = max(0, int(limit))
+        return checkpoint_items[:safe_limit]
     
     async def initialize(self):
         """Initialize or load training state"""
@@ -252,7 +338,7 @@ class EvoTrainer:
             if self._split_state_exists():
                 try:
                     # Load existing split state produced by save_coevolution_state
-                    self.state = load_coevolution_state()
+                    self.state = load_coevolution_state(str(self.state_base_path))
                     logger.info(f"Loaded existing state at generation {self.state.generation}")
                 except (FileNotFoundError, ValueError) as exc:
                     logger.warning(f"Failed to load existing state ({exc}); starting fresh")
@@ -507,7 +593,7 @@ class EvoTrainer:
                 state.generation += 1
 
                 # Keep canonical state current for automatic resume.
-                await asyncio.to_thread(save_coevolution_state, state)
+                await asyncio.to_thread(save_coevolution_state, state, str(self.state_base_path))
                 if evaluator is not None and hasattr(evaluator, "save_seeds"):
                     await asyncio.to_thread(evaluator.save_seeds)
                 
@@ -574,7 +660,7 @@ class EvoTrainer:
         path_obj.parent.mkdir(parents=True, exist_ok=True)
 
         # Always update canonical split state for API auto-resume.
-        await asyncio.to_thread(save_coevolution_state, self.state)
+        await asyncio.to_thread(save_coevolution_state, self.state, str(self.state_base_path))
         # Save generation snapshot in checkpoint namespace.
         await asyncio.to_thread(save_coevolution_state, self.state, str(path_obj))
 

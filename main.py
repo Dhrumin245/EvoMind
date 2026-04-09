@@ -341,7 +341,7 @@ class EvolutionConfig:
     num_opponents_per_eval: int = 2
     hall_of_fame_size: int = 10
 
-    # Milestone 4: Speciation + novelty archive knobs
+    # Speciation + novelty archive knobs
     speciation_enabled: bool = True
     speciation_compatibility_threshold: float = 2.0
     speciation_compatibility_decay_rate: float = 400.0
@@ -4516,6 +4516,21 @@ async def main_coevolution_async(runtime_overrides: Optional[RuntimeOverrides] =
 
 
         training_state.generation += 1
+
+        # Persist the post-evolution state so resume starts from the completed round.
+        save_coevolution_state(
+            training_state,
+            curriculum_controller=curriculum_controller,
+            architect_population=architect_population,
+            mutator_population=mutator_population,
+            prey_engine=prey_engine,
+            predator_engine=predator_engine,
+            loop_runtime_state={
+                'stagnation_generations': stagnation_generations,
+                'last_combined_best': last_combined_best,
+            },
+        )
+        evaluator.save_seeds()
 
     # Final save
     save_coevolution_state(

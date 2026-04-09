@@ -455,10 +455,13 @@ def create_app(metrics_path: Path, refresh_seconds: float, max_points: int, api_
             if api_err is not None:
                 api_text = api_err
             else:
-                api_text = (
-                    f"API status={api_status.get('status', 'unknown')} "
-                    f"gen={api_status.get('generation', 'n/a')}"
-                )
+                if api_status is not None:
+                    api_text = (
+                        f"API status={api_status.get('status', 'unknown')} "
+                        f"gen={api_status.get('generation', 'n/a')}"
+                    )
+                else:
+                    api_text = "API status unavailable"
 
             status = f"Watching: {path} | {err} | {api_text}"
             return (
@@ -494,11 +497,14 @@ def create_app(metrics_path: Path, refresh_seconds: float, max_points: int, api_
         if api_err is not None:
             api_text = api_err
         else:
-            api_text = (
-                f"API status={api_status.get('status', 'unknown')} "
-                f"gen={api_status.get('generation', 'n/a')} "
-                f"stage={api_status.get('curriculum_stage', 'unknown')}"
-            )
+            if api_status is not None:
+                api_text = (
+                    f"API status={api_status.get('status', 'unknown')} "
+                    f"gen={api_status.get('generation', 'n/a')} "
+                    f"stage={api_status.get('curriculum_stage', 'unknown')}"
+                )
+            else:
+                api_text = "API status unavailable"
 
         status = (
             f"Watching: {path} | rows={len(rows)} | latest_generation={latest_gen} "

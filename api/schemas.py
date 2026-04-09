@@ -93,6 +93,223 @@ class AgentResponse(BaseModel):
     generation: int
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="Action confidence based on fitness")
 
+class BatchAgentQuery(BaseModel):
+    observations: List[List[float]] = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Batch of environment observation vectors",
+    )
+    genome_type: GenomeType
+    generation: Optional[int] = None
+    max_action_length: Optional[int] = Field(10, ge=1, le=10)
+
+class BatchAgentResponse(BaseModel):
+    genome_id: str
+    genome_type: GenomeType
+    generation: int
+    genome_fitness: float
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    batch_size: int
+    actions: List[List[float]]
+
+class GenomeSummary(BaseModel):
+    genome_id: str
+    genome_type: GenomeType
+    fitness: float
+    generation: int
+    source: str
+    gene_count: int = 0
+    input_size: int = 0
+    output_size: int = 0
+    architecture: Optional[str] = None
+
+class GenomeListResponse(BaseModel):
+    count: int
+    items: List[GenomeSummary]
+
+class CheckpointSummary(BaseModel):
+    checkpoint_path: str
+    generation: int
+    saved_at_utc: str = ""
+    config_path: Optional[str] = None
+    experiment_path: Optional[str] = None
+    metrics_path: Optional[str] = None
+    marker_exists: bool = True
+
+class CheckpointListResponse(BaseModel):
+    count: int
+    items: List[CheckpointSummary]
+
+class CreateCheckpointRequest(BaseModel):
+    path: Optional[str] = Field(
+        default=None,
+        description="Optional custom checkpoint marker path",
+    )
+
+class CreateCheckpointResponse(BaseModel):
+    checkpoint: CheckpointSummary
+
+class MetricsResponse(BaseModel):
+    source: str
+    total: int
+    count: int
+    limit: Optional[int] = None
+    offset: int = 0
+    since_generation: Optional[int] = None
+    items: List[Dict[str, Any]]
+
+class JobCreateRequest(BaseModel):
+    job_id: Optional[str] = Field(
+        default=None,
+        description="Optional custom job identifier",
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="Friendly display name for the job",
+    )
+
+class JobSummary(BaseModel):
+    job_id: str
+    tenant_id: str
+    name: str
+    base_dir: str
+    created_at: str
+    updated_at: str
+    status: str
+    generation: int = 0
+
+class JobListResponse(BaseModel):
+    count: int
+    items: List[JobSummary]
+
+class TenantLimitsResponse(BaseModel):
+    tenant_id: str
+    requests_per_minute: int
+    requests_per_day: int
+    max_jobs: int
+
+class UsageSummaryResponse(BaseModel):
+    tenant_id: str
+    requests_last_minute: int
+    requests_last_day: int
+    requests_total: int
+    requests_per_minute_limit: int
+    requests_per_day_limit: int
+    max_jobs: int
+    remaining_this_minute: int
+    remaining_today: int
+    estimated_cost_last_day_usd: float = 0.0
+    estimated_cost_total_usd: float = 0.0
+
+class BillingTierInfo(BaseModel):
+    method: str
+    route_template: str
+    billing_tier: str
+    unit_name: str
+    unit_price_usd: float
+    description: str
+
+class BillingTiersResponse(BaseModel):
+    count: int
+    items: List[BillingTierInfo]
+
+class UsageExportRow(BaseModel):
+    created_at: str
+    tenant_id: str
+    key_id: str
+    method: str
+    path: str
+    route_template: Optional[str] = None
+    status_code: int
+    duration_ms: float
+    job_id: Optional[str] = None
+    billing_tier: str
+    billed_units: int
+    unit_price_usd: float
+    estimated_cost_usd: float
+
+class UsageExportResponse(BaseModel):
+    tenant_id: str
+    count: int
+    items: List[UsageExportRow]
+
+class JobEvent(BaseModel):
+    event_id: str
+    tenant_id: str
+    job_id: str
+    event_type: str
+    payload: Dict[str, Any]
+    created_at: str
+
+class JobEventListResponse(BaseModel):
+    count: int
+    items: List[JobEvent]
+
+class WebhookCreateRequest(BaseModel):
+    url: str = Field(..., min_length=8, description="Webhook target URL")
+    description: Optional[str] = Field(default=None, description="Optional display name")
+    subscribed_events: List[str] = Field(
+        default_factory=list,
+        description="Optional event filter list. Empty means all job events.",
+    )
+    secret: Optional[str] = Field(
+        default=None,
+        description="Optional signing secret for X-Evomind-Signature",
+    )
+
+class WebhookSummary(BaseModel):
+    webhook_id: str
+    tenant_id: str
+    url: str
+    description: str
+    subscribed_events: List[str]
+    status: str
+    created_at: str
+    updated_at: str
+    last_delivery_at: Optional[str] = None
+    last_delivery_status: Optional[str] = None
+    last_delivery_error: Optional[str] = None
+
+class WebhookListResponse(BaseModel):
+    count: int
+    items: List[WebhookSummary]
+
+class WebhookDeleteResponse(BaseModel):
+    webhook_id: str
+    deleted: bool
+
+class WebhookDeliveryAttempt(BaseModel):
+    attempt_id: str
+    delivery_id: str
+    attempt_number: int
+    status: str
+    response_status_code: Optional[int] = None
+    error_message: Optional[str] = None
+    created_at: str
+    completed_at: Optional[str] = None
+
+class WebhookDelivery(BaseModel):
+    delivery_id: str
+    webhook_id: str
+    event_id: str
+    tenant_id: str
+    job_id: str
+    event_type: str
+    status: str
+    attempt_count: int
+    max_attempts: int
+    next_retry_at: Optional[str] = None
+    delivered_at: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: str
+    updated_at: str
+    attempts: List[WebhookDeliveryAttempt] = Field(default_factory=list)
+
+class WebhookDeliveryListResponse(BaseModel):
+    count: int
+    items: List[WebhookDelivery]
+
 class HealthCheck(BaseModel):
     status: Literal["healthy", "warning", "error"]
     message: str

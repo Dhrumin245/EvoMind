@@ -10,6 +10,8 @@ import multiprocessing
 from dataclasses import dataclass
 from enum import Enum
 
+logger = logging.getLogger(__name__)
+
 class EvaluationMode(Enum):
     SINGLE_AGENT = "single_agent"
     CO_EVOLUTION = "co_evolution"
@@ -71,11 +73,21 @@ class AsyncDeterministicEvaluator:
             thread_name_prefix='eval_cpu_worker_'
         )
         
-        # Process pool for GPU work (safer for CUDA)
-        self.process_pool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=min(4, self.num_workers),  # Fewer processes for GPU
-            mp_context=multiprocessing.get_context('spawn')
-        )
+        # Process pool for GPU work (safer for CUDA). Some Windows/sandboxed
+        # environments deny process creation, so fall back to thread-only mode.
+        try:
+            self.process_pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=min(4, self.num_workers),  # Fewer processes for GPU
+                mp_context=multiprocessing.get_context('spawn')
+            )
+        except Exception as exc:
+            logger.warning(
+                "Process pool unavailable for AsyncDeterministicEvaluator; "
+                "falling back to thread-only evaluation: %s",
+                exc,
+            )
+            self.process_pool = None
+            self.use_gpu = False
         
         # Track deterministic seeds
         self.seed_registry = {}
@@ -132,7 +144,7 @@ class AsyncDeterministicEvaluator:
         )
         
         # Choose execution method based on GPU usage
-        if self.use_gpu:
+        if self.use_gpu and self.process_pool is not None:
             # Use process pool for GPU safety
             loop = asyncio.get_event_loop()
             fitness = await loop.run_in_executor(
@@ -607,7 +619,8 @@ class AsyncDeterministicEvaluator:
     def close(self):
         """Cleanup resources"""
         self.thread_pool.shutdown(wait=True)
-        self.process_pool.shutdown(wait=True)
+        if self.process_pool is not None:
+            self.process_pool.shutdown(wait=True)
 
 
 class HybridEvaluator:
