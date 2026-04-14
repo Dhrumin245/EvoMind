@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List
 import logging
 
 from api.schemas import TrainStatus
+from api.storage import data_dir
 
 # Core project imports
 from main import (
@@ -73,12 +74,13 @@ class EvoTrainer:
         return (self.base_dir / "config.json").exists() and (self.base_dir / "expirement_state.json").exists()
 
     def _metrics_file_candidates(self) -> List[Path]:
+        shared_data_dir = data_dir()
         # Keep backward compatibility with historical typo-based filenames.
         return [
             self.base_dir / "metrices.csv",
             self.base_dir / "metrics.csv",
-            Path("data/metrices.csv"),
-            Path("data/metrics.csv"),
+            shared_data_dir / "metrices.csv",
+            shared_data_dir / "metrics.csv",
         ]
 
     def get_metrics_file(self) -> Optional[Path]:
@@ -331,6 +333,39 @@ class EvoTrainer:
 
         safe_limit = max(0, int(limit))
         return checkpoint_items[:safe_limit]
+
+    @staticmethod
+    def _is_within_directory(candidate: Path, directory: Path) -> bool:
+        try:
+            candidate.relative_to(directory)
+            return True
+        except ValueError:
+            return False
+
+    def resolve_checkpoint_path(self, checkpoint_path: str) -> Path:
+        raw_value = str(checkpoint_path).strip()
+        if not raw_value:
+            raise ValueError("checkpoint_path is required")
+
+        requested_path = Path(raw_value)
+        candidate_path = (
+            requested_path
+            if requested_path.is_absolute()
+            else (self.checkpoint_dir / requested_path)
+        )
+
+        checkpoint_root = self.checkpoint_dir.resolve(strict=False)
+        resolved_candidate = candidate_path.resolve(strict=False)
+        if not self._is_within_directory(resolved_candidate, checkpoint_root):
+            raise ValueError("Checkpoint path must stay within the job checkpoint directory")
+
+        if not candidate_path.exists():
+            raise ValueError("Checkpoint path not found")
+
+        if not candidate_path.is_file():
+            raise ValueError("Checkpoint path must point to a checkpoint marker file")
+
+        return candidate_path
     
     async def initialize(self):
         """Initialize or load training state"""
@@ -630,8 +665,9 @@ class EvoTrainer:
     async def resume(self, checkpoint_path: str) -> Dict[str, Any]:
         """Resume from specific checkpoint"""
         try:
+            resolved_checkpoint_path = self.resolve_checkpoint_path(checkpoint_path)
             # Load state from checkpoint
-            self.state = load_coevolution_state(checkpoint_path)
+            self.state = load_coevolution_state(str(resolved_checkpoint_path))
             
             # Restart training task
             self.start_time = time.time()
@@ -639,7 +675,10 @@ class EvoTrainer:
             self.training_task = asyncio.create_task(self._training_loop())
             
             self.update_status()
-            return self.last_status
+            return {
+                **self.last_status,
+                "checkpoint_path": str(resolved_checkpoint_path),
+            }
             
         except Exception as e:
             logger.error(f"Resume failed: {e}")

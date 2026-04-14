@@ -1,0 +1,10 @@
+{
+  "job_id": "default",
+  "tenant_id": "tenant_smoke",
+  "name": "Default Job",
+  "base_dir": "data\\tenants\\tenant_smoke\\jobs\\default",
+  "created_at": "2026-04-09T16:31:48Z",
+  "updated_at": "2026-04-09T16:31:57Z",
+  "status": "stopped",
+  "generation": 0
+}

@@ -1,10 +1,10 @@
+import asyncio
 import argparse
 import csv
 import hashlib
 import hmac
 import json
 import secrets
-import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -13,6 +13,14 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from api.logging_utils import merge_log_context
+from api.storage import (
+    api_auth_db_path,
+    auto_increment_primary_key_sql,
+    column_names,
+    connect_database,
+    resolve_db_target,
+)
 
 
 DEFAULT_REQUESTS_PER_MINUTE = 120
@@ -341,23 +349,85 @@ class APIKeyPrincipal:
 
 
 class APIKeyStore:
-    def __init__(self, db_path: str = "data/api_auth.db"):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Optional[str] = None, db_url: Optional[str] = None):
+        self.db_target = resolve_db_target(
+            context="API auth",
+            explicit_path=Path(db_path) if db_path is not None else None,
+            explicit_url=db_url,
+            env_url_names=("EVOMIND_API_AUTH_DB_URL",),
+            default_path=api_auth_db_path(),
+        )
+        self.db_path = self.db_target.path
+        self.db_url = self.db_target.url
+        self.db_backend = self.db_target.backend
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self):
+        return connect_database(self.db_target, timeout=30.0)
 
     @staticmethod
-    def _column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
-        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        return {str(row["name"]) for row in rows}
+    def _current_rate_limit_windows(now: Optional[datetime] = None) -> tuple[str, str]:
+        current = now or datetime.now(timezone.utc)
+        return (
+            current.strftime("%Y-%m-%dT%H:%M"),
+            current.strftime("%Y-%m-%d"),
+        )
+
+    def _ensure_tenant_limits_conn(self, conn: Any, tenant_id: str) -> None:
+        now = _utc_now()
+        conn.execute(
+            """
+            INSERT INTO tenant_limits (
+                tenant_id, requests_per_minute, requests_per_day, max_jobs, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id) DO NOTHING
+            """,
+            (
+                tenant_id,
+                DEFAULT_REQUESTS_PER_MINUTE,
+                DEFAULT_REQUESTS_PER_DAY,
+                DEFAULT_MAX_JOBS,
+                now,
+                now,
+            ),
+        )
+
+    def _get_tenant_limits_conn(self, conn: Any, tenant_id: str) -> Dict[str, int]:
+        self._ensure_tenant_limits_conn(conn, tenant_id)
+        row = conn.execute(
+            """
+            SELECT requests_per_minute, requests_per_day, max_jobs
+            FROM tenant_limits
+            WHERE tenant_id = ?
+            """,
+            (tenant_id,),
+        ).fetchone()
+
+        if row is None:
+            return {
+                "requests_per_minute": DEFAULT_REQUESTS_PER_MINUTE,
+                "requests_per_day": DEFAULT_REQUESTS_PER_DAY,
+                "max_jobs": DEFAULT_MAX_JOBS,
+            }
+
+        return {
+            "requests_per_minute": int(row["requests_per_minute"]),
+            "requests_per_day": int(row["requests_per_day"]),
+            "max_jobs": int(row["max_jobs"]),
+        }
+
+    def is_available(self) -> bool:
+        try:
+            with self._connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            id_column_sql = auto_increment_primary_key_sql(self.db_backend)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS api_keys (
@@ -385,9 +455,9 @@ class APIKeyStore:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS usage_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {id_column_sql},
                     tenant_id TEXT NOT NULL,
                     key_id TEXT NOT NULL,
                     method TEXT NOT NULL,
@@ -404,8 +474,20 @@ class APIKeyStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rate_limit_counters (
+                    tenant_id TEXT PRIMARY KEY,
+                    minute_window TEXT NOT NULL,
+                    minute_count INTEGER NOT NULL DEFAULT 0,
+                    day_window TEXT NOT NULL,
+                    day_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
 
-            usage_log_columns = self._column_names(conn, "usage_logs")
+            usage_log_columns = column_names(conn, "usage_logs")
             usage_log_migrations = {
                 "route_template": "TEXT",
                 "billing_tier": "TEXT NOT NULL DEFAULT 'unclassified'",
@@ -497,50 +579,118 @@ class APIKeyStore:
         }
 
     def ensure_tenant_limits(self, tenant_id: str) -> None:
-        now = _utc_now()
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO tenant_limits (
-                    tenant_id, requests_per_minute, requests_per_day, max_jobs, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant_id) DO NOTHING
-                """,
-                (
-                    tenant_id,
-                    DEFAULT_REQUESTS_PER_MINUTE,
-                    DEFAULT_REQUESTS_PER_DAY,
-                    DEFAULT_MAX_JOBS,
-                    now,
-                    now,
-                ),
-            )
+            self._ensure_tenant_limits_conn(conn, tenant_id)
             conn.commit()
 
     def get_tenant_limits(self, tenant_id: str) -> Dict[str, int]:
-        self.ensure_tenant_limits(tenant_id)
+        with self._connect() as conn:
+            limits = self._get_tenant_limits_conn(conn, tenant_id)
+            conn.commit()
+        return limits
+
+    def get_rate_limit_snapshot(self, tenant_id: str) -> Dict[str, int]:
+        limits = self.get_tenant_limits(tenant_id)
+        minute_window, day_window = self._current_rate_limit_windows()
+
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT requests_per_minute, requests_per_day, max_jobs
-                FROM tenant_limits
+                SELECT minute_window, minute_count, day_window, day_count
+                FROM rate_limit_counters
                 WHERE tenant_id = ?
                 """,
                 (tenant_id,),
             ).fetchone()
 
-        if row is None:
-            return {
-                "requests_per_minute": DEFAULT_REQUESTS_PER_MINUTE,
-                "requests_per_day": DEFAULT_REQUESTS_PER_DAY,
-                "max_jobs": DEFAULT_MAX_JOBS,
-            }
+        minute_count = 0
+        day_count = 0
+        if row is not None:
+            if str(row["minute_window"]) == minute_window:
+                minute_count = int(row["minute_count"] or 0)
+            if str(row["day_window"]) == day_window:
+                day_count = int(row["day_count"] or 0)
 
         return {
-            "requests_per_minute": int(row["requests_per_minute"]),
-            "requests_per_day": int(row["requests_per_day"]),
-            "max_jobs": int(row["max_jobs"]),
+            "minute_count": minute_count,
+            "day_count": day_count,
+            **limits,
+        }
+
+    def consume_rate_limit(self, tenant_id: str, requests: int = 1) -> Dict[str, int]:
+        normalized_requests = max(1, int(requests))
+        now = datetime.now(timezone.utc)
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        minute_window, day_window = self._current_rate_limit_windows(now)
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            limits = self._get_tenant_limits_conn(conn, tenant_id)
+            row = conn.execute(
+                """
+                SELECT minute_window, minute_count, day_window, day_count
+                FROM rate_limit_counters
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
+            ).fetchone()
+
+            minute_count = 0
+            day_count = 0
+            if row is not None:
+                if str(row["minute_window"]) == minute_window:
+                    minute_count = int(row["minute_count"] or 0)
+                if str(row["day_window"]) == day_window:
+                    day_count = int(row["day_count"] or 0)
+
+            next_minute_count = minute_count + normalized_requests
+            next_day_count = day_count + normalized_requests
+
+            if next_minute_count > limits["requests_per_minute"]:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Per-minute request limit exceeded",
+                )
+
+            if next_day_count > limits["requests_per_day"]:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Per-day request limit exceeded",
+                )
+
+            conn.execute(
+                """
+                INSERT INTO rate_limit_counters (
+                    tenant_id,
+                    minute_window,
+                    minute_count,
+                    day_window,
+                    day_count,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE SET
+                    minute_window = excluded.minute_window,
+                    minute_count = excluded.minute_count,
+                    day_window = excluded.day_window,
+                    day_count = excluded.day_count,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    tenant_id,
+                    minute_window,
+                    next_minute_count,
+                    day_window,
+                    next_day_count,
+                    now_iso,
+                ),
+            )
+            conn.commit()
+
+        return {
+            "minute_count": next_minute_count,
+            "day_count": next_day_count,
+            **limits,
         }
 
     def set_tenant_limits(
@@ -683,42 +833,21 @@ class APIKeyStore:
         )
 
     def check_rate_limits(self, tenant_id: str) -> Dict[str, int]:
-        limits = self.get_tenant_limits(tenant_id)
-        now = datetime.now(timezone.utc)
-        minute_threshold = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        day_threshold = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        snapshot = self.get_rate_limit_snapshot(tenant_id)
 
-        with self._connect() as conn:
-            minute_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM usage_logs WHERE tenant_id = ? AND created_at >= ?",
-                    (tenant_id, minute_threshold),
-                ).fetchone()[0]
-            )
-            day_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM usage_logs WHERE tenant_id = ? AND created_at >= ?",
-                    (tenant_id, day_threshold),
-                ).fetchone()[0]
-            )
-
-        if minute_count >= limits["requests_per_minute"]:
+        if snapshot["minute_count"] >= snapshot["requests_per_minute"]:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Per-minute request limit exceeded",
             )
 
-        if day_count >= limits["requests_per_day"]:
+        if snapshot["day_count"] >= snapshot["requests_per_day"]:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Per-day request limit exceeded",
             )
 
-        return {
-            "minute_count": minute_count,
-            "day_count": day_count,
-            **limits,
-        }
+        return snapshot
 
     def log_usage(
         self,
@@ -782,18 +911,13 @@ class APIKeyStore:
             conn.commit()
 
     def get_usage_summary(self, tenant_id: str) -> Dict[str, Any]:
-        limits = self.get_tenant_limits(tenant_id)
+        rate_snapshot = self.get_rate_limit_snapshot(tenant_id)
         now = datetime.now(timezone.utc)
-        minute_threshold = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        day_threshold = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        day_threshold = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
         with self._connect() as conn:
-            minute_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM usage_logs WHERE tenant_id = ? AND created_at >= ?",
-                    (tenant_id, minute_threshold),
-                ).fetchone()[0]
-            )
             day_row = conn.execute(
                 """
                 SELECT
@@ -815,7 +939,8 @@ class APIKeyStore:
                 (tenant_id,),
             ).fetchone()
 
-        day_count = int(day_row["request_count"])
+        minute_count = int(rate_snapshot["minute_count"])
+        day_count = int(rate_snapshot["day_count"])
         total_count = int(total_row["request_count"])
         day_cost = self._round_cost(float(day_row["estimated_cost_usd"] or 0.0))
         total_cost = self._round_cost(float(total_row["estimated_cost_usd"] or 0.0))
@@ -824,11 +949,11 @@ class APIKeyStore:
             "requests_last_minute": minute_count,
             "requests_last_day": day_count,
             "requests_total": total_count,
-            "requests_per_minute_limit": limits["requests_per_minute"],
-            "requests_per_day_limit": limits["requests_per_day"],
-            "max_jobs": limits["max_jobs"],
-            "remaining_this_minute": max(0, limits["requests_per_minute"] - minute_count),
-            "remaining_today": max(0, limits["requests_per_day"] - day_count),
+            "requests_per_minute_limit": rate_snapshot["requests_per_minute"],
+            "requests_per_day_limit": rate_snapshot["requests_per_day"],
+            "max_jobs": rate_snapshot["max_jobs"],
+            "remaining_this_minute": max(0, rate_snapshot["requests_per_minute"] - minute_count),
+            "remaining_today": max(0, rate_snapshot["requests_per_day"] - day_count),
             "estimated_cost_last_day_usd": day_cost,
             "estimated_cost_total_usd": total_cost,
         }
@@ -913,7 +1038,7 @@ async def require_api_key(
             detail="Missing API key",
         )
 
-    principal = api_key_store.resolve_key(raw_key)
+    principal = await asyncio.to_thread(api_key_store.resolve_key, raw_key)
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -921,7 +1046,11 @@ async def require_api_key(
         )
 
     request.state.principal = principal
-    request.state.rate_limits = api_key_store.check_rate_limits(principal.tenant_id)
+    merge_log_context(tenant_id=principal.tenant_id, key_id=principal.key_id)
+    request.state.rate_limits = await asyncio.to_thread(
+        api_key_store.consume_rate_limit,
+        principal.tenant_id,
+    )
     return principal
 
 

@@ -1,0 +1,10 @@
+{
+  "job_id": "smoke1",
+  "tenant_id": "tenant_smoke",
+  "name": "Swagger Smoke Test",
+  "base_dir": "data\\tenants\\tenant_smoke\\jobs\\smoke1",
+  "created_at": "2026-04-09T16:02:18Z",
+  "updated_at": "2026-04-09T16:33:08Z",
+  "status": "stopped",
+  "generation": 6
+}

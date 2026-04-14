@@ -1,8 +1,29 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List, Literal, Dict, Any
+from pydantic import BaseModel, Field, conlist
+from typing import Optional, List, Literal, Dict, Any, Annotated
 from enum import Enum
 
+
+MAX_OBSERVATION_VECTOR_LENGTH = 2048
+MAX_BATCH_OBSERVATIONS = 256
+ObservationVector = Annotated[
+    List[float],
+    conlist(
+        float,
+        min_length=1,
+        max_length=MAX_OBSERVATION_VECTOR_LENGTH,
+    ),
+]
+ObservationBatch = Annotated[
+    List[List[float]],
+    conlist(
+        list,
+        min_length=1,
+        max_length=MAX_BATCH_OBSERVATIONS,
+    ),
+]
+
 class TrainStatusEnum(str, Enum):
+    QUEUED = "queued"
     STOPPED = "stopped"
     RUNNING = "running"
     PAUSED = "paused"
@@ -73,17 +94,26 @@ class TrainRequest(BaseModel):
     resume_from: Optional[str] = None  # Optional checkpoint path
 
 class TrainResumeRequest(BaseModel):
-    checkpoint_path: str  # Required for resume
+    checkpoint_path: str = Field(
+        ...,
+        description=(
+            "Checkpoint marker path to resume from. Relative paths are resolved inside "
+            "the job checkpoint directory; absolute paths must also stay inside it."
+        ),
+    )
 
 class GenomeType(str, Enum):
     PREY = "prey"
     PREDATOR = "predator"
 
 class AgentQuery(BaseModel):
-    observation: List[float] = Field(..., min_length=1, description="Environment observation vector")
+    observation: ObservationVector = Field(
+        ...,
+        description="Environment observation vector",
+    )
     genome_type: GenomeType
     generation: Optional[int] = None  # Specific generation, None for latest best
-    max_action_length: Optional[int] = 10
+    max_action_length: Optional[int] = Field(10, ge=1, le=10)
 
 class AgentResponse(BaseModel):
     action: List[float] = Field(..., max_length=10, description="Agent action vector")
@@ -94,10 +124,8 @@ class AgentResponse(BaseModel):
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="Action confidence based on fitness")
 
 class BatchAgentQuery(BaseModel):
-    observations: List[List[float]] = Field(
+    observations: ObservationBatch = Field(
         ...,
-        min_length=1,
-        max_length=256,
         description="Batch of environment observation vectors",
     )
     genome_type: GenomeType
@@ -315,3 +343,15 @@ class HealthCheck(BaseModel):
     message: str
     uptime_seconds: float
 
+
+class ReadinessComponent(BaseModel):
+    name: str
+    healthy: bool
+    detail: str = ""
+
+
+class ReadinessCheck(BaseModel):
+    status: Literal["ready", "not_ready"]
+    message: str
+    uptime_seconds: float
+    components: List[ReadinessComponent] = Field(default_factory=list)

@@ -1,10 +1,11 @@
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import secrets
-import sqlite3
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from api.storage import api_events_db_path, column_names, connect_database, resolve_db_target
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,7 @@ DEFAULT_MAX_DELIVERY_ATTEMPTS = 5
 DEFAULT_DELIVERY_BATCH_SIZE = 20
 DELIVERY_POLL_INTERVAL_SECONDS = 2
 RETRY_DELAYS_SECONDS = [0, 60, 300, 1800, 7200]
+DEFAULT_PROCESSING_LEASE_SECONDS = 300
 
 
 def _utc_now() -> str:
@@ -142,17 +145,35 @@ class WebhookDeliveryRecord:
 
 
 class EventManager:
-    def __init__(self, db_path: str = "data/api_events.db"):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Optional[str] = None, db_url: Optional[str] = None):
+        self.db_target = resolve_db_target(
+            context="API events",
+            explicit_path=Path(db_path) if db_path is not None else None,
+            explicit_url=db_url,
+            env_url_names=("EVOMIND_API_EVENTS_DB_URL",),
+            default_path=api_events_db_path(),
+        )
+        self.db_path = self.db_target.path
+        self.db_url = self.db_target.url
+        self.db_backend = self.db_target.backend
         self._delivery_worker_task: Optional[asyncio.Task] = None
         self._delivery_lock = asyncio.Lock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self):
+        return connect_database(self.db_target, timeout=30.0)
+
+    def is_available(self) -> bool:
+        try:
+            with self._connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
+    def is_worker_running(self) -> bool:
+        task = self._delivery_worker_task
+        return task is not None and not task.done()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -201,6 +222,8 @@ class EventManager:
                     next_retry_at TEXT,
                     delivered_at TEXT,
                     last_error TEXT,
+                    processing_started_at TEXT,
+                    claim_token TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -244,6 +267,16 @@ class EventManager:
                 ON webhook_deliveries (status, next_retry_at, updated_at)
                 """
             )
+            delivery_columns = column_names(conn, "webhook_deliveries")
+            delivery_migrations = {
+                "processing_started_at": "TEXT",
+                "claim_token": "TEXT",
+            }
+            for column_name, column_definition in delivery_migrations.items():
+                if column_name not in delivery_columns:
+                    conn.execute(
+                        f"ALTER TABLE webhook_deliveries ADD COLUMN {column_name} {column_definition}"
+                    )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery
@@ -260,14 +293,82 @@ class EventManager:
         return normalized
 
     @staticmethod
-    def _validate_webhook_url(url: str) -> str:
-        parsed = urllib_parse.urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("Webhook URL must be a valid http or https URL")
-        return url
+    def _is_disallowed_webhook_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return any(
+            (
+                address.is_private,
+                address.is_loopback,
+                address.is_link_local,
+                address.is_multicast,
+                address.is_reserved,
+                address.is_unspecified,
+            )
+        )
 
     @staticmethod
-    def _row_to_event(row: sqlite3.Row) -> JobEventRecord:
+    def _resolve_webhook_host_addresses(hostname: str) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        try:
+            infos = socket.getaddrinfo(
+                hostname,
+                None,
+                proto=socket.IPPROTO_TCP,
+            )
+        except socket.gaierror as exc:
+            raise ValueError("Webhook host could not be resolved") from exc
+
+        addresses: List[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        seen = set()
+        for info in infos:
+            sockaddr = info[4]
+            if not sockaddr:
+                continue
+            ip_text = str(sockaddr[0]).split("%", 1)[0]
+            try:
+                address = ipaddress.ip_address(ip_text)
+            except ValueError:
+                continue
+            if address in seen:
+                continue
+            seen.add(address)
+            addresses.append(address)
+
+        if not addresses:
+            raise ValueError("Webhook host could not be resolved")
+
+        return addresses
+
+    @classmethod
+    def _validate_webhook_url(cls, url: str) -> str:
+        candidate_url = str(url).strip()
+        parsed = urllib_parse.urlparse(candidate_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Webhook URL must be a valid http or https URL")
+
+        if parsed.username or parsed.password:
+            raise ValueError("Webhook URL must not include embedded credentials")
+
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("Webhook URL must include a hostname")
+
+        normalized_host = hostname.strip().lower().rstrip(".")
+        if normalized_host == "localhost" or normalized_host.endswith(".localhost"):
+            raise ValueError("Webhook host must be publicly reachable")
+
+        addresses: List[ipaddress.IPv4Address | ipaddress.IPv6Address]
+        try:
+            addresses = [ipaddress.ip_address(normalized_host)]
+        except ValueError:
+            addresses = cls._resolve_webhook_host_addresses(normalized_host)
+
+        if any(cls._is_disallowed_webhook_ip(address) for address in addresses):
+            raise ValueError("Webhook host must resolve to publicly routable IP addresses")
+
+        normalized_url = parsed._replace(fragment="").geturl()
+        return normalized_url
+
+    @staticmethod
+    def _row_to_event(row: Any) -> JobEventRecord:
         payload_raw = row["payload_json"] if row["payload_json"] else "{}"
         try:
             payload = json.loads(payload_raw)
@@ -285,7 +386,7 @@ class EventManager:
         )
 
     @staticmethod
-    def _row_to_webhook(row: sqlite3.Row) -> WebhookRecord:
+    def _row_to_webhook(row: Any) -> WebhookRecord:
         subscribed_events_raw = row["subscribed_events_json"] or "[]"
         try:
             subscribed_events = json.loads(subscribed_events_raw)
@@ -309,7 +410,7 @@ class EventManager:
         )
 
     @staticmethod
-    def _row_to_delivery(row: sqlite3.Row) -> WebhookDeliveryRecord:
+    def _row_to_delivery(row: Any) -> WebhookDeliveryRecord:
         return WebhookDeliveryRecord(
             delivery_id=str(row["delivery_id"]),
             webhook_id=str(row["webhook_id"]),
@@ -329,7 +430,7 @@ class EventManager:
         )
 
     @staticmethod
-    def _row_to_attempt(row: sqlite3.Row) -> WebhookDeliveryAttemptRecord:
+    def _row_to_attempt(row: Any) -> WebhookDeliveryAttemptRecord:
         response_status_code = row["response_status_code"]
         return WebhookDeliveryAttemptRecord(
             attempt_id=str(row["attempt_id"]),
@@ -351,6 +452,11 @@ class EventManager:
     def _add_seconds(iso_timestamp: str, seconds: int) -> str:
         base = datetime.strptime(iso_timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         return (base + timedelta(seconds=int(seconds))).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _subtract_seconds(iso_timestamp: str, seconds: int) -> str:
+        base = datetime.strptime(iso_timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return (base - timedelta(seconds=int(seconds))).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def create_webhook(
         self,
@@ -491,7 +597,7 @@ class EventManager:
             for webhook in webhooks:
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO webhook_deliveries (
+                    INSERT INTO webhook_deliveries (
                         delivery_id,
                         webhook_id,
                         event_id,
@@ -506,6 +612,7 @@ class EventManager:
                         updated_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+                    ON CONFLICT (webhook_id, event_id) DO NOTHING
                     """,
                     (
                         secrets.token_hex(12),
@@ -521,6 +628,81 @@ class EventManager:
                     ),
                 )
             conn.commit()
+
+    def _claim_due_deliveries(
+        self,
+        due_at: str,
+        limit: int,
+        processing_lease_seconds: int = DEFAULT_PROCESSING_LEASE_SECONDS,
+    ) -> List[WebhookDeliveryRecord]:
+        claim_token = secrets.token_hex(12)
+        stale_threshold = self._subtract_seconds(due_at, processing_lease_seconds)
+        normalized_limit = max(1, int(limit))
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate_rows = conn.execute(
+                """
+                SELECT delivery_id
+                FROM webhook_deliveries
+                WHERE
+                    (
+                        status = 'pending'
+                        AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    )
+                    OR (
+                        status = 'retrying'
+                        AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    )
+                    OR (
+                        status = 'processing'
+                        AND processing_started_at IS NOT NULL
+                        AND processing_started_at <= ?
+                    )
+                ORDER BY
+                    CASE status
+                        WHEN 'processing' THEN 0
+                        WHEN 'retrying' THEN 1
+                        ELSE 2
+                    END,
+                    COALESCE(next_retry_at, created_at) ASC,
+                    created_at ASC
+                LIMIT ?
+                """,
+                (due_at, due_at, stale_threshold, normalized_limit),
+            ).fetchall()
+
+            delivery_ids = [str(row["delivery_id"]) for row in candidate_rows]
+            if not delivery_ids:
+                conn.commit()
+                return []
+
+            placeholders = ",".join("?" for _ in delivery_ids)
+            conn.execute(
+                f"""
+                UPDATE webhook_deliveries
+                SET
+                    status = 'processing',
+                    processing_started_at = ?,
+                    claim_token = ?,
+                    updated_at = ?
+                WHERE delivery_id IN ({placeholders})
+                """,
+                (due_at, claim_token, due_at, *delivery_ids),
+            )
+
+            claimed_rows = conn.execute(
+                """
+                SELECT *
+                FROM webhook_deliveries
+                WHERE claim_token = ?
+                ORDER BY created_at ASC
+                """,
+                (claim_token,),
+            ).fetchall()
+            conn.commit()
+
+        return [self._row_to_delivery(row) for row in claimed_rows]
 
     def list_deliveries(
         self,
@@ -770,6 +952,8 @@ class EventManager:
                     next_retry_at = ?,
                     delivered_at = ?,
                     last_error = ?,
+                    processing_started_at = NULL,
+                    claim_token = NULL,
                     updated_at = ?
                 WHERE delivery_id = ?
                 """,
@@ -941,20 +1125,10 @@ class EventManager:
     ) -> int:
         async with self._delivery_lock:
             due_at = _utc_now()
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM webhook_deliveries
-                    WHERE status IN ('pending', 'retrying')
-                      AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                    ORDER BY next_retry_at ASC, created_at ASC
-                    LIMIT ?
-                    """,
-                    (due_at, max(1, int(limit))),
-                ).fetchall()
-
-            deliveries = [self._row_to_delivery(row) for row in rows]
+            deliveries = self._claim_due_deliveries(
+                due_at=due_at,
+                limit=limit,
+            )
             if not deliveries:
                 return 0
 

@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: evomind
+      POSTGRES_USER: evomind
+      POSTGRES_PASSWORD: evomind
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evomind -d evomind"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  worker:
+    build:
+      context: .
+      target: worker
+    image: evomind-worker:local
+    environment:
+      EVOMIND_DATA_DIR: /app/data
+      EVOMIND_BACKUP_DIR: /app/backups
+      EVOMIND_CONTROL_PLANE_DB_URL: postgresql://evomind:evomind@postgres:5432/evomind
+      EVOMIND_ENV: production
+      EVOMIND_ENABLE_API_DOCS: "false"
+      MPLBACKEND: Agg
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+
+  api:
+    build:
+      context: .
+      target: api
+    image: evomind-api:local
+    environment:
+      EVOMIND_DATA_DIR: /app/data
+      EVOMIND_BACKUP_DIR: /app/backups
+      EVOMIND_CONTROL_PLANE_DB_URL: postgresql://evomind:evomind@postgres:5432/evomind
+      EVOMIND_ENV: production
+      EVOMIND_ENABLE_API_DOCS: "false"
+      MPLBACKEND: Agg
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups

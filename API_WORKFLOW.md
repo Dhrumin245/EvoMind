@@ -12,6 +12,7 @@ It supports:
 - Per-tenant usage logging
 - Per-tenant request limits and job quotas
 - Backward-compatible default-job routes
+- Queue-driven training execution via a separate worker process
 
 At a high level:
 
@@ -20,6 +21,80 @@ At a high level:
 3. The tenant creates one or more jobs.
 4. Each job gets its own isolated trainer state, metrics, checkpoints, and genomes.
 5. The customer uses job-scoped endpoints for training, metrics, checkpoints, and inference.
+
+Training execution is no longer performed inside the API process.
+
+The API now acts as a control plane:
+
+1. authenticated requests enqueue training commands
+2. a separate worker process claims commands from the shared runtime database
+3. the worker runs trainers in its own process and writes runtime status back to the database
+
+The repository also includes a GitHub Actions CI workflow at `.github/workflows/api-ci.yml`.
+
+It currently runs:
+
+- dependency installation from `requirements.txt`
+- Python compile checks for the API modules
+- the full `unittest` suite under `tests/`
+
+
+## Container Deployment
+
+The repo now includes container packaging for both long-running processes:
+
+- `Dockerfile` multi-target build for the API and the training worker
+- `docker-compose.yml` to run the API and worker against PostgreSQL for control-plane state
+- `.dockerignore` to keep local artifacts and runtime state out of the image build context
+
+Build and run locally with:
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- `postgres` for control-plane state
+- `api` on port `8000`
+- `worker` as the external training executor required by API readiness
+
+Control-plane storage is now configurable with environment variables:
+
+- `EVOMIND_CONTROL_PLANE_DB_URL`
+- `EVOMIND_API_AUTH_DB_URL`
+- `EVOMIND_API_EVENTS_DB_URL`
+- `EVOMIND_API_JOBS_DB_URL`
+
+If `EVOMIND_ENV=production`, SQLite is rejected by default unless explicitly overridden with:
+
+- `EVOMIND_ALLOW_SQLITE_IN_PRODUCTION=true`
+
+Artifact and local fallback storage are still configurable with:
+
+- `EVOMIND_DATA_DIR`
+- `EVOMIND_BACKUP_DIR`
+- `EVOMIND_TENANT_ROOT_DIR`
+- `EVOMIND_API_AUTH_DB`
+- `EVOMIND_API_EVENTS_DB`
+- `EVOMIND_API_JOBS_DB`
+
+For production, the intended model is:
+
+- PostgreSQL for auth, events, usage, and runtime coordination
+- tenant job directories under `EVOMIND_TENANT_ROOT_DIR` for checkpoints and artifacts
+- periodic backups created with `python -m api.backup create`
+
+The backup CLI stores tenant artifacts plus SQLite snapshots when SQLite is in use locally:
+
+```bash
+python -m api.backup create
+python -m api.backup restore --input backups/evomind-backup-<timestamp>.tar.gz --force
+```
+
+Run restore with the API and worker stopped so local SQLite fallback files and tenant artifacts can be replaced safely.
+
+SQLite fallback databases are still opened in WAL mode with a busy timeout and foreign keys enabled so the API and worker can coordinate more reliably on a single host.
 
 
 ## Core Concepts
@@ -152,7 +227,10 @@ Responsible for:
 - creating jobs
 - listing jobs
 - loading job metadata
-- caching per-job trainers and agent interfaces
+- runtime claims for active workers
+- command queue persistence for start/resume/stop
+- runtime status snapshots written by workers
+- loading trainer snapshots for read-only API requests
 
 ### `api/trainer.py`
 
@@ -180,9 +258,20 @@ Responsible for:
 
 - FastAPI route definitions
 - wiring auth to endpoints
-- mapping routes to trainer and agent operations
+- mapping training control routes to queue submissions
+- reading runtime status produced by workers
 - compatibility routes
 - usage logging middleware
+
+### `api/worker.py`
+
+Responsible for:
+
+- claiming queued training commands
+- running `EvoTrainer` instances outside the API process
+- heartbeating runtime leases
+- publishing runtime status for polling endpoints
+- emitting actual `job.started`, `job.resumed`, and `job.stopped` events
 
 
 ## Endpoint Groups
@@ -204,6 +293,25 @@ Main fields:
 - `status`
 - `message`
 - `uptime_seconds`
+
+### `GET /health/readiness`
+
+Purpose:
+
+- verify that runtime dependencies are operational for serving production traffic
+
+Readiness now requires:
+
+- API auth database connectivity
+- runtime coordination database connectivity
+- at least one active external training worker heartbeat
+- event database connectivity
+- webhook delivery worker running inside the API process
+
+Behavior:
+
+- returns `200` with `status="ready"` when all dependencies are healthy
+- returns `503` with `status="not_ready"` when any dependency is unhealthy
 
 
 ## 2. Usage and Commercial Limits
@@ -296,35 +404,47 @@ Returns:
 
 Purpose:
 
-- start background training for the selected job
+- queue a training start request for the selected job
 
 Returns:
 
-- full training status snapshot
+- current training status snapshot
+
+Notes:
+
+- the request is accepted by the API immediately
+- the separate worker process performs the actual start
+- if the job is not already running, the returned status is typically `queued`
 
 ### `POST /jobs/{job_id}/train/stop`
 
 Purpose:
 
-- stop training and save a checkpoint
+- queue a training stop request for the selected job
 
 Returns:
 
-- full training status snapshot
+- current training status snapshot
 
 ### `POST /jobs/{job_id}/train/resume`
 
 Purpose:
 
-- resume training from a checkpoint
+- queue a resume request from a checkpoint
 
 Input:
 
 - `checkpoint_path`
 
+Notes:
+
+- `checkpoint_path` must resolve inside the job's checkpoint directory
+- relative paths are resolved from that directory
+- absolute paths outside that directory are rejected
+
 Returns:
 
-- full training status snapshot
+- current training status snapshot
 
 
 ## 5. Training Metrics and Monitoring
@@ -334,6 +454,11 @@ Returns:
 Purpose:
 
 - main dashboard endpoint for current training state
+
+Notes:
+
+- if a worker owns the job, this endpoint returns worker-published runtime status
+- if a start or resume command is queued and no worker has claimed the job yet, status is `queued`
 
 Returns:
 
@@ -692,4 +817,5 @@ Use:
 - Jobs are isolated per tenant.
 - Job creation is quota-limited.
 - Compatibility routes exist, but new integrations should prefer job-scoped routes.
-
+- Training execution requires a separate worker process:
+  `python -m api.worker`

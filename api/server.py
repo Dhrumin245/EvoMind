@@ -1,5 +1,9 @@
+import asyncio
 import csv
 import logging
+import os
+import secrets
+import re
 import time
 from io import StringIO
 from pathlib import Path
@@ -8,12 +12,13 @@ from typing import Any, Dict, Optional, Tuple
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from api.auth import APIKeyPrincipal, api_key_store, require_api_key
 from api.events import EventManager
 from api.interface import AgentInterface
-from api.job_manager import JobManager, JobRecord
+from api.job_manager import JobControlConflictError, JobManager, JobRecord
+from api.logging_utils import configure_logging, merge_log_context, push_log_context, reset_log_context
 from api.schemas import (
     AgentQuery,
     AgentResponse,
@@ -28,6 +33,8 @@ from api.schemas import (
     GenomeSummary,
     GenomeType,
     HealthCheck,
+    ReadinessCheck,
+    ReadinessComponent,
     JobEvent,
     JobEventListResponse,
     JobCreateRequest,
@@ -50,8 +57,67 @@ from api.schemas import (
 from api.trainer import EvoTrainer
 
 
-logging.basicConfig(level=logging.INFO)
+configure_logging(service_name="evomind", component="api")
 logger = logging.getLogger(__name__)
+
+
+def _is_truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_csv(value: Optional[str]) -> list[str]:
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw_value))
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using default=%s", name, raw_value, default)
+        return max(minimum, default)
+
+
+APP_ENV = os.getenv("EVOMIND_ENV", "development").strip().lower() or "development"
+_docs_override = os.getenv("EVOMIND_ENABLE_API_DOCS")
+if _docs_override is None:
+    API_DOCS_ENABLED = APP_ENV != "production"
+else:
+    API_DOCS_ENABLED = _is_truthy(_docs_override)
+
+_default_cors_origins = "http://localhost:3000,http://127.0.0.1:3000" if APP_ENV != "production" else ""
+CORS_ALLOW_ORIGINS = _parse_csv(os.getenv("EVOMIND_CORS_ALLOW_ORIGINS", _default_cors_origins))
+CORS_ALLOW_METHODS = _parse_csv(os.getenv("EVOMIND_CORS_ALLOW_METHODS", "GET,POST,DELETE,OPTIONS"))
+CORS_ALLOW_HEADERS = _parse_csv(
+    os.getenv("EVOMIND_CORS_ALLOW_HEADERS", "Authorization,Content-Type,X-API-Key")
+)
+CORS_ALLOW_CREDENTIALS = _is_truthy(os.getenv("EVOMIND_CORS_ALLOW_CREDENTIALS", "false"))
+if "*" in CORS_ALLOW_ORIGINS and CORS_ALLOW_CREDENTIALS:
+    logger.warning("Disabling CORS credentials because wildcard origin is configured")
+    CORS_ALLOW_CREDENTIALS = False
+
+MAX_REQUEST_BYTES = _read_int_env("EVOMIND_MAX_REQUEST_BYTES", 1_048_576)
+USAGE_LOG_QUEUE_SIZE = _read_int_env("EVOMIND_USAGE_LOG_QUEUE_SIZE", 5000)
+USAGE_LOG_DRAIN_TIMEOUT_SECONDS = _read_int_env("EVOMIND_USAGE_LOG_DRAIN_TIMEOUT_SECONDS", 5)
+SERVICE_STARTED_AT = time.time()
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+class RequestBodyTooLargeError(RuntimeError):
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max(1, int(max_bytes))
+        super().__init__(f"Request body too large (max {self.max_bytes} bytes)")
+
+
+def _resolve_request_id(value: Optional[str]) -> str:
+    normalized = str(value or "").strip()
+    if normalized and len(normalized) <= 128 and re.fullmatch(r"[A-Za-z0-9._:-]+", normalized):
+        return normalized
+    return secrets.token_hex(12)
 
 app = FastAPI(
     title="Evomind API",
@@ -62,51 +128,305 @@ app = FastAPI(
         "Tenant request limits, billing tiers, usage exports, job events, and webhook delivery history are exposed through the API."
     ),
     version="1.6.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
+    docs_url="/docs" if API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_methods=CORS_ALLOW_METHODS or ["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=CORS_ALLOW_HEADERS or ["Authorization", "Content-Type", "X-API-Key"],
 )
 
 job_manager: Optional[JobManager] = None
 event_manager: Optional[EventManager] = None
+usage_log_queue: Optional[asyncio.Queue[Optional[Dict[str, Any]]]] = None
+usage_log_worker_task: Optional[asyncio.Task] = None
+
+
+def _service_uptime_seconds() -> float:
+    return max(0.0, time.time() - SERVICE_STARTED_AT)
+
+
+def _internal_server_error(log_message: str, exc: Optional[Exception] = None) -> HTTPException:
+    if exc is not None:
+        logger.exception(log_message)
+    else:
+        logger.error(log_message)
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
+def _model_dump(model: Any) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()  # type: ignore[no-any-return]
+    return model.dict()  # type: ignore[no-any-return]
+
+
+def _request_body_too_large_response(max_bytes: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={"detail": f"Request body too large (max {max_bytes} bytes)"},
+    )
+
+
+def _install_request_body_limit(request: Request, max_bytes: int) -> None:
+    original_receive = request._receive
+    bytes_read = 0
+
+    async def limited_receive() -> Dict[str, Any]:
+        nonlocal bytes_read
+        message = await original_receive()
+        if message.get("type") != "http.request":
+            return dict(message)
+
+        body = message.get("body", b"") or b""
+        bytes_read += len(body)
+        if bytes_read > max_bytes:
+            raise RequestBodyTooLargeError(max_bytes)
+        return dict(message)
+
+    # Starlette Request reads from this receive hook when parsing the body/stream.
+    request._receive = limited_receive
+
+
+async def _readiness_components() -> list[ReadinessComponent]:
+    components: list[ReadinessComponent] = []
+
+    auth_db_healthy = await asyncio.to_thread(api_key_store.is_available)
+    components.append(
+        ReadinessComponent(
+            name="api_auth_db",
+            healthy=auth_db_healthy,
+            detail="reachable" if auth_db_healthy else "unreachable",
+        )
+    )
+
+    current_job_manager = job_manager
+    runtime_db_healthy = False
+    training_worker_count = 0
+    if current_job_manager is not None:
+        runtime_db_healthy = bool(await asyncio.to_thread(current_job_manager.is_available))
+        if runtime_db_healthy:
+            training_worker_count = len(
+                await asyncio.to_thread(current_job_manager.list_active_workers, "training")
+            )
+    components.append(
+        ReadinessComponent(
+            name="job_runtime_db",
+            healthy=runtime_db_healthy,
+            detail="reachable" if runtime_db_healthy else "unreachable",
+        )
+    )
+
+    components.append(
+        ReadinessComponent(
+            name="training_worker",
+            healthy=training_worker_count > 0,
+            detail=f"{training_worker_count} active worker(s)" if training_worker_count > 0 else "no active workers",
+        )
+    )
+
+    current_event_manager = event_manager
+    events_db_healthy = False
+    worker_healthy = False
+    if current_event_manager is not None:
+        events_db_healthy = bool(await asyncio.to_thread(current_event_manager.is_available))
+        worker_healthy = current_event_manager.is_worker_running()
+
+    components.append(
+        ReadinessComponent(
+            name="api_events_db",
+            healthy=events_db_healthy,
+            detail="reachable" if events_db_healthy else "unreachable",
+        )
+    )
+
+    components.append(
+        ReadinessComponent(
+            name="webhook_worker",
+            healthy=worker_healthy,
+            detail="running" if worker_healthy else "not running",
+        )
+    )
+
+    return components
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(getattr(request, "state", None), "request_id", None)
+    token = push_log_context(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+    )
+    try:
+        logger.exception("Unhandled exception for %s %s", request.method, request.url.path, extra={"event": "request_error"})
+        response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        if request_id:
+            response.headers[REQUEST_ID_HEADER] = str(request_id)
+        return response
+    finally:
+        reset_log_context(token)
+
+
+async def _usage_log_worker_loop() -> None:
+    queue = usage_log_queue
+    if queue is None:
+        return
+
+    while True:
+        payload = await queue.get()
+        try:
+            if payload is None:
+                return
+            await asyncio.to_thread(api_key_store.log_usage, **payload)
+        except Exception:
+            logger.exception(
+                "Usage logging failed tenant=%s key_id=%s path=%s",
+                payload.get("tenant_id") if isinstance(payload, dict) else "<unknown>",
+                payload.get("key_id") if isinstance(payload, dict) else "<unknown>",
+                payload.get("path") if isinstance(payload, dict) else "<unknown>",
+            )
+        finally:
+            queue.task_done()
+
+
+def _enqueue_usage_log(payload: Dict[str, Any]) -> None:
+    queue = usage_log_queue
+    if queue is None:
+        logger.warning("Usage log queue unavailable; dropping record for path=%s", payload.get("path"))
+        return
+    try:
+        queue.put_nowait(payload)
+    except asyncio.QueueFull:
+        logger.error(
+            "Usage log queue full; dropping record tenant=%s key_id=%s path=%s",
+            payload.get("tenant_id"),
+            payload.get("key_id"),
+            payload.get("path"),
+        )
+
+
+def _attach_rate_limit_headers(response, rate_limits: Any) -> None:
+    if not isinstance(rate_limits, dict):
+        return
+
+    def _read_non_negative_int(key: str) -> int:
+        raw_value = rate_limits.get(key)
+        if raw_value is None:
+            return 0
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return 0
+
+    minute_limit = _read_non_negative_int("requests_per_minute")
+    minute_used = _read_non_negative_int("minute_count")
+    day_limit = _read_non_negative_int("requests_per_day")
+    day_used = _read_non_negative_int("day_count")
+
+    response.headers["X-RateLimit-Limit-Minute"] = str(minute_limit)
+    response.headers["X-RateLimit-Used-Minute"] = str(minute_used)
+    response.headers["X-RateLimit-Remaining-Minute"] = str(max(0, minute_limit - minute_used))
+    response.headers["X-RateLimit-Limit-Day"] = str(day_limit)
+    response.headers["X-RateLimit-Used-Day"] = str(day_used)
+    response.headers["X-RateLimit-Remaining-Day"] = str(max(0, day_limit - day_used))
+
+
+def _finalize_request_response(request: Request, response, started_at: float):
+    request_id = getattr(getattr(request, "state", None), "request_id", None)
+    if request_id:
+        response.headers[REQUEST_ID_HEADER] = str(request_id)
+
+    _attach_rate_limit_headers(response, getattr(request.state, "rate_limits", None))
+
+    duration_ms = (time.perf_counter() - started_at) * 1000.0
+    principal = getattr(request.state, "principal", None)
+    job_id = None
+    path_params = getattr(request, "path_params", None)
+    if isinstance(path_params, dict):
+        job_id = path_params.get("job_id")
+    route = request.scope.get("route")
+    route_template = getattr(route, "path", request.url.path)
+    merge_log_context(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=round(duration_ms, 3),
+        route_template=route_template,
+        job_id=job_id,
+    )
+    if principal is not None:
+        merge_log_context(
+            tenant_id=principal.tenant_id,
+            key_id=principal.key_id,
+        )
+    logger.info("Request completed", extra={"event": "request_completed"})
+
+    if principal is not None:
+        billed_units = getattr(request.state, "billable_units", 1)
+        _enqueue_usage_log(
+            {
+                "tenant_id": principal.tenant_id,
+                "key_id": principal.key_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+                "route_template": route_template,
+                "job_id": job_id,
+                "billed_units": billed_units,
+            }
+        )
+
+    return response
 
 
 @app.middleware("http")
 async def usage_logging_middleware(request: Request, call_next):
     started_at = time.perf_counter()
-    response = await call_next(request)
+    request_id = _resolve_request_id(request.headers.get(REQUEST_ID_HEADER))
+    request.state.request_id = request_id
+    token = push_log_context(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+    )
 
-    principal = getattr(request.state, "principal", None)
-    if principal is not None:
-        duration_ms = (time.perf_counter() - started_at) * 1000.0
-        job_id = None
-        path_params = getattr(request, "path_params", None)
-        if isinstance(path_params, dict):
-            job_id = path_params.get("job_id")
-        route = request.scope.get("route")
-        route_template = getattr(route, "path", request.url.path)
-        billed_units = getattr(request.state, "billable_units", 1)
-        api_key_store.log_usage(
-            tenant_id=principal.tenant_id,
-            key_id=principal.key_id,
-            method=request.method,
-            path=request.url.path,
-            status_code=response.status_code,
-            duration_ms=duration_ms,
-            route_template=route_template,
-            job_id=job_id,
-            billed_units=billed_units,
-        )
+    try:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                content_length_value = int(content_length)
+            except ValueError:
+                return _finalize_request_response(
+                    request,
+                    JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header"}),
+                    started_at,
+                )
 
-    return response
+            if content_length_value > MAX_REQUEST_BYTES:
+                return _finalize_request_response(
+                    request,
+                    _request_body_too_large_response(MAX_REQUEST_BYTES),
+                    started_at,
+                )
+
+        _install_request_body_limit(request, MAX_REQUEST_BYTES)
+
+        try:
+            response = await call_next(request)
+        except RequestBodyTooLargeError as exc:
+            response = _request_body_too_large_response(exc.max_bytes)
+
+        return _finalize_request_response(request, response, started_at)
+    finally:
+        reset_log_context(token)
 
 
 def _require_job_manager() -> JobManager:
@@ -122,7 +442,21 @@ def _require_event_manager() -> EventManager:
 
 
 def _job_summary(record: JobRecord) -> JobSummary:
-    return JobSummary(**record.to_dict())
+    return JobSummary(**record.to_dict())  # type: ignore
+
+
+def _serialize_train_status(status: TrainStatus) -> Dict[str, Any]:
+    if hasattr(status, "model_dump"):
+        return status.model_dump()  # type: ignore[no-any-return]
+    return status.dict()  # type: ignore[no-any-return]
+
+
+def _job_control_conflict(job_id: str, exc: JobControlConflictError) -> HTTPException:
+    detail = (
+        f"Job '{job_id}' is currently controlled by another API instance "
+        f"({exc.owner_id}) until {exc.lease_expires_at}"
+    )
+    return HTTPException(status_code=409, detail=detail)
 
 
 def _checkpoint_summary(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,6 +476,7 @@ async def _get_job_components(
     job_id: str,
 ) -> Tuple[JobRecord, EvoTrainer, AgentInterface]:
     manager = _require_job_manager()
+    merge_log_context(job_id=job_id)
 
     record = manager.get_job(principal.tenant_id, job_id)
     if record is None:
@@ -155,7 +490,7 @@ async def _get_job_components(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error("Job load failed for tenant=%s job=%s: %s", principal.tenant_id, job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
     return updated_record, trainer, agent
 
@@ -165,7 +500,83 @@ async def _get_default_job_components(
 ) -> Tuple[JobRecord, EvoTrainer, AgentInterface]:
     manager = _require_job_manager()
     manager.ensure_default_job(principal.tenant_id)
+    merge_log_context(job_id="default")
     return await _get_job_components(principal, "default")
+
+
+def _build_queued_train_status_payload(
+    trainer: EvoTrainer,
+    queued_at: str,
+) -> Dict[str, Any]:
+    status_payload = _serialize_train_status(trainer.status())
+    status_payload["status"] = "queued"
+    status_payload["last_update"] = queued_at
+    system_payload = dict(status_payload.get("system", {})) if isinstance(status_payload.get("system"), dict) else {}
+    system_payload["status"] = "queued"
+    system_payload["last_update"] = queued_at
+    status_payload["system"] = system_payload
+    return status_payload
+
+
+async def _queue_training_command(
+    manager: JobManager,
+    principal: APIKeyPrincipal,
+    job_id: str,
+    command_type: str,
+    checkpoint_path: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    active_claim = await asyncio.to_thread(manager.get_runtime_claim, principal.tenant_id, job_id)
+    pending_command = await asyncio.to_thread(
+        manager.get_pending_command,
+        principal.tenant_id,
+        job_id,
+        [command_type],
+    )
+
+    if command_type in {"start", "resume"} and active_claim is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job '{job_id}' is already running on worker "
+                f"{active_claim.owner_id} until {active_claim.lease_expires_at}"
+            ),
+        )
+
+    if pending_command is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A '{command_type}' command is already queued for job '{job_id}'",
+        )
+
+    if command_type == "stop" and active_claim is None:
+        return {}, None
+
+    payload: Dict[str, Any] = {}
+    if checkpoint_path is not None:
+        payload["checkpoint_path"] = checkpoint_path
+
+    command = await asyncio.to_thread(
+        manager.enqueue_job_command,
+        principal.tenant_id,
+        job_id,
+        command_type,
+        payload,
+    )
+    return _model_dump(command), command.created_at
+
+
+def _effective_train_status_payload(
+    manager: JobManager,
+    principal: APIKeyPrincipal,
+    job_id: str,
+    trainer: EvoTrainer,
+    queued_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    status_payload = _serialize_train_status(trainer.status())
+    status_payload = manager.apply_runtime_status_overlay(principal.tenant_id, job_id, status_payload)
+    if queued_at is not None and status_payload.get("status") != "running":
+        status_payload = _build_queued_train_status_payload(trainer, queued_at)
+    return status_payload
 
 
 async def _emit_job_event(
@@ -210,7 +621,7 @@ async def _run_agent_action(
         raise
     except Exception as e:
         logger.error("Agent action failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 async def _run_agent_batch_action(
@@ -241,20 +652,61 @@ async def _run_agent_batch_action(
         raise
     except Exception as e:
         logger.error("Batch agent action failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.on_event("startup")
 async def startup_event():
-    global job_manager, event_manager
+    global event_manager, job_manager, usage_log_queue, usage_log_worker_task
     job_manager = JobManager()
     event_manager = EventManager()
+    usage_log_queue = asyncio.Queue(maxsize=USAGE_LOG_QUEUE_SIZE)
+    usage_log_worker_task = asyncio.create_task(_usage_log_worker_loop())
     await event_manager.start_worker()
-    logger.info("Evomind API initialized with job isolation and webhook events")
+    logger.info(
+        "Evomind API initialized env=%s docs_enabled=%s cors_origins=%s max_request_bytes=%s usage_log_queue_size=%s",
+        APP_ENV,
+        API_DOCS_ENABLED,
+        CORS_ALLOW_ORIGINS or ["<none>"],
+        MAX_REQUEST_BYTES,
+        USAGE_LOG_QUEUE_SIZE,
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global usage_log_queue, usage_log_worker_task
+
+    queue = usage_log_queue
+    task = usage_log_worker_task
+    if queue is not None and task is not None:
+        try:
+            await queue.put(None)
+            await asyncio.wait_for(queue.join(), timeout=USAGE_LOG_DRAIN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Usage log drain timed out after %ss; forcing shutdown",
+                USAGE_LOG_DRAIN_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.exception("Unexpected failure while draining usage log queue")
+
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Usage log worker stopped with error")
+
+    usage_log_worker_task = None
+    usage_log_queue = None
+
+    current_job_manager = job_manager
+    if current_job_manager is not None:
+        await current_job_manager.shutdown()
+
     current_event_manager = event_manager
     if current_event_manager is not None:
         await current_event_manager.stop_worker()
@@ -262,19 +714,31 @@ async def shutdown_event():
 
 @app.get("/health", response_model=HealthCheck)
 async def health_check():
-    current_manager = job_manager
-    if current_manager is None:
-        return HealthCheck(
-            status="error",
-            message="Job manager has not been initialized",
-            uptime_seconds=0.0,
-        )
-
     return HealthCheck(
         status="healthy",
-        message="Service is ready",
-        uptime_seconds=0.0,
+        message="Service is alive",
+        uptime_seconds=_service_uptime_seconds(),
     )
+
+
+@app.get("/health/readiness", response_model=ReadinessCheck)
+async def readiness_check():
+    components = await _readiness_components()
+    all_healthy = all(component.healthy for component in components)
+    payload = ReadinessCheck(
+        status="ready" if all_healthy else "not_ready",
+        message=(
+            "Service dependencies are ready"
+            if all_healthy
+            else "Dependencies not ready: "
+            + ", ".join(component.name for component in components if not component.healthy)
+        ),
+        uptime_seconds=_service_uptime_seconds(),
+        components=components,
+    )
+    if all_healthy:
+        return payload
+    return JSONResponse(status_code=503, content=_model_dump(payload))
 
 
 @app.post("/jobs", response_model=JobSummary)
@@ -283,7 +747,7 @@ async def create_job(
     principal: APIKeyPrincipal = Depends(require_api_key),
 ):
     manager = _require_job_manager()
-    limits = api_key_store.get_tenant_limits(principal.tenant_id)
+    limits = await asyncio.to_thread(api_key_store.get_tenant_limits, principal.tenant_id)
     existing_jobs = manager.list_jobs(principal.tenant_id)
 
     if len(existing_jobs) >= limits["max_jobs"]:
@@ -313,13 +777,13 @@ async def create_job(
 
 @app.get("/usage/limits", response_model=TenantLimitsResponse)
 async def usage_limits(principal: APIKeyPrincipal = Depends(require_api_key)):
-    limits = api_key_store.get_tenant_limits(principal.tenant_id)
+    limits = await asyncio.to_thread(api_key_store.get_tenant_limits, principal.tenant_id)
     return TenantLimitsResponse(tenant_id=principal.tenant_id, **limits)
 
 
 @app.get("/usage/summary", response_model=UsageSummaryResponse)
 async def usage_summary(principal: APIKeyPrincipal = Depends(require_api_key)):
-    summary = api_key_store.get_usage_summary(principal.tenant_id)
+    summary = await asyncio.to_thread(api_key_store.get_usage_summary, principal.tenant_id)
     return UsageSummaryResponse(tenant_id=principal.tenant_id, **summary)
 
 
@@ -336,7 +800,8 @@ async def usage_export(
     limit: int = Query(default=5000, ge=1, le=50000),
     format: str = Query(default="json", pattern="^(json|csv)$"),
 ):
-    items = api_key_store.export_usage(
+    items = await asyncio.to_thread(
+        api_key_store.export_usage,
         tenant_id=principal.tenant_id,
         days=days,
         limit=limit,
@@ -486,36 +951,47 @@ async def list_job_events(
 async def job_train_start(job_id: str, principal: APIKeyPrincipal = Depends(require_api_key)):
     manager = _require_job_manager()
     _, trainer, _ = await _get_job_components(principal, job_id)
-    await trainer.start()
+    _, queued_at = await _queue_training_command(
+        manager=manager,
+        principal=principal,
+        job_id=job_id,
+        command_type="start",
+    )
     record = manager.update_job_status(principal.tenant_id, job_id, trainer=trainer)
     await _emit_job_event(
         principal,
         job_id,
-        "job.started",
+        "job.start_requested",
         {
-            "status": trainer.last_status,
+            "queued_at": queued_at,
             "job": record.to_dict(),
         },
     )
-    return TrainStatus(**trainer.last_status)
+    return TrainStatus(**_effective_train_status_payload(manager, principal, job_id, trainer, queued_at))
 
 
 @app.post("/jobs/{job_id}/train/stop", response_model=TrainStatus)
 async def job_train_stop(job_id: str, principal: APIKeyPrincipal = Depends(require_api_key)):
     manager = _require_job_manager()
     _, trainer, _ = await _get_job_components(principal, job_id)
-    await trainer.stop()
-    record = manager.update_job_status(principal.tenant_id, job_id, trainer=trainer)
-    await _emit_job_event(
-        principal,
-        job_id,
-        "job.stopped",
-        {
-            "status": trainer.last_status,
-            "job": record.to_dict(),
-        },
+    _, queued_at = await _queue_training_command(
+        manager=manager,
+        principal=principal,
+        job_id=job_id,
+        command_type="stop",
     )
-    return TrainStatus(**trainer.last_status)
+    record = manager.update_job_status(principal.tenant_id, job_id, trainer=trainer)
+    if queued_at is not None:
+        await _emit_job_event(
+            principal,
+            job_id,
+            "job.stop_requested",
+            {
+                "queued_at": queued_at,
+                "job": record.to_dict(),
+            },
+        )
+    return TrainStatus(**_effective_train_status_payload(manager, principal, job_id, trainer))
 
 
 @app.get("/jobs/{job_id}/train/status", response_model=TrainStatus)
@@ -523,7 +999,7 @@ async def job_train_status(job_id: str, principal: APIKeyPrincipal = Depends(req
     manager = _require_job_manager()
     _, trainer, _ = await _get_job_components(principal, job_id)
     manager.update_job_status(principal.tenant_id, job_id, trainer=trainer)
-    return trainer.status()
+    return TrainStatus(**_effective_train_status_payload(manager, principal, job_id, trainer))
 
 
 @app.get("/jobs/{job_id}/train/insights", response_model=Dict[str, Any])
@@ -537,7 +1013,7 @@ async def job_train_insights(
         return trainer.get_insights(last_n=last_n)
     except Exception as e:
         logger.error("Insights retrieval failed for job=%s: %s", job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.get("/jobs/{job_id}/train/metrics", response_model=MetricsResponse)
@@ -564,23 +1040,29 @@ async def job_train_resume(
 ):
     manager = _require_job_manager()
     _, trainer, _ = await _get_job_components(principal, job_id)
-    result = await trainer.resume(request.checkpoint_path)
-
-    if result.get("status") == "resume_failed":
-        raise HTTPException(status_code=400, detail=result.get("error", "Resume failed"))
-
+    try:
+        checkpoint_path = str(trainer.resolve_checkpoint_path(request.checkpoint_path))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _, queued_at = await _queue_training_command(
+        manager=manager,
+        principal=principal,
+        job_id=job_id,
+        command_type="resume",
+        checkpoint_path=checkpoint_path,
+    )
     record = manager.update_job_status(principal.tenant_id, job_id, trainer=trainer)
     await _emit_job_event(
         principal,
         job_id,
-        "job.resumed",
+        "job.resume_requested",
         {
-            "checkpoint_path": request.checkpoint_path,
-            "status": trainer.last_status,
+            "checkpoint_path": checkpoint_path,
+            "queued_at": queued_at,
             "job": record.to_dict(),
         },
     )
-    return TrainStatus(**trainer.last_status)
+    return TrainStatus(**_effective_train_status_payload(manager, principal, job_id, trainer, queued_at))
 
 
 @app.get("/jobs/{job_id}/train/checkpoints", response_model=CheckpointListResponse)
@@ -590,7 +1072,8 @@ async def job_list_checkpoints(
     principal: APIKeyPrincipal = Depends(require_api_key),
 ):
     _, trainer, _ = await _get_job_components(principal, job_id)
-    items = [_checkpoint_summary(item) for item in trainer.list_checkpoints(limit=limit)]
+    from api.schemas import CheckpointSummary
+    items = [CheckpointSummary(**_checkpoint_summary(item)) for item in trainer.list_checkpoints(limit=limit)]
     return CheckpointListResponse(count=len(items), items=items)
 
 
@@ -615,7 +1098,7 @@ async def job_create_checkpoint(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Checkpoint creation failed for job=%s: %s", job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
     checkpoint_items = trainer.list_checkpoints(limit=None)
     created_checkpoint = next(
@@ -630,15 +1113,17 @@ async def job_create_checkpoint(
             "marker_exists": True,
         },
     )
+    checkpoint_summary = _checkpoint_summary(created_checkpoint)
     await _emit_job_event(
         principal,
         job_id,
         "checkpoint.created",
         {
-            "checkpoint": _checkpoint_summary(created_checkpoint),
+            "checkpoint": checkpoint_summary,
         },
     )
-    return CreateCheckpointResponse(checkpoint=_checkpoint_summary(created_checkpoint))
+    from api.schemas import CheckpointSummary
+    return CreateCheckpointResponse(checkpoint=CheckpointSummary(**checkpoint_summary))
 
 
 @app.post("/jobs/{job_id}/agent/action", response_model=AgentResponse)
@@ -685,7 +1170,7 @@ async def job_agent_info(
         return {"available": True, **summary}
     except Exception as e:
         logger.error("Agent info failed for job=%s: %s", job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.get("/jobs/{job_id}/genomes", response_model=GenomeListResponse)
@@ -710,7 +1195,7 @@ async def job_list_genomes(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Genome listing failed for job=%s: %s", job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.get("/jobs/{job_id}/genomes/{genome_id}", response_model=GenomeSummary)
@@ -737,7 +1222,7 @@ async def job_get_genome(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Genome lookup failed for job=%s: %s", job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 # Compatibility routes. These now operate on the tenant-scoped "default" job.
@@ -745,36 +1230,47 @@ async def job_get_genome(
 async def train_start(principal: APIKeyPrincipal = Depends(require_api_key)):
     manager = _require_job_manager()
     record, trainer, _ = await _get_default_job_components(principal)
-    await trainer.start()
+    _, queued_at = await _queue_training_command(
+        manager=manager,
+        principal=principal,
+        job_id=record.job_id,
+        command_type="start",
+    )
     updated_record = manager.update_job_status(principal.tenant_id, record.job_id, trainer=trainer)
     await _emit_job_event(
         principal,
         record.job_id,
-        "job.started",
+        "job.start_requested",
         {
-            "status": trainer.last_status,
+            "queued_at": queued_at,
             "job": updated_record.to_dict(),
         },
     )
-    return TrainStatus(**trainer.last_status)
+    return TrainStatus(**_effective_train_status_payload(manager, principal, record.job_id, trainer, queued_at))
 
 
 @app.post("/train/stop", response_model=TrainStatus)
 async def train_stop(principal: APIKeyPrincipal = Depends(require_api_key)):
     manager = _require_job_manager()
     record, trainer, _ = await _get_default_job_components(principal)
-    await trainer.stop()
-    updated_record = manager.update_job_status(principal.tenant_id, record.job_id, trainer=trainer)
-    await _emit_job_event(
-        principal,
-        record.job_id,
-        "job.stopped",
-        {
-            "status": trainer.last_status,
-            "job": updated_record.to_dict(),
-        },
+    _, queued_at = await _queue_training_command(
+        manager=manager,
+        principal=principal,
+        job_id=record.job_id,
+        command_type="stop",
     )
-    return TrainStatus(**trainer.last_status)
+    updated_record = manager.update_job_status(principal.tenant_id, record.job_id, trainer=trainer)
+    if queued_at is not None:
+        await _emit_job_event(
+            principal,
+            record.job_id,
+            "job.stop_requested",
+            {
+                "queued_at": queued_at,
+                "job": updated_record.to_dict(),
+            },
+        )
+    return TrainStatus(**_effective_train_status_payload(manager, principal, record.job_id, trainer))
 
 
 @app.get("/train/status", response_model=TrainStatus)
@@ -782,7 +1278,7 @@ async def train_status(principal: APIKeyPrincipal = Depends(require_api_key)):
     manager = _require_job_manager()
     record, trainer, _ = await _get_default_job_components(principal)
     manager.update_job_status(principal.tenant_id, record.job_id, trainer=trainer)
-    return trainer.status()
+    return TrainStatus(**_effective_train_status_payload(manager, principal, record.job_id, trainer))
 
 
 @app.get("/train/insights", response_model=Dict[str, Any])
@@ -795,7 +1291,7 @@ async def train_insights(
         return trainer.get_insights(last_n=last_n)
     except Exception as e:
         logger.error("Insights retrieval failed on default job: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.get("/train/metrics", response_model=MetricsResponse)
@@ -820,23 +1316,29 @@ async def train_resume(
 ):
     manager = _require_job_manager()
     record, trainer, _ = await _get_default_job_components(principal)
-    result = await trainer.resume(request.checkpoint_path)
-
-    if result.get("status") == "resume_failed":
-        raise HTTPException(status_code=400, detail=result.get("error", "Resume failed"))
-
+    try:
+        checkpoint_path = str(trainer.resolve_checkpoint_path(request.checkpoint_path))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _, queued_at = await _queue_training_command(
+        manager=manager,
+        principal=principal,
+        job_id=record.job_id,
+        command_type="resume",
+        checkpoint_path=checkpoint_path,
+    )
     updated_record = manager.update_job_status(principal.tenant_id, record.job_id, trainer=trainer)
     await _emit_job_event(
         principal,
         record.job_id,
-        "job.resumed",
+        "job.resume_requested",
         {
-            "checkpoint_path": request.checkpoint_path,
-            "status": trainer.last_status,
+            "checkpoint_path": checkpoint_path,
+            "queued_at": queued_at,
             "job": updated_record.to_dict(),
         },
     )
-    return TrainStatus(**trainer.last_status)
+    return TrainStatus(**_effective_train_status_payload(manager, principal, record.job_id, trainer, queued_at))
 
 
 @app.get("/train/checkpoints", response_model=CheckpointListResponse)
@@ -845,7 +1347,8 @@ async def list_train_checkpoints(
     principal: APIKeyPrincipal = Depends(require_api_key),
 ):
     _, trainer, _ = await _get_default_job_components(principal)
-    items = [_checkpoint_summary(item) for item in trainer.list_checkpoints(limit=limit)]
+    from api.schemas import CheckpointSummary
+    items = [CheckpointSummary(**_checkpoint_summary(item)) for item in trainer.list_checkpoints(limit=limit)]
     return CheckpointListResponse(count=len(items), items=items)
 
 
@@ -869,7 +1372,7 @@ async def create_train_checkpoint(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Checkpoint creation failed on default job: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
     checkpoint_items = trainer.list_checkpoints(limit=None)
     created_checkpoint = next(
@@ -884,15 +1387,17 @@ async def create_train_checkpoint(
             "marker_exists": True,
         },
     )
+    checkpoint_summary = _checkpoint_summary(created_checkpoint)
     await _emit_job_event(
         principal,
         "default",
         "checkpoint.created",
         {
-            "checkpoint": _checkpoint_summary(created_checkpoint),
+            "checkpoint": checkpoint_summary,
         },
     )
-    return CreateCheckpointResponse(checkpoint=_checkpoint_summary(created_checkpoint))
+    from api.schemas import CheckpointSummary
+    return CreateCheckpointResponse(checkpoint=CheckpointSummary(**checkpoint_summary))
 
 
 @app.post("/agent/action", response_model=AgentResponse)
@@ -936,7 +1441,7 @@ async def agent_info(
         return {"available": True, **summary}
     except Exception as e:
         logger.error("Agent info failed on default job: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.get("/genomes", response_model=GenomeListResponse)
@@ -960,7 +1465,7 @@ async def list_genomes(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Genome listing failed on default job: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 @app.get("/genomes/{genome_id}", response_model=GenomeSummary)
@@ -986,7 +1491,7 @@ async def get_genome(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Genome lookup failed on default job: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_server_error("Internal request handling failed", exc=e)
 
 
 if __name__ == "__main__":
@@ -994,6 +1499,6 @@ if __name__ == "__main__":
         "api.server:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=APP_ENV == "development",
         log_level="info",
     )

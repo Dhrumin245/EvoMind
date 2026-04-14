@@ -22,6 +22,13 @@ class AgentInterface:
         return max(1, min(int(max_action_length), 10))
 
     @staticmethod
+    def _expected_input_size(genome: Any) -> int:
+        try:
+            return int(getattr(genome, "input_size", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
     def _architecture_label(genome: Any) -> str:
         architecture = getattr(genome, "architecture", None)
         if isinstance(architecture, list) and architecture:
@@ -119,6 +126,17 @@ class AgentInterface:
             if brain is None:
                 raise ValueError("Genome has no brain")
 
+            expected_input_size = self._expected_input_size(genome)
+            if expected_input_size > 0 and len(observation) != expected_input_size:
+                return {
+                    "error": (
+                        f"Observation length {len(observation)} does not match "
+                        f"expected input size {expected_input_size}"
+                    ),
+                    "genome_id": getattr(genome, "genome_id", "unknown"),
+                    "action": [0.0] * 4,
+                }
+
             obs_array = np.array(observation, dtype=np.float32)
             action_length = self._normalize_max_action_length(max_action_length)
             action = brain.act_batch(obs_array[None, :])[0][:action_length].tolist()
@@ -132,9 +150,9 @@ class AgentInterface:
                 "confidence": min(1.0, float(getattr(genome, "fitness", 0.0) / 10.0)),
             }
 
-        except Exception as e:
+        except Exception:
             return {
-                "error": f"Inference failed: {str(e)}",
+                "error": "Inference failed",
                 "genome_id": getattr(genome, "genome_id", "unknown"),
                 "action": [0.0] * 4,
             }
@@ -160,6 +178,31 @@ class AgentInterface:
             if brain is None:
                 raise ValueError("Genome has no brain")
 
+            if not observations:
+                return {
+                    "error": "observations cannot be empty",
+                    "genome_id": getattr(genome, "genome_id", "unknown"),
+                    "actions": [],
+                }
+
+            expected_input_size = self._expected_input_size(genome)
+            first_size = len(observations[0])
+            if any(len(item) != first_size for item in observations):
+                return {
+                    "error": "All observation vectors in the batch must have the same length",
+                    "genome_id": getattr(genome, "genome_id", "unknown"),
+                    "actions": [],
+                }
+            if expected_input_size > 0 and first_size != expected_input_size:
+                return {
+                    "error": (
+                        f"Observation length {first_size} does not match expected input size "
+                        f"{expected_input_size}"
+                    ),
+                    "genome_id": getattr(genome, "genome_id", "unknown"),
+                    "actions": [],
+                }
+
             obs_array = np.array(observations, dtype=np.float32)
             if obs_array.ndim != 2:
                 raise ValueError("observations must be a 2D list")
@@ -176,9 +219,9 @@ class AgentInterface:
                 "confidence": min(1.0, float(getattr(genome, "fitness", 0.0) / 10.0)),
                 "batch_size": len(actions),
             }
-        except Exception as e:
+        except Exception:
             return {
-                "error": f"Batch inference failed: {str(e)}",
+                "error": "Batch inference failed",
                 "genome_id": getattr(genome, "genome_id", "unknown"),
                 "actions": [],
             }

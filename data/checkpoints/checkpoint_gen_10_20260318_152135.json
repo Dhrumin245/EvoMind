@@ -1,0 +1,8 @@
+{
+  "generation": 10,
+  "checkpoint_base": "data\\checkpoints\\checkpoint_gen_10_20260318_152135.json",
+  "config": "data\\checkpoints\\checkpoint_gen_10_20260318_152135_config.json",
+  "experiment": "data\\checkpoints\\checkpoint_gen_10_20260318_152135_expirement_state.json",
+  "metrics": "data\\checkpoints\\checkpoint_gen_10_20260318_152135_metrices.csv",
+  "saved_at_utc": "2026-03-18T09:51:41Z"
+}

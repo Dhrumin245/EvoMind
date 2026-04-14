@@ -208,7 +208,7 @@ def _ensure_seed_coverage(
 def _log_heartbeat(generation: int) -> None:
     """Print a compact heartbeat line with human-readable timestamp."""
     stamp = time.strftime("%H:%M:%S", time.localtime())
-    print(f"💓 HEARTBEAT | Gen {generation:04d} | {stamp}")
+    print(f" HEARTBEAT | Gen {generation:04d} | {stamp}")
 
 try:
     import torch

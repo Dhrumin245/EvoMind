@@ -1,0 +1,81 @@
+{
+  "generation": 2,
+  "fitness": 45.043698104800335,
+  "species": 8,
+  "architecture": "8-16-4",
+  "role": "prey",
+  "genome_id": "gen_4623_copy_copy_copy_copy",
+  "genome_signature": "167a8270e6e2503672dd6b49993c2c9ebf8f77e434aeedbea2aa6103b243f8b5",
+  "species_id": "species_8",
+  "artifact_name": "best_prey",
+  "model_file": "best_prey.pt",
+  "model_path": "models\\best_prey.pt",
+  "metadata_file": "best_prey.json",
+  "metadata_path": "models\\best_prey.json",
+  "created_at_utc": "2026-03-20T14:25:36Z",
+  "timestamp_epoch_seconds": 1774016736.1594558,
+  "input_size": 8,
+  "output_size": 4,
+  "gene_count": 2,
+  "module_count": 2,
+  "role_architecture_default": null,
+  "architecture_summary": {
+    "genome_id": "gen_4623_copy_copy_copy_copy",
+    "input_size": 8,
+    "output_size": 4,
+    "total_layers": 2,
+    "total_params": 44440,
+    "skip_connections": 0,
+    "layers": [
+      {
+        "layer": 0,
+        "type": "linear",
+        "input": 8,
+        "output": 16,
+        "activation": "sigmoid",
+        "bias": true,
+        "batch_norm": false,
+        "dropout": 0.11229308032624914,
+        "skip_from": null
+      },
+      {
+        "layer": 1,
+        "type": "linear",
+        "input": 16,
+        "output": 4,
+        "activation": "linear",
+        "bias": true,
+        "batch_norm": false,
+        "dropout": 0.1409464516886116,
+        "skip_from": null
+      }
+    ]
+  },
+  "age": 0,
+  "norm_fitness": 0.0,
+  "novelty_score": 0.0,
+  "novelty_score_norm": 0.0,
+  "meta_parameters": {
+    "reward_gain": 3.8411031468476367,
+    "reward_bias": 0.07683711639119417,
+    "plastic_lr": 2.5796593292168923
+  },
+  "learning_rule": null,
+  "learning_rule_net": {
+    "input_dim": 8,
+    "output_dim": 4,
+    "hidden_dim": 16
+  },
+  "lineage": {
+    "parent_ids": [],
+    "birth_generation": 0,
+    "origin_population": "unknown",
+    "mutation_history_count": 0,
+    "last_eval_metrics": null
+  },
+  "export": {
+    "save_condition": "new_best_fitness",
+    "previous_best_fitness": 43.390585585913996,
+    "fitness_delta_vs_previous": 1.6531125188863385
+  }
+}
