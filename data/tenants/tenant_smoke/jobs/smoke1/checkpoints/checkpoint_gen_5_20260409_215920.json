@@ -1,8 +1,0 @@
-{
-  "generation": 5,
-  "checkpoint_base": "data\\tenants\\tenant_smoke\\jobs\\smoke1\\checkpoints\\checkpoint_gen_5_20260409_215920.json",
-  "config": "data\\tenants\\tenant_smoke\\jobs\\smoke1\\checkpoints\\checkpoint_gen_5_20260409_215920_config.json",
-  "experiment": "data\\tenants\\tenant_smoke\\jobs\\smoke1\\checkpoints\\checkpoint_gen_5_20260409_215920_expirement_state.json",
-  "metrics": "data\\tenants\\tenant_smoke\\jobs\\smoke1\\checkpoints\\checkpoint_gen_5_20260409_215920_metrices.csv",
-  "saved_at_utc": "2026-04-09T16:29:28Z"
-}
