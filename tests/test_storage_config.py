@@ -115,6 +115,61 @@ class StorageConfigTests(unittest.TestCase):
         self.assertEqual(target.url, "postgresql://evomind:secret@example.com:5432/evomind")
         self.assertIsNone(target.path)
 
+    def test_resolve_db_target_supports_file_based_database_url(self) -> None:
+        secret_file = self.base_dir / "control-plane-db-url.txt"
+        secret_file.write_text(
+            "postgresql://evomind:secret@example.com:5432/evomind\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"EVOMIND_CONTROL_PLANE_DB_URL_FILE": str(secret_file)},
+            clear=False,
+        ):
+            target = resolve_db_target(
+                context="test",
+                explicit_path=None,
+                explicit_url=None,
+                env_url_names=("EVOMIND_API_AUTH_DB_URL",),
+                default_path=self.base_dir / "fallback.sqlite3",
+            )
+
+        self.assertEqual(target.backend, "postgres")
+        self.assertEqual(target.url, "postgresql://evomind:secret@example.com:5432/evomind")
+        self.assertIsNone(target.path)
+
+    def test_resolve_db_target_builds_database_url_from_components(self) -> None:
+        password_file = self.base_dir / "control-plane-db-password.txt"
+        password_file.write_text("secret-password\n", encoding="utf-8")
+
+        with patch.dict(
+            os.environ,
+            {
+                "EVOMIND_CONTROL_PLANE_DB_HOST": "postgres.internal",
+                "EVOMIND_CONTROL_PLANE_DB_PORT": "5432",
+                "EVOMIND_CONTROL_PLANE_DB_NAME": "evomind",
+                "EVOMIND_CONTROL_PLANE_DB_USER": "service-account",
+                "EVOMIND_CONTROL_PLANE_DB_PASSWORD_FILE": str(password_file),
+                "EVOMIND_CONTROL_PLANE_DB_SSLMODE": "require",
+            },
+            clear=False,
+        ):
+            target = resolve_db_target(
+                context="test",
+                explicit_path=None,
+                explicit_url=None,
+                env_url_names=("EVOMIND_API_AUTH_DB_URL",),
+                default_path=self.base_dir / "fallback.sqlite3",
+            )
+
+        self.assertEqual(target.backend, "postgres")
+        self.assertEqual(
+            target.url,
+            "postgresql://service-account:secret-password@postgres.internal:5432/evomind?sslmode=require",
+        )
+        self.assertIsNone(target.path)
+
     def test_production_requires_postgres_unless_explicitly_overridden(self) -> None:
         with patch.dict(
             os.environ,

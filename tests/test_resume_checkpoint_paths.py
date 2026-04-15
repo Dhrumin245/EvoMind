@@ -8,13 +8,12 @@ class ResumeCheckpointPathTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.trainer = object.__new__(EvoTrainer)
-        cls.trainer.checkpoint_dir = Path(
-            "data/tenants/tenant_smoke/jobs/default/checkpoints"
-        ).resolve(strict=True)
+        fixture_root = Path("tests/fixtures/resume_checkpoints")
+        cls.trainer.checkpoint_dir = fixture_root.resolve(strict=True)
         cls.valid_checkpoint = next(
             cls.trainer.checkpoint_dir.glob("checkpoint_gen_*.json")
         )
-        cls.outside_checkpoint_file = Path("data/config.json").resolve(strict=True)
+        cls.outside_checkpoint_file = (fixture_root.parent / "outside-config.json").resolve(strict=True)
 
     def test_relative_checkpoint_path_inside_directory_is_allowed(self) -> None:
         resolved = self.trainer.resolve_checkpoint_path(self.valid_checkpoint.name)

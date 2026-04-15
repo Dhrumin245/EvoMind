@@ -1,19 +1,23 @@
 import asyncio
 import hashlib
+import http.client
 import hmac
 import ipaddress
 import json
 import logging
+import os
 import secrets
 import socket
+import ssl
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from cryptography.fernet import Fernet, InvalidToken
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
-from urllib import request as urllib_request
 
+from api.env_utils import read_env_value
 from api.storage import api_events_db_path, column_names, connect_database, resolve_db_target
 
 logger = logging.getLogger(__name__)
@@ -25,6 +29,8 @@ DEFAULT_DELIVERY_BATCH_SIZE = 20
 DELIVERY_POLL_INTERVAL_SECONDS = 2
 RETRY_DELAYS_SECONDS = [0, 60, 300, 1800, 7200]
 DEFAULT_PROCESSING_LEASE_SECONDS = 300
+WEBHOOK_SECRET_ENCRYPTION_ENV_VAR = "EVOMIND_WEBHOOK_SECRET_KEY"
+WEBHOOK_SECRET_ENCRYPTION_PREFIX = "fernet:v1:"
 
 
 def _utc_now() -> str:
@@ -144,6 +150,67 @@ class WebhookDeliveryRecord:
         }
 
 
+@dataclass(frozen=True)
+class ResolvedWebhookTarget:
+    family: int
+    socktype: int
+    proto: int
+    sockaddr: Tuple[Any, ...]
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        target: ResolvedWebhookTarget,
+        timeout: int,
+    ) -> None:
+        super().__init__(host=host, port=port, timeout=timeout)
+        self._target = target
+
+    def connect(self) -> None:
+        raw_socket = socket.socket(
+            self._target.family,
+            self._target.socktype,
+            self._target.proto,
+        )
+        try:
+            raw_socket.settimeout(self.timeout)
+            raw_socket.connect(self._target.sockaddr)
+        except Exception:
+            raw_socket.close()
+            raise
+        self.sock = raw_socket
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        target: ResolvedWebhookTarget,
+        timeout: int,
+    ) -> None:
+        super().__init__(host=host, port=port, timeout=timeout)
+        self._target = target
+
+    def connect(self) -> None:
+        raw_socket = socket.socket(
+            self._target.family,
+            self._target.socktype,
+            self._target.proto,
+        )
+        try:
+            raw_socket.settimeout(self.timeout)
+            raw_socket.connect(self._target.sockaddr)
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        except Exception:
+            raw_socket.close()
+            raise
+
+
 class EventManager:
     def __init__(self, db_path: Optional[str] = None, db_url: Optional[str] = None):
         self.db_target = resolve_db_target(
@@ -156,6 +223,7 @@ class EventManager:
         self.db_path = self.db_target.path
         self.db_url = self.db_target.url
         self.db_backend = self.db_target.backend
+        self._webhook_secret_cipher = self._load_webhook_secret_cipher()
         self._delivery_worker_task: Optional[asyncio.Task] = None
         self._delivery_lock = asyncio.Lock()
         self._init_db()
@@ -283,7 +351,88 @@ class EventManager:
                 ON webhook_delivery_attempts (delivery_id, attempt_number)
                 """
             )
+            self._migrate_webhook_secret_storage(conn)
             conn.commit()
+
+    @staticmethod
+    def _load_webhook_secret_cipher() -> Optional[Fernet]:
+        raw_value = str(read_env_value(WEBHOOK_SECRET_ENCRYPTION_ENV_VAR, "") or "").strip()
+        if not raw_value:
+            return None
+        try:
+            return Fernet(raw_value.encode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"{WEBHOOK_SECRET_ENCRYPTION_ENV_VAR} must be a valid Fernet key"
+            ) from exc
+
+    def _require_webhook_secret_cipher(self) -> Fernet:
+        if self._webhook_secret_cipher is None:
+            raise RuntimeError(
+                "Webhook secret encryption is not configured. "
+                f"Set {WEBHOOK_SECRET_ENCRYPTION_ENV_VAR} to a valid Fernet key."
+            )
+        return self._webhook_secret_cipher
+
+    @staticmethod
+    def _is_encrypted_webhook_secret(value: Optional[str]) -> bool:
+        return str(value or "").startswith(WEBHOOK_SECRET_ENCRYPTION_PREFIX)
+
+    def _encrypt_webhook_secret(self, secret: Optional[str]) -> Optional[str]:
+        if secret is None:
+            return None
+        cipher = self._require_webhook_secret_cipher()
+        token = cipher.encrypt(secret.encode("utf-8")).decode("utf-8")
+        return f"{WEBHOOK_SECRET_ENCRYPTION_PREFIX}{token}"
+
+    def _decrypt_webhook_secret(self, stored_secret: Optional[str]) -> Optional[str]:
+        if stored_secret is None:
+            return None
+        if not self._is_encrypted_webhook_secret(stored_secret):
+            raise RuntimeError(
+                "Legacy plaintext webhook secret detected. "
+                f"Configure {WEBHOOK_SECRET_ENCRYPTION_ENV_VAR} so stored secrets can be migrated."
+            )
+        cipher = self._require_webhook_secret_cipher()
+        token = stored_secret[len(WEBHOOK_SECRET_ENCRYPTION_PREFIX) :].encode("utf-8")
+        try:
+            return cipher.decrypt(token).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError("Webhook secret could not be decrypted with the configured key") from exc
+
+    def _migrate_webhook_secret_storage(self, conn: Any) -> None:
+        rows = conn.execute(
+            """
+            SELECT webhook_id, secret
+            FROM webhooks
+            WHERE secret IS NOT NULL AND secret != ''
+            """
+        ).fetchall()
+        if not rows:
+            return
+
+        if self._webhook_secret_cipher is None:
+            raise RuntimeError(
+                "Stored webhook secrets require encryption at rest. "
+                f"Set {WEBHOOK_SECRET_ENCRYPTION_ENV_VAR} to start the API."
+            )
+
+        migrated_count = 0
+        for row in rows:
+            stored_secret = row["secret"]
+            if self._is_encrypted_webhook_secret(stored_secret):
+                continue
+            conn.execute(
+                "UPDATE webhooks SET secret = ? WHERE webhook_id = ?",
+                (
+                    self._encrypt_webhook_secret(str(stored_secret)),
+                    str(row["webhook_id"]),
+                ),
+            )
+            migrated_count += 1
+
+        if migrated_count > 0:
+            logger.info("Migrated %s webhook secrets from plaintext to encrypted storage", migrated_count)
 
     @staticmethod
     def _parse_subscribed_events(value: Optional[List[str]]) -> List[str]:
@@ -338,7 +487,7 @@ class EventManager:
         return addresses
 
     @classmethod
-    def _validate_webhook_url(cls, url: str) -> str:
+    def _parse_webhook_url(cls, url: str) -> Tuple[urllib_parse.ParseResult, str, str]:
         candidate_url = str(url).strip()
         parsed = urllib_parse.urlparse(candidate_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -355,6 +504,19 @@ class EventManager:
         if normalized_host == "localhost" or normalized_host.endswith(".localhost"):
             raise ValueError("Webhook host must be publicly reachable")
 
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("Webhook URL must include a valid port") from exc
+
+        normalized_url = parsed._replace(fragment="").geturl()
+        return parsed, normalized_host, normalized_url
+
+    @classmethod
+    def _resolve_validated_webhook_addresses(
+        cls,
+        normalized_host: str,
+    ) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
         addresses: List[ipaddress.IPv4Address | ipaddress.IPv6Address]
         try:
             addresses = [ipaddress.ip_address(normalized_host)]
@@ -364,8 +526,96 @@ class EventManager:
         if any(cls._is_disallowed_webhook_ip(address) for address in addresses):
             raise ValueError("Webhook host must resolve to publicly routable IP addresses")
 
-        normalized_url = parsed._replace(fragment="").geturl()
+        return addresses
+
+    @classmethod
+    def _resolve_validated_webhook_targets(
+        cls,
+        normalized_host: str,
+        port: int,
+    ) -> List[ResolvedWebhookTarget]:
+        try:
+            infos = socket.getaddrinfo(
+                normalized_host,
+                port,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except socket.gaierror as exc:
+            raise ValueError("Webhook host could not be resolved") from exc
+
+        targets: List[ResolvedWebhookTarget] = []
+        seen = set()
+        for family, socktype, proto, _, sockaddr in infos:
+            if not sockaddr:
+                continue
+            ip_text = str(sockaddr[0]).split("%", 1)[0]
+            try:
+                address = ipaddress.ip_address(ip_text)
+            except ValueError:
+                continue
+            if address in seen:
+                continue
+            seen.add(address)
+            targets.append(
+                ResolvedWebhookTarget(
+                    family=family,
+                    socktype=socktype,
+                    proto=proto,
+                    sockaddr=tuple(sockaddr),
+                    address=address,
+                )
+            )
+
+        if not targets:
+            raise ValueError("Webhook host could not be resolved")
+
+        if any(cls._is_disallowed_webhook_ip(target.address) for target in targets):
+            raise ValueError("Webhook host must resolve to publicly routable IP addresses")
+
+        return targets
+
+    @classmethod
+    def _validate_webhook_url(cls, url: str) -> str:
+        _, normalized_host, normalized_url = cls._parse_webhook_url(url)
+        cls._resolve_validated_webhook_addresses(normalized_host)
         return normalized_url
+
+    @staticmethod
+    def _webhook_host_header(normalized_host: str, port: int, scheme: str) -> str:
+        default_port = 443 if scheme == "https" else 80
+        host_header = normalized_host
+        if ":" in host_header:
+            host_header = f"[{host_header}]"
+        if port != default_port:
+            host_header = f"{host_header}:{port}"
+        return host_header
+
+    @staticmethod
+    def _webhook_request_target(parsed: urllib_parse.ParseResult) -> str:
+        path = parsed.path or "/"
+        return urllib_parse.urlunparse(("", "", path, parsed.params, parsed.query, ""))
+
+    @staticmethod
+    def _build_webhook_connection(
+        scheme: str,
+        normalized_host: str,
+        port: int,
+        target: ResolvedWebhookTarget,
+    ) -> http.client.HTTPConnection:
+        if scheme == "https":
+            return _PinnedHTTPSConnection(
+                host=normalized_host,
+                port=port,
+                target=target,
+                timeout=DEFAULT_DELIVERY_TIMEOUT_SECONDS,
+            )
+        return _PinnedHTTPConnection(
+            host=normalized_host,
+            port=port,
+            target=target,
+            timeout=DEFAULT_DELIVERY_TIMEOUT_SECONDS,
+        )
 
     @staticmethod
     def _row_to_event(row: Any) -> JobEventRecord:
@@ -385,8 +635,7 @@ class EventManager:
             created_at=str(row["created_at"]),
         )
 
-    @staticmethod
-    def _row_to_webhook(row: Any) -> WebhookRecord:
+    def _row_to_webhook(self, row: Any) -> WebhookRecord:
         subscribed_events_raw = row["subscribed_events_json"] or "[]"
         try:
             subscribed_events = json.loads(subscribed_events_raw)
@@ -406,7 +655,7 @@ class EventManager:
             last_delivery_at=row["last_delivery_at"],
             last_delivery_status=row["last_delivery_status"],
             last_delivery_error=row["last_delivery_error"],
-            secret=row["secret"],
+            secret=self._decrypt_webhook_secret(row["secret"]),
         )
 
     @staticmethod
@@ -470,6 +719,7 @@ class EventManager:
         now = _utc_now()
         normalized_url = self._validate_webhook_url(url)
         normalized_events = self._parse_subscribed_events(subscribed_events)
+        encrypted_secret = self._encrypt_webhook_secret(secret)
 
         with self._connect() as conn:
             conn.execute(
@@ -492,7 +742,7 @@ class EventManager:
                     tenant_id,
                     normalized_url,
                     description or "",
-                    secret,
+                    encrypted_secret,
                     json.dumps(normalized_events),
                     now,
                     now,
@@ -899,6 +1149,11 @@ class EventManager:
             conn.commit()
 
     def _post_webhook(self, webhook: WebhookRecord, event: JobEventRecord) -> int:
+        parsed, normalized_host, _ = self._parse_webhook_url(webhook.url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        targets = self._resolve_validated_webhook_targets(normalized_host, port)
+        request_target = self._webhook_request_target(parsed)
+
         payload = {
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -913,24 +1168,57 @@ class EventManager:
             "User-Agent": "Evomind-Webhooks/1.0",
             "X-Evomind-Event": event.event_type,
             "X-Evomind-Webhook": webhook.webhook_id,
+            "Host": self._webhook_host_header(normalized_host, port, parsed.scheme),
         }
         if webhook.secret:
             headers["X-Evomind-Signature"] = self._signature(webhook.secret, body)
 
-        request = urllib_request.Request(
-            webhook.url,
-            data=body,
-            headers=headers,
-            method="POST",
-        )
-        with urllib_request.urlopen(
-            request,
-            timeout=DEFAULT_DELIVERY_TIMEOUT_SECONDS,
-        ) as response:
-            status_code = getattr(response, "status", 200)
-            if int(status_code) >= 400:
-                raise RuntimeError(f"Webhook returned status {status_code}")
-            return int(status_code)
+        last_error: Optional[urllib_error.URLError] = None
+        for target in targets:
+            connection = self._build_webhook_connection(
+                parsed.scheme,
+                normalized_host,
+                port,
+                target,
+            )
+            try:
+                connection.request("POST", request_target, body=body, headers=headers)
+                response = connection.getresponse()
+                try:
+                    status_code = int(getattr(response, "status", 200))
+                    response.read()
+                finally:
+                    response.close()
+            except (socket.timeout, TimeoutError):
+                last_error = urllib_error.URLError("timed out")
+                continue
+            except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+                last_error = urllib_error.URLError(str(exc))
+                continue
+            finally:
+                connection.close()
+
+            if 300 <= status_code < 400:
+                raise urllib_error.HTTPError(
+                    webhook.url,
+                    status_code,
+                    "Webhook redirect responses are not allowed",
+                    None,
+                    None,
+                )
+            if status_code >= 400:
+                raise urllib_error.HTTPError(
+                    webhook.url,
+                    status_code,
+                    f"Webhook returned status {status_code}",
+                    None,
+                    None,
+                )
+            return status_code
+
+        if last_error is not None:
+            raise last_error
+        raise urllib_error.URLError("Webhook host could not be resolved")
 
     def _set_delivery_state(
         self,

@@ -4,8 +4,9 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
+from api.env_utils import read_env_value
 
 PathLike = Union[str, Path]
 
@@ -22,6 +23,13 @@ class ManagedSqliteConnection(sqlite3.Connection):
 
 class ManagedPostgresConnection:
     backend = "postgres"
+
+    class _NoOpCursor:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
 
     def __init__(self, connection: Any):
         self._connection = connection
@@ -42,14 +50,16 @@ class ManagedPostgresConnection:
             self._connection.close()
 
     @staticmethod
-    def _adapt_query(query: str) -> str:
+    def _adapt_query(query: str) -> Optional[str]:
         normalized = str(query)
-        if normalized.strip().upper() == "BEGIN IMMEDIATE":
-            return "BEGIN"
+        if normalized.strip().upper() in {"BEGIN", "BEGIN IMMEDIATE"}:
+            return None
         return normalized.replace("?", "%s")
 
     def execute(self, query: str, params: Optional[Any] = None):
         adapted_query = self._adapt_query(query)
+        if adapted_query is None:
+            return self._NoOpCursor()
         if params is None:
             return self._connection.execute(adapted_query)
         return self._connection.execute(adapted_query, params)
@@ -139,13 +149,59 @@ def api_jobs_db_path() -> Path:
 
 def _control_plane_url(*specific_names: str) -> Optional[str]:
     for name in specific_names:
-        raw_value = os.getenv(name)
-        if raw_value and raw_value.strip():
-            return raw_value.strip()
-    generic = os.getenv("EVOMIND_CONTROL_PLANE_DB_URL")
-    if generic and generic.strip():
-        return generic.strip()
-    return None
+        raw_value = read_env_value(name)
+        if raw_value:
+            return raw_value
+    generic = read_env_value("EVOMIND_CONTROL_PLANE_DB_URL")
+    if generic:
+        return generic
+    return _build_control_plane_url_from_components()
+
+
+def _build_control_plane_url_from_components() -> Optional[str]:
+    host = str(read_env_value("EVOMIND_CONTROL_PLANE_DB_HOST", "") or "").strip()
+    port = str(read_env_value("EVOMIND_CONTROL_PLANE_DB_PORT", "") or "").strip()
+    database = str(read_env_value("EVOMIND_CONTROL_PLANE_DB_NAME", "") or "").strip()
+    user = str(read_env_value("EVOMIND_CONTROL_PLANE_DB_USER", "") or "").strip()
+    password = str(read_env_value("EVOMIND_CONTROL_PLANE_DB_PASSWORD", "") or "").strip()
+    sslmode = str(read_env_value("EVOMIND_CONTROL_PLANE_DB_SSLMODE", "") or "").strip()
+
+    if not any((host, port, database, user, password, sslmode)):
+        return None
+
+    missing = [
+        name
+        for name, value in (
+            ("EVOMIND_CONTROL_PLANE_DB_HOST", host),
+            ("EVOMIND_CONTROL_PLANE_DB_NAME", database),
+            ("EVOMIND_CONTROL_PLANE_DB_USER", user),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "Incomplete control-plane database configuration. Missing: " + ", ".join(missing)
+        )
+
+    auth = quote(user, safe="")
+    if password:
+        auth += ":" + quote(password, safe="")
+
+    netloc = f"{auth}@{host}"
+    if port:
+        netloc += f":{port}"
+
+    query = urlencode({"sslmode": sslmode}) if sslmode else ""
+    return urlunparse(
+        (
+            "postgresql",
+            netloc,
+            "/" + quote(database, safe=""),
+            "",
+            query,
+            "",
+        )
+    )
 
 
 def resolve_db_target(
