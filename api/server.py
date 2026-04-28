@@ -19,11 +19,19 @@ from api.events import EventManager
 from api.interface import AgentInterface
 from api.job_manager import JobControlConflictError, JobManager, JobRecord
 from api.logging_utils import configure_logging, merge_log_context, push_log_context, reset_log_context
+from api.payments import RazorpayClient
 from api.schemas import (
     AgentQuery,
     AgentResponse,
+    BillingAccountResponse,
+    BillingLedgerEntry,
+    BillingLedgerResponse,
     BillingTierInfo,
     BillingTiersResponse,
+    BillingTopupConfirmRequest,
+    BillingTopupConfirmResponse,
+    BillingTopupRequest,
+    BillingTopupResponse,
     BatchAgentQuery,
     BatchAgentResponse,
     CheckpointListResponse,
@@ -125,9 +133,9 @@ app = FastAPI(
         "API for evolutionary AI training control and agent inference. "
         "Protected endpoints require `X-API-Key: <your-key>` or `Authorization: Bearer <your-key>`. "
         "Each tenant can create isolated jobs with separate state, checkpoints, and metrics. "
-        "Tenant request limits, billing tiers, usage exports, job events, and webhook delivery history are exposed through the API."
+        "Tenant request limits, prepaid credits, billing tiers, usage exports, job events, and webhook delivery history are exposed through the API."
     ),
-    version="1.6.0",
+    version="1.7.0",
     docs_url="/docs" if API_DOCS_ENABLED else None,
     redoc_url="/redoc" if API_DOCS_ENABLED else None,
     openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
@@ -172,9 +180,28 @@ def _request_body_too_large_response(max_bytes: int) -> JSONResponse:
     )
 
 
+def _estimate_tokens_from_size(payload_size: int) -> int:
+    # Approximate tokens from payload size when the API payload is arbitrary JSON
+    # rather than model-native text with a tokenizer available.
+    normalized_size = max(0, int(payload_size))
+    if normalized_size == 0:
+        return 0
+    return (normalized_size + 3) // 4
+
+
+def _response_body_size(response: Any) -> int:
+    body = getattr(response, "body", b"") or b""
+    if isinstance(body, str):
+        return len(body.encode("utf-8"))
+    if isinstance(body, memoryview):
+        return len(body.tobytes())
+    return len(body)
+
+
 def _install_request_body_limit(request: Request, max_bytes: int) -> None:
     original_receive = request._receive
     bytes_read = 0
+    request.state.request_body_bytes_for_billing = 0
 
     async def limited_receive() -> Dict[str, Any]:
         nonlocal bytes_read
@@ -184,6 +211,7 @@ def _install_request_body_limit(request: Request, max_bytes: int) -> None:
 
         body = message.get("body", b"") or b""
         bytes_read += len(body)
+        request.state.request_body_bytes_for_billing += len(body)
         if bytes_read > max_bytes:
             raise RequestBodyTooLargeError(max_bytes)
         return dict(message)
@@ -369,7 +397,11 @@ def _finalize_request_response(request: Request, response, started_at: float):
     logger.info("Request completed", extra={"event": "request_completed"})
 
     if principal is not None:
-        billed_units = getattr(request.state, "billable_units", 1)
+        request_body_tokens = _estimate_tokens_from_size(
+            getattr(request.state, "request_body_bytes_for_billing", 0)
+        )
+        response_body_tokens = _estimate_tokens_from_size(_response_body_size(response))
+        billed_tokens = request_body_tokens + response_body_tokens
         _enqueue_usage_log(
             {
                 "tenant_id": principal.tenant_id,
@@ -380,7 +412,7 @@ def _finalize_request_response(request: Request, response, started_at: float):
                 "duration_ms": duration_ms,
                 "route_template": route_template,
                 "job_id": job_id,
-                "billed_units": billed_units,
+                "billed_tokens": billed_tokens,
             }
         )
 
@@ -775,6 +807,157 @@ async def create_job(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.get("/billing/account", response_model=BillingAccountResponse)
+async def billing_account(principal: APIKeyPrincipal = Depends(require_api_key)):
+    account = await asyncio.to_thread(api_key_store.get_billing_account, principal.tenant_id)
+    return BillingAccountResponse(**account)
+
+
+@app.get("/billing/ledger", response_model=BillingLedgerResponse)
+async def billing_ledger(
+    principal: APIKeyPrincipal = Depends(require_api_key),
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    items = await asyncio.to_thread(api_key_store.list_billing_ledger, principal.tenant_id, limit)
+    return BillingLedgerResponse(
+        tenant_id=principal.tenant_id,
+        count=len(items),
+        items=[BillingLedgerEntry(**item) for item in items],
+    )
+
+
+@app.post("/billing/topups", response_model=BillingTopupResponse)
+async def billing_topup_create(
+    request: BillingTopupRequest,
+    principal: APIKeyPrincipal = Depends(require_api_key),
+):
+    receipt = f"tp_{secrets.token_hex(8)}"
+    notes = {
+        "tenant_id": principal.tenant_id,
+        "requested_amount_inr": f"{request.amount_inr:.2f}",
+    }
+    if request.description:
+        notes["description"] = request.description
+    try:
+        order = await asyncio.to_thread(
+            RazorpayClient.create_order,
+            amount_inr=request.amount_inr,
+            receipt=receipt,
+            notes=notes,
+        )
+        topup = await asyncio.to_thread(
+            api_key_store.create_topup,
+            principal.tenant_id,
+            provider="razorpay",
+            amount_inr=request.amount_inr,
+            provider_order_id=str(order["id"]),
+            receipt=receipt,
+            description=request.description,
+            metadata={
+                "razorpay_order_status": order.get("status"),
+                "razorpay_amount_subunits": order.get("amount"),
+                "notes": order.get("notes") if isinstance(order.get("notes"), dict) else {},
+            },
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return BillingTopupResponse(
+        tenant_id=principal.tenant_id,
+        topup_id=topup["topup_id"],
+        provider=topup["provider"],
+        status=topup["status"],
+        amount_inr=topup["amount_inr"],
+        currency=topup["currency"],
+        receipt=topup["receipt"],
+        provider_order_id=topup["provider_order_id"],
+        checkout_key_id=RazorpayClient.checkout_key_id(),
+        created_at=topup["created_at"],
+    )
+
+
+@app.post("/billing/topups/confirm", response_model=BillingTopupConfirmResponse)
+async def billing_topup_confirm(
+    request: BillingTopupConfirmRequest,
+    principal: APIKeyPrincipal = Depends(require_api_key),
+):
+    try:
+        await asyncio.to_thread(
+            RazorpayClient.verify_checkout_signature,
+            order_id=request.razorpay_order_id,
+            payment_id=request.razorpay_payment_id,
+            signature=request.razorpay_signature,
+        )
+        result = await asyncio.to_thread(
+            api_key_store.confirm_topup_payment,
+            provider="razorpay",
+            provider_order_id=request.razorpay_order_id,
+            provider_payment_id=request.razorpay_payment_id,
+            expected_tenant_id=principal.tenant_id,
+            metadata={"confirmed_via": "checkout_callback"},
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    topup = result["topup"]
+    account = result["account"]
+    return BillingTopupConfirmResponse(
+        tenant_id=principal.tenant_id,
+        topup_id=topup["topup_id"],
+        provider=topup["provider"],
+        status=topup["status"],
+        amount_inr=topup["amount_inr"],
+        payment_id=topup["provider_payment_id"],
+        balance_inr=account["available_credit_inr"],
+        credited=bool(result["credited"]),
+    )
+
+
+@app.post("/billing/providers/razorpay/webhook")
+async def billing_razorpay_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing Razorpay signature header")
+    try:
+        await asyncio.to_thread(
+            RazorpayClient.verify_webhook_signature,
+            body=raw_body,
+            signature=signature,
+        )
+        payload = RazorpayClient.parse_webhook(raw_body)
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    payment = RazorpayClient.extract_captured_payment(payload)
+    if payment is None:
+        return {"ok": True, "ignored": True}
+
+    try:
+        await asyncio.to_thread(
+            api_key_store.confirm_topup_payment,
+            provider="razorpay",
+            provider_order_id=payment["order_id"],
+            provider_payment_id=payment["payment_id"],
+            amount_inr=payment["amount_inr"],
+            metadata={"confirmed_via": "webhook", "event": payment["event"]},
+        )
+    except ValueError as e:
+        logger.warning("Ignored Razorpay webhook order=%s payment=%s: %s", payment["order_id"], payment["payment_id"], e)
+        return {"ok": True, "ignored": True}
+
+    return {"ok": True, "processed": True}
+
+
 @app.get("/usage/limits", response_model=TenantLimitsResponse)
 async def usage_limits(principal: APIKeyPrincipal = Depends(require_api_key)):
     limits = await asyncio.to_thread(api_key_store.get_tenant_limits, principal.tenant_id)
@@ -822,9 +1005,9 @@ async def usage_export(
                 "duration_ms",
                 "job_id",
                 "billing_tier",
-                "billed_units",
-                "unit_price_usd",
-                "estimated_cost_usd",
+                "billed_tokens",
+                "unit_price_inr",
+                "estimated_cost_inr",
             ],
         )
         writer.writeheader()
@@ -1143,7 +1326,6 @@ async def job_agent_action_batch(
     query: BatchAgentQuery,
     principal: APIKeyPrincipal = Depends(require_api_key),
 ):
-    request.state.billable_units = len(query.observations)
     _, _, agent = await _get_job_components(principal, job_id)
     return await _run_agent_batch_action(agent, query)
 
@@ -1415,7 +1597,6 @@ async def agent_action_batch(
     query: BatchAgentQuery,
     principal: APIKeyPrincipal = Depends(require_api_key),
 ):
-    request.state.billable_units = len(query.observations)
     _, _, agent = await _get_default_job_components(principal)
     return await _run_agent_batch_action(agent, query)
 

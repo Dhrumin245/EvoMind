@@ -4,6 +4,7 @@ import csv
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sys
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ DEFAULT_REQUESTS_PER_MINUTE = 120
 DEFAULT_REQUESTS_PER_DAY = 10000
 DEFAULT_MAX_JOBS = 5
 DEFAULT_EXPORT_LIMIT = 5000
+DEFAULT_BILLING_LEDGER_LIMIT = 100
 API_KEY_STATUS_ACTIVE = "active"
 API_KEY_STATUS_REVOKED = "revoked"
 API_KEY_STATUS_EXPIRED = "expired"
@@ -35,6 +37,8 @@ API_KEY_ROLE_ADMIN = "admin"
 API_KEY_ROLE_OPERATOR = "operator"
 API_KEY_ROLE_READER = "reader"
 API_KEY_SCOPE_ALL = "*"
+API_KEY_SCOPE_BILLING_READ = "billing:read"
+API_KEY_SCOPE_BILLING_WRITE = "billing:write"
 API_KEY_SCOPE_USAGE_READ = "usage:read"
 API_KEY_SCOPE_WEBHOOKS_READ = "webhooks:read"
 API_KEY_SCOPE_WEBHOOKS_WRITE = "webhooks:write"
@@ -51,13 +55,18 @@ API_KEY_SCOPE_GENOMES_READ = "genomes:read"
 
 API_KEY_PERMISSION_RULES: Dict[tuple[str, str], tuple[str, ...]] = {}
 for route_template in (
+    "/billing/account",
+    "/billing/ledger",
     "/usage/limits",
     "/usage/summary",
     "/usage/billing-tiers",
     "/usage/export",
 ):
-    API_KEY_PERMISSION_RULES[("GET", route_template)] = (API_KEY_SCOPE_USAGE_READ,)
+    required_scope = API_KEY_SCOPE_BILLING_READ if route_template.startswith("/billing/") else API_KEY_SCOPE_USAGE_READ
+    API_KEY_PERMISSION_RULES[("GET", route_template)] = (required_scope,)
 for method, route_template, scope in (
+    ("POST", "/billing/topups", API_KEY_SCOPE_BILLING_WRITE),
+    ("POST", "/billing/topups/confirm", API_KEY_SCOPE_BILLING_WRITE),
     ("GET", "/webhooks", API_KEY_SCOPE_WEBHOOKS_READ),
     ("POST", "/webhooks", API_KEY_SCOPE_WEBHOOKS_WRITE),
     ("DELETE", "/webhooks/{webhook_id}", API_KEY_SCOPE_WEBHOOKS_WRITE),
@@ -96,6 +105,8 @@ for method, route_template, scope in (
     API_KEY_PERMISSION_RULES[(method, route_template)] = (scope,)
 
 ALL_API_KEY_SCOPES = {
+    API_KEY_SCOPE_BILLING_READ,
+    API_KEY_SCOPE_BILLING_WRITE,
     API_KEY_SCOPE_USAGE_READ,
     API_KEY_SCOPE_WEBHOOKS_READ,
     API_KEY_SCOPE_WEBHOOKS_WRITE,
@@ -113,6 +124,8 @@ ALL_API_KEY_SCOPES = {
 ROLE_DEFAULT_SCOPES = {
     API_KEY_ROLE_ADMIN: [API_KEY_SCOPE_ALL],
     API_KEY_ROLE_OPERATOR: [
+        API_KEY_SCOPE_BILLING_READ,
+        API_KEY_SCOPE_BILLING_WRITE,
         API_KEY_SCOPE_USAGE_READ,
         API_KEY_SCOPE_WEBHOOKS_READ,
         API_KEY_SCOPE_WEBHOOKS_WRITE,
@@ -128,6 +141,7 @@ ROLE_DEFAULT_SCOPES = {
         API_KEY_SCOPE_GENOMES_READ,
     ],
     API_KEY_ROLE_READER: [
+        API_KEY_SCOPE_BILLING_READ,
         API_KEY_SCOPE_USAGE_READ,
         API_KEY_SCOPE_WEBHOOKS_READ,
         API_KEY_SCOPE_JOBS_READ,
@@ -139,316 +153,346 @@ ROLE_DEFAULT_SCOPES = {
     ],
 }
 
-BILLING_CATALOG = [
+USD_TO_INR_REFERENCE_RATE = 93.0
+# Preserve the previous relative price ladder by converting the old USD/request
+# prices into INR/token rates using a 1k-token reference block.
+TOKEN_PRICE_REFERENCE = 1000.0
+
+
+def _inr_price_per_token(usd_price_per_request: float) -> float:
+    return round(
+        (float(usd_price_per_request) * USD_TO_INR_REFERENCE_RATE) / TOKEN_PRICE_REFERENCE,
+        6,
+    )
+
+
+BILLING_TIERS: Dict[str, Dict[str, Any]] = {
+    "admin_free": {
+        "unit_name": "token",
+        "unit_price_inr": 0.0,
+    },
+    "job_write": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.01),
+    },
+    "job_read": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.005),
+    },
+    "job_events": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.005),
+    },
+    "training_control": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.02),
+    },
+    "training_snapshot": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.01),
+    },
+    "training_metrics": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.015),
+    },
+    "artifact_read": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.01),
+    },
+    "artifact_write": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.02),
+    },
+    "inference_single": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.03),
+    },
+    "inference_batch": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.01),
+    },
+    "model_catalog": {
+        "unit_name": "token",
+        "unit_price_inr": _inr_price_per_token(0.005),
+    },
+}
+
+ROUTE_BILLING_CATALOG = [
+    {
+        "method": "GET",
+        "route_template": "/billing/account",
+        "billing_tier": "admin_free",
+        "description": "Read tenant prepaid balance and billing summary",
+    },
+    {
+        "method": "GET",
+        "route_template": "/billing/ledger",
+        "billing_tier": "admin_free",
+        "description": "Read tenant billing ledger history",
+    },
+    {
+        "method": "POST",
+        "route_template": "/billing/topups",
+        "billing_tier": "admin_free",
+        "description": "Create a Razorpay prepaid credit top-up order",
+    },
+    {
+        "method": "POST",
+        "route_template": "/billing/topups/confirm",
+        "billing_tier": "admin_free",
+        "description": "Confirm a successful Razorpay prepaid credit payment",
+    },
     {
         "method": "GET",
         "route_template": "/usage/limits",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Read tenant quota configuration",
     },
     {
         "method": "GET",
         "route_template": "/usage/summary",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Read tenant usage summary",
     },
     {
         "method": "GET",
         "route_template": "/usage/billing-tiers",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Read billing tier catalog",
     },
     {
         "method": "GET",
         "route_template": "/usage/export",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Export tenant usage history",
     },
     {
         "method": "GET",
         "route_template": "/webhooks",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "List tenant webhooks",
     },
     {
         "method": "POST",
         "route_template": "/webhooks",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Create tenant webhook",
     },
     {
         "method": "DELETE",
         "route_template": "/webhooks/{webhook_id}",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Delete tenant webhook",
     },
     {
         "method": "GET",
         "route_template": "/webhooks/{webhook_id}/deliveries",
         "billing_tier": "admin_free",
-        "unit_name": "request",
-        "unit_price_usd": 0.0,
         "description": "Inspect webhook delivery history",
     },
     {
         "method": "POST",
         "route_template": "/jobs",
-        "billing_tier": "job_management",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "job_write",
         "description": "Create a job",
     },
     {
         "method": "GET",
         "route_template": "/jobs",
-        "billing_tier": "job_management",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
+        "billing_tier": "job_read",
         "description": "List jobs",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}",
-        "billing_tier": "job_management",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
+        "billing_tier": "job_read",
         "description": "Get job metadata",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/events",
         "billing_tier": "job_events",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "List job lifecycle events",
     },
     {
         "method": "POST",
         "route_template": "/jobs/{job_id}/train/start",
         "billing_tier": "training_control",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
         "description": "Start training",
     },
     {
         "method": "POST",
         "route_template": "/jobs/{job_id}/train/stop",
         "billing_tier": "training_control",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
         "description": "Stop training",
     },
     {
         "method": "POST",
         "route_template": "/jobs/{job_id}/train/resume",
         "billing_tier": "training_control",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
         "description": "Resume training",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/train/status",
-        "billing_tier": "training_metrics",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "training_snapshot",
         "description": "Read training status snapshot",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/train/insights",
-        "billing_tier": "training_metrics",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "training_snapshot",
         "description": "Read trend insights",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/train/metrics",
         "billing_tier": "training_metrics",
-        "unit_name": "request",
-        "unit_price_usd": 0.015,
         "description": "Read raw metrics rows",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/train/checkpoints",
-        "billing_tier": "training_artifacts",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "artifact_read",
         "description": "List checkpoints",
     },
     {
         "method": "POST",
         "route_template": "/jobs/{job_id}/train/checkpoints",
-        "billing_tier": "training_artifacts",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
+        "billing_tier": "artifact_write",
         "description": "Create checkpoint",
     },
     {
         "method": "POST",
         "route_template": "/jobs/{job_id}/agent/action",
         "billing_tier": "inference_single",
-        "unit_name": "request",
-        "unit_price_usd": 0.03,
         "description": "Single inference call",
     },
     {
         "method": "POST",
         "route_template": "/jobs/{job_id}/agent/action/batch",
         "billing_tier": "inference_batch",
-        "unit_name": "observation",
-        "unit_price_usd": 0.01,
-        "description": "Batch inference charged per observation",
+        "description": "Batch inference charged by payload tokens",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/agent/info",
         "billing_tier": "model_catalog",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "Selected agent metadata",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/genomes",
         "billing_tier": "model_catalog",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "List genomes",
     },
     {
         "method": "GET",
         "route_template": "/jobs/{job_id}/genomes/{genome_id}",
         "billing_tier": "model_catalog",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "Genome metadata lookup",
     },
     {
         "method": "POST",
         "route_template": "/train/start",
         "billing_tier": "training_control",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
         "description": "Start training on the tenant default job",
     },
     {
         "method": "POST",
         "route_template": "/train/stop",
         "billing_tier": "training_control",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
         "description": "Stop training on the tenant default job",
     },
     {
         "method": "POST",
         "route_template": "/train/resume",
         "billing_tier": "training_control",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
         "description": "Resume training on the tenant default job",
     },
     {
         "method": "GET",
         "route_template": "/train/status",
-        "billing_tier": "training_metrics",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "training_snapshot",
         "description": "Read training status snapshot on the tenant default job",
     },
     {
         "method": "GET",
         "route_template": "/train/insights",
-        "billing_tier": "training_metrics",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "training_snapshot",
         "description": "Read trend insights on the tenant default job",
     },
     {
         "method": "GET",
         "route_template": "/train/metrics",
         "billing_tier": "training_metrics",
-        "unit_name": "request",
-        "unit_price_usd": 0.015,
         "description": "Read raw metrics rows on the tenant default job",
     },
     {
         "method": "GET",
         "route_template": "/train/checkpoints",
-        "billing_tier": "training_artifacts",
-        "unit_name": "request",
-        "unit_price_usd": 0.01,
+        "billing_tier": "artifact_read",
         "description": "List checkpoints on the tenant default job",
     },
     {
         "method": "POST",
         "route_template": "/train/checkpoints",
-        "billing_tier": "training_artifacts",
-        "unit_name": "request",
-        "unit_price_usd": 0.02,
+        "billing_tier": "artifact_write",
         "description": "Create checkpoint on the tenant default job",
     },
     {
         "method": "POST",
         "route_template": "/agent/action",
         "billing_tier": "inference_single",
-        "unit_name": "request",
-        "unit_price_usd": 0.03,
         "description": "Single inference call on the tenant default job",
     },
     {
         "method": "POST",
         "route_template": "/agent/action/batch",
         "billing_tier": "inference_batch",
-        "unit_name": "observation",
-        "unit_price_usd": 0.01,
-        "description": "Batch inference on the tenant default job, charged per observation",
+        "description": "Batch inference on the tenant default job, charged by payload tokens",
     },
     {
         "method": "GET",
         "route_template": "/agent/info",
         "billing_tier": "model_catalog",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "Selected agent metadata on the tenant default job",
     },
     {
         "method": "GET",
         "route_template": "/genomes",
         "billing_tier": "model_catalog",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "List genomes on the tenant default job",
     },
     {
         "method": "GET",
         "route_template": "/genomes/{genome_id}",
         "billing_tier": "model_catalog",
-        "unit_name": "request",
-        "unit_price_usd": 0.005,
         "description": "Genome metadata lookup on the tenant default job",
     },
 ]
 
 
+def _build_billing_catalog() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for route_item in ROUTE_BILLING_CATALOG:
+        tier = BILLING_TIERS[route_item["billing_tier"]]
+        item = dict(route_item)
+        item["unit_name"] = tier["unit_name"]
+        item["unit_price_inr"] = tier["unit_price_inr"]
+        items.append(item)
+    return items
+
+
+BILLING_CATALOG = _build_billing_catalog()
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_truthy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -616,6 +660,19 @@ class APIKeyStore:
             "max_jobs": int(row["max_jobs"]),
         }
 
+    def _ensure_tenant_billing_conn(self, conn: Any, tenant_id: str) -> None:
+        now = _utc_now()
+        conn.execute(
+            """
+            INSERT INTO tenant_billing_accounts (
+                tenant_id, currency, balance_inr, created_at, updated_at
+            )
+            VALUES (?, 'INR', 0, ?, ?)
+            ON CONFLICT(tenant_id) DO NOTHING
+            """,
+            (tenant_id, now, now),
+        )
+
     def is_available(self) -> bool:
         try:
             with self._connect() as conn:
@@ -666,9 +723,9 @@ class APIKeyStore:
                     duration_ms REAL NOT NULL DEFAULT 0,
                     job_id TEXT,
                     billing_tier TEXT NOT NULL DEFAULT 'unclassified',
-                    billed_units INTEGER NOT NULL DEFAULT 1,
-                    unit_price_usd REAL NOT NULL DEFAULT 0,
-                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    billed_tokens INTEGER NOT NULL DEFAULT 0,
+                    unit_price_inr REAL NOT NULL DEFAULT 0,
+                    estimated_cost_inr REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -685,25 +742,95 @@ class APIKeyStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tenant_billing_accounts (
+                    tenant_id TEXT PRIMARY KEY,
+                    currency TEXT NOT NULL DEFAULT 'INR',
+                    balance_inr REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS billing_ledger (
+                    id {id_column_sql},
+                    tenant_id TEXT NOT NULL,
+                    entry_type TEXT NOT NULL,
+                    amount_inr REAL NOT NULL,
+                    balance_after_inr REAL NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'INR',
+                    description TEXT NOT NULL DEFAULT '',
+                    reference_type TEXT,
+                    reference_id TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS billing_topups (
+                    topup_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    amount_inr REAL NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'INR',
+                    receipt TEXT NOT NULL,
+                    provider_order_id TEXT NOT NULL,
+                    provider_payment_id TEXT,
+                    description TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    paid_at TEXT
+                )
+                """
+            )
 
             usage_log_columns = column_names(conn, "usage_logs")
             usage_log_migrations = {
                 "route_template": "TEXT",
                 "billing_tier": "TEXT NOT NULL DEFAULT 'unclassified'",
-                "billed_units": "INTEGER NOT NULL DEFAULT 1",
-                "unit_price_usd": "REAL NOT NULL DEFAULT 0",
-                "estimated_cost_usd": "REAL NOT NULL DEFAULT 0",
+                "billed_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "unit_price_inr": "REAL NOT NULL DEFAULT 0",
+                "estimated_cost_inr": "REAL NOT NULL DEFAULT 0",
             }
             for column_name, column_definition in usage_log_migrations.items():
                 if column_name not in usage_log_columns:
-                    conn.execute(
-                        f"ALTER TABLE usage_logs ADD COLUMN {column_name} {column_definition}"
-                    )
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE usage_logs ADD COLUMN {column_name} {column_definition}"
+                        )
+                    except Exception as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
 
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_usage_logs_tenant_created
                 ON usage_logs (tenant_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_billing_ledger_tenant_created
+                ON billing_ledger (tenant_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_topups_provider_order
+                ON billing_topups (provider, provider_order_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_topups_provider_payment
+                ON billing_topups (provider, provider_payment_id)
                 """
             )
             api_key_columns = column_names(conn, "api_keys")
@@ -794,10 +921,10 @@ class APIKeyStore:
         return round(float(value), 6)
 
     @staticmethod
-    def _coerce_billed_units(billed_units: Optional[int]) -> int:
-        if billed_units is None:
-            return 1
-        return max(1, int(billed_units))
+    def _coerce_billed_tokens(billed_tokens: Optional[int]) -> int:
+        if billed_tokens is None:
+            return 0
+        return max(0, int(billed_tokens))
 
     @staticmethod
     def _is_chargeable_status(status_code: int) -> bool:
@@ -814,6 +941,446 @@ class APIKeyStore:
             return False
         current = now or cls._utc_now_datetime()
         return parsed <= current
+
+    @staticmethod
+    def prepaid_required() -> bool:
+        return _is_truthy(os.getenv("EVOMIND_PREPAID_REQUIRED"))
+
+    def ensure_billing_account(self, tenant_id: str) -> None:
+        with self._connect() as conn:
+            self._ensure_tenant_billing_conn(conn, tenant_id)
+            conn.commit()
+
+    @staticmethod
+    def _coerce_amount_inr(amount_inr: float) -> float:
+        normalized = round(float(amount_inr), 6)
+        if normalized <= 0:
+            raise ValueError("Amount must be greater than zero")
+        return normalized
+
+    @staticmethod
+    def _json_dumps(value: Optional[Dict[str, Any]]) -> str:
+        return json.dumps(value or {}, sort_keys=True)
+
+    @staticmethod
+    def _json_loads(raw_value: Any) -> Dict[str, Any]:
+        if raw_value in (None, ""):
+            return {}
+        try:
+            parsed = json.loads(str(raw_value))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+
+    @staticmethod
+    def _ledger_entry_to_dict(row: Any) -> Dict[str, Any]:
+        return {
+            "entry_id": int(row["id"]),
+            "tenant_id": str(row["tenant_id"]),
+            "entry_type": str(row["entry_type"]),
+            "amount_inr": APIKeyStore._round_cost(float(row["amount_inr"] or 0.0)),
+            "balance_after_inr": APIKeyStore._round_cost(float(row["balance_after_inr"] or 0.0)),
+            "currency": str(row["currency"] or "INR"),
+            "description": str(row["description"] or ""),
+            "reference_type": row["reference_type"],
+            "reference_id": row["reference_id"],
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _topup_row_to_dict(row: Any) -> Dict[str, Any]:
+        return {
+            "topup_id": str(row["topup_id"]),
+            "tenant_id": str(row["tenant_id"]),
+            "provider": str(row["provider"]),
+            "status": str(row["status"]),
+            "amount_inr": APIKeyStore._round_cost(float(row["amount_inr"] or 0.0)),
+            "currency": str(row["currency"] or "INR"),
+            "receipt": str(row["receipt"]),
+            "provider_order_id": str(row["provider_order_id"]),
+            "provider_payment_id": row["provider_payment_id"],
+            "description": row["description"],
+            "metadata": APIKeyStore._json_loads(row["metadata_json"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "paid_at": row["paid_at"],
+        }
+
+    def _get_billing_account_conn(self, conn: Any, tenant_id: str) -> Dict[str, Any]:
+        self._ensure_tenant_billing_conn(conn, tenant_id)
+        account_row = conn.execute(
+            """
+            SELECT tenant_id, currency, balance_inr, created_at, updated_at
+            FROM tenant_billing_accounts
+            WHERE tenant_id = ?
+            """,
+            (tenant_id,),
+        ).fetchone()
+        totals_row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN amount_inr > 0 THEN amount_inr ELSE 0 END), 0) AS total_credited_inr,
+                COALESCE(SUM(CASE WHEN amount_inr < 0 THEN -amount_inr ELSE 0 END), 0) AS total_debited_inr
+            FROM billing_ledger
+            WHERE tenant_id = ?
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if account_row is None:
+            raise ValueError(f"Billing account for tenant '{tenant_id}' was not found")
+        balance_inr = self._round_cost(float(account_row["balance_inr"] or 0.0))
+        return {
+            "tenant_id": str(account_row["tenant_id"]),
+            "currency": str(account_row["currency"] or "INR"),
+            "available_credit_inr": balance_inr,
+            "outstanding_amount_inr": self._round_cost(max(0.0, -balance_inr)),
+            "total_credited_inr": self._round_cost(float(totals_row["total_credited_inr"] or 0.0)),
+            "total_debited_inr": self._round_cost(float(totals_row["total_debited_inr"] or 0.0)),
+            "prepaid_required": self.prepaid_required(),
+        }
+
+    def _append_billing_ledger_entry_conn(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        entry_type: str,
+        amount_inr: float,
+        description: str,
+        reference_type: Optional[str] = None,
+        reference_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_tenant_billing_conn(conn, tenant_id)
+        row = conn.execute(
+            """
+            SELECT balance_inr, currency
+            FROM tenant_billing_accounts
+            WHERE tenant_id = ?
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Billing account for tenant '{tenant_id}' was not found")
+        current_balance = float(row["balance_inr"] or 0.0)
+        next_balance = self._round_cost(current_balance + float(amount_inr))
+        now = _utc_now()
+        conn.execute(
+            """
+            UPDATE tenant_billing_accounts
+            SET balance_inr = ?, updated_at = ?
+            WHERE tenant_id = ?
+            """,
+            (next_balance, now, tenant_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO billing_ledger (
+                tenant_id,
+                entry_type,
+                amount_inr,
+                balance_after_inr,
+                currency,
+                description,
+                reference_type,
+                reference_id,
+                metadata_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tenant_id,
+                entry_type,
+                self._round_cost(float(amount_inr)),
+                next_balance,
+                str(row["currency"] or "INR"),
+                str(description or ""),
+                reference_type,
+                reference_id,
+                self._json_dumps(metadata),
+                now,
+            ),
+        )
+        created_row = conn.execute(
+            """
+            SELECT
+                id,
+                tenant_id,
+                entry_type,
+                amount_inr,
+                balance_after_inr,
+                currency,
+                description,
+                reference_type,
+                reference_id,
+                created_at
+            FROM billing_ledger
+            WHERE tenant_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if created_row is None:
+            raise ValueError("Billing ledger entry was not created")
+        return self._ledger_entry_to_dict(created_row)
+
+    def add_credit(
+        self,
+        tenant_id: str,
+        amount_inr: float,
+        *,
+        description: str,
+        reference_type: Optional[str] = None,
+        reference_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_amount = self._coerce_amount_inr(amount_inr)
+        with self._connect() as conn:
+            entry = self._append_billing_ledger_entry_conn(
+                conn,
+                tenant_id,
+                entry_type="credit",
+                amount_inr=normalized_amount,
+                description=description,
+                reference_type=reference_type,
+                reference_id=reference_id,
+                metadata=metadata,
+            )
+            conn.commit()
+        return entry
+
+    def get_billing_account(self, tenant_id: str) -> Dict[str, Any]:
+        with self._connect() as conn:
+            account = self._get_billing_account_conn(conn, tenant_id)
+        return account
+
+    def list_billing_ledger(
+        self,
+        tenant_id: str,
+        limit: int = DEFAULT_BILLING_LEDGER_LIMIT,
+    ) -> List[Dict[str, Any]]:
+        normalized_limit = max(1, int(limit))
+        with self._connect() as conn:
+            self._ensure_tenant_billing_conn(conn, tenant_id)
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    tenant_id,
+                    entry_type,
+                    amount_inr,
+                    balance_after_inr,
+                    currency,
+                    description,
+                    reference_type,
+                    reference_id,
+                    created_at
+                FROM billing_ledger
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, normalized_limit),
+            ).fetchall()
+        return [self._ledger_entry_to_dict(row) for row in rows]
+
+    def create_topup(
+        self,
+        tenant_id: str,
+        *,
+        provider: str,
+        amount_inr: float,
+        provider_order_id: str,
+        receipt: str,
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_amount = self._coerce_amount_inr(amount_inr)
+        normalized_provider = str(provider or "").strip().lower()
+        if not normalized_provider:
+            raise ValueError("Payment provider is required")
+        now = _utc_now()
+        topup_id = f"topup_{secrets.token_hex(8)}"
+        with self._connect() as conn:
+            self._ensure_tenant_billing_conn(conn, tenant_id)
+            conn.execute(
+                """
+                INSERT INTO billing_topups (
+                    topup_id,
+                    tenant_id,
+                    provider,
+                    status,
+                    amount_inr,
+                    currency,
+                    receipt,
+                    provider_order_id,
+                    provider_payment_id,
+                    description,
+                    metadata_json,
+                    created_at,
+                    updated_at,
+                    paid_at
+                )
+                VALUES (?, ?, ?, 'created', ?, 'INR', ?, ?, NULL, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    topup_id,
+                    tenant_id,
+                    normalized_provider,
+                    normalized_amount,
+                    receipt,
+                    provider_order_id,
+                    description,
+                    self._json_dumps(metadata),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM billing_topups
+                WHERE topup_id = ?
+                """,
+                (topup_id,),
+            ).fetchone()
+            conn.commit()
+        if row is None:
+            raise ValueError("Billing top-up was not created")
+        return self._topup_row_to_dict(row)
+
+    def confirm_topup_payment(
+        self,
+        *,
+        provider: str,
+        provider_order_id: str,
+        provider_payment_id: str,
+        amount_inr: Optional[float] = None,
+        expected_tenant_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_provider = str(provider or "").strip().lower()
+        normalized_order_id = str(provider_order_id or "").strip()
+        normalized_payment_id = str(provider_payment_id or "").strip()
+        if not normalized_provider or not normalized_order_id or not normalized_payment_id:
+            raise ValueError("Provider, order id, and payment id are required")
+        normalized_amount = None if amount_inr is None else self._coerce_amount_inr(amount_inr)
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM billing_topups
+                WHERE provider = ? AND provider_order_id = ?
+                """,
+                (normalized_provider, normalized_order_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Billing top-up for order '{normalized_order_id}' was not found")
+            if expected_tenant_id is not None and str(row["tenant_id"]) != str(expected_tenant_id):
+                raise PermissionError("Top-up does not belong to the authenticated tenant")
+
+            existing_payment_row = conn.execute(
+                """
+                SELECT topup_id
+                FROM billing_topups
+                WHERE provider = ? AND provider_payment_id = ? AND topup_id != ?
+                """,
+                (normalized_provider, normalized_payment_id, row["topup_id"]),
+            ).fetchone()
+            if existing_payment_row is not None:
+                raise ValueError(f"Payment '{normalized_payment_id}' is already linked to another top-up")
+
+            stored_amount = self._round_cost(float(row["amount_inr"] or 0.0))
+            if normalized_amount is not None and normalized_amount != stored_amount:
+                raise ValueError(
+                    f"Payment amount mismatch for order '{normalized_order_id}': expected {stored_amount}, got {normalized_amount}"
+                )
+
+            if str(row["status"]) != "paid":
+                ledger_metadata = dict(self._json_loads(row["metadata_json"]))
+                ledger_metadata.update(metadata or {})
+                ledger_metadata["provider_order_id"] = normalized_order_id
+                ledger_metadata["provider_payment_id"] = normalized_payment_id
+                self._append_billing_ledger_entry_conn(
+                    conn,
+                    str(row["tenant_id"]),
+                    entry_type="topup_credit",
+                    amount_inr=stored_amount,
+                    description=f"{normalized_provider.capitalize()} prepaid top-up",
+                    reference_type="payment",
+                    reference_id=normalized_payment_id,
+                    metadata=ledger_metadata,
+                )
+                now = _utc_now()
+                conn.execute(
+                    """
+                    UPDATE billing_topups
+                    SET
+                        status = 'paid',
+                        provider_payment_id = ?,
+                        metadata_json = ?,
+                        updated_at = ?,
+                        paid_at = COALESCE(paid_at, ?)
+                    WHERE topup_id = ?
+                    """,
+                    (
+                        normalized_payment_id,
+                        self._json_dumps(ledger_metadata),
+                        now,
+                        now,
+                        row["topup_id"],
+                    ),
+                )
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM billing_topups
+                    WHERE topup_id = ?
+                    """,
+                    (row["topup_id"],),
+                ).fetchone()
+            if row is None:
+                raise ValueError("Billing top-up payment confirmation failed")
+            account = self._get_billing_account_conn(conn, str(row["tenant_id"]))
+            conn.commit()
+        if row is None:
+            raise ValueError("Billing top-up payment confirmation failed")
+        topup = self._topup_row_to_dict(row)
+        return {
+            "topup": topup,
+            "account": account,
+            "credited": topup["status"] == "paid" and topup["provider_payment_id"] == normalized_payment_id,
+        }
+
+    def require_prepaid_balance(
+        self,
+        tenant_id: str,
+        *,
+        method: str,
+        route_template: Optional[str],
+        path: str,
+    ) -> None:
+        if not self.prepaid_required():
+            return
+        billing_definition = self.resolve_billing_definition(
+            method=method,
+            route_template=route_template,
+            path=path,
+        )
+        if float(billing_definition["unit_price_inr"]) <= 0.0:
+            return
+        account = self.get_billing_account(tenant_id)
+        if float(account["available_credit_inr"]) > 0.0:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Prepaid balance exhausted. Top up credits before calling chargeable endpoints.",
+        )
 
     def _fetch_key_row(self, conn: Any, key_id: str) -> Any:
         return conn.execute(
@@ -926,8 +1493,8 @@ class APIKeyStore:
             "method": normalized_method,
             "route_template": route_template or path or "",
             "billing_tier": "unclassified",
-            "unit_name": "request",
-            "unit_price_usd": 0.0,
+            "unit_name": "token",
+            "unit_price_inr": 0.0,
             "description": "No billing rule registered for this endpoint",
         }
 
@@ -1114,6 +1681,7 @@ class APIKeyStore:
         key_hash = self._hash_key(raw_key, salt_hex)
         created_at = _utc_now()
         self.ensure_tenant_limits(tenant_id)
+        self.ensure_billing_account(tenant_id)
 
         with self._connect() as conn:
             conn.execute(
@@ -1458,20 +2026,21 @@ class APIKeyStore:
         duration_ms: float,
         route_template: Optional[str] = None,
         job_id: Optional[str] = None,
-        billed_units: Optional[int] = None,
+        billed_tokens: Optional[int] = None,
     ) -> None:
         billing_definition = self.resolve_billing_definition(
             method=method,
             route_template=route_template,
             path=path,
         )
-        normalized_units = self._coerce_billed_units(billed_units)
-        unit_price_usd = float(billing_definition["unit_price_usd"])
-        estimated_cost_usd = 0.0
+        normalized_tokens = self._coerce_billed_tokens(billed_tokens)
+        unit_price_inr = float(billing_definition["unit_price_inr"])
+        estimated_cost_inr = 0.0
         if self._is_chargeable_status(status_code):
-            estimated_cost_usd = self._round_cost(normalized_units * unit_price_usd)
+            estimated_cost_inr = self._round_cost(normalized_tokens * unit_price_inr)
 
         with self._connect() as conn:
+            self._ensure_tenant_billing_conn(conn, tenant_id)
             conn.execute(
                 """
                 INSERT INTO usage_logs (
@@ -1484,9 +2053,9 @@ class APIKeyStore:
                     duration_ms,
                     job_id,
                     billing_tier,
-                    billed_units,
-                    unit_price_usd,
-                    estimated_cost_usd,
+                    billed_tokens,
+                    unit_price_inr,
+                    estimated_cost_inr,
                     created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1501,12 +2070,30 @@ class APIKeyStore:
                     float(duration_ms),
                     job_id,
                     billing_definition["billing_tier"],
-                    normalized_units,
-                    unit_price_usd,
-                    estimated_cost_usd,
+                    normalized_tokens,
+                    unit_price_inr,
+                    estimated_cost_inr,
                     _utc_now(),
                 ),
             )
+            if estimated_cost_inr > 0.0:
+                reference_target = route_template or path
+                self._append_billing_ledger_entry_conn(
+                    conn,
+                    tenant_id,
+                    entry_type="usage_charge",
+                    amount_inr=-estimated_cost_inr,
+                    description=f"Usage charge for {method.upper()} {reference_target}",
+                    reference_type="usage_path",
+                    reference_id=reference_target,
+                    metadata={
+                        "key_id": key_id,
+                        "job_id": job_id,
+                        "billing_tier": billing_definition["billing_tier"],
+                        "billed_tokens": normalized_tokens,
+                        "status_code": int(status_code),
+                    },
+                )
             conn.commit()
 
     def get_usage_summary(self, tenant_id: str) -> Dict[str, Any]:
@@ -1521,7 +2108,7 @@ class APIKeyStore:
                 """
                 SELECT
                     COUNT(*) AS request_count,
-                    COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                    COALESCE(SUM(estimated_cost_inr), 0) AS estimated_cost_inr
                 FROM usage_logs
                 WHERE tenant_id = ? AND created_at >= ?
                 """,
@@ -1531,7 +2118,7 @@ class APIKeyStore:
                 """
                 SELECT
                     COUNT(*) AS request_count,
-                    COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                    COALESCE(SUM(estimated_cost_inr), 0) AS estimated_cost_inr
                 FROM usage_logs
                 WHERE tenant_id = ?
                 """,
@@ -1540,9 +2127,9 @@ class APIKeyStore:
 
         minute_count = int(rate_snapshot["minute_count"])
         day_count = int(rate_snapshot["day_count"])
-        total_count = int(total_row["request_count"])
-        day_cost = self._round_cost(float(day_row["estimated_cost_usd"] or 0.0))
-        total_cost = self._round_cost(float(total_row["estimated_cost_usd"] or 0.0))
+        total_count = int(total_row["request_count"]) if total_row is not None else 0
+        day_cost = self._round_cost(float(day_row["estimated_cost_inr"] or 0.0)) if day_row is not None else 0.0
+        total_cost = self._round_cost(float(total_row["estimated_cost_inr"] or 0.0)) if total_row is not None else 0.0
 
         return {
             "requests_last_minute": minute_count,
@@ -1553,8 +2140,8 @@ class APIKeyStore:
             "max_jobs": rate_snapshot["max_jobs"],
             "remaining_this_minute": max(0, rate_snapshot["requests_per_minute"] - minute_count),
             "remaining_today": max(0, rate_snapshot["requests_per_day"] - day_count),
-            "estimated_cost_last_day_usd": day_cost,
-            "estimated_cost_total_usd": total_cost,
+            "estimated_cost_last_day_inr": day_cost,
+            "estimated_cost_total_inr": total_cost,
         }
 
     def export_usage(
@@ -1582,9 +2169,9 @@ class APIKeyStore:
                     duration_ms,
                     job_id,
                     billing_tier,
-                    billed_units,
-                    unit_price_usd,
-                    estimated_cost_usd
+                    billed_tokens,
+                    unit_price_inr,
+                    estimated_cost_inr
                 FROM usage_logs
                 WHERE tenant_id = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
@@ -1607,10 +2194,10 @@ class APIKeyStore:
                     "duration_ms": float(row["duration_ms"]),
                     "job_id": row["job_id"],
                     "billing_tier": str(row["billing_tier"]),
-                    "billed_units": int(row["billed_units"] or 1),
-                    "unit_price_usd": self._round_cost(float(row["unit_price_usd"] or 0.0)),
-                    "estimated_cost_usd": self._round_cost(
-                        float(row["estimated_cost_usd"] or 0.0)
+                    "billed_tokens": int(row["billed_tokens"] or 0),
+                    "unit_price_inr": self._round_cost(float(row["unit_price_inr"] or 0.0)),
+                    "estimated_cost_inr": self._round_cost(
+                        float(row["estimated_cost_inr"] or 0.0)
                     ),
                 }
             )
@@ -1651,6 +2238,13 @@ async def require_api_key(
         principal,
         request.method,
         route_template,
+    )
+    await asyncio.to_thread(
+        api_key_store.require_prepaid_balance,
+        principal.tenant_id,
+        method=request.method,
+        route_template=route_template,
+        path=request.url.path,
     )
     request.state.principal = principal
     merge_log_context(
@@ -1860,7 +2454,7 @@ def main() -> int:
         for item in api_key_store.get_billing_catalog():
             print(
                 "{method} {route_template} tier={billing_tier} unit={unit_name} "
-                "price_usd={unit_price_usd:.6f} description={description}".format(**item)
+                "price_inr={unit_price_inr:.6f} description={description}".format(**item)
             )
         return 0
 
@@ -1967,9 +2561,9 @@ def main() -> int:
             "duration_ms",
             "job_id",
             "billing_tier",
-            "billed_units",
-            "unit_price_usd",
-            "estimated_cost_usd",
+            "billed_tokens",
+            "unit_price_inr",
+            "estimated_cost_inr",
         ]
         writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
         writer.writeheader()

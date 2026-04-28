@@ -25,6 +25,10 @@ class ManagedPostgresConnection:
     backend = "postgres"
 
     class _NoOpCursor:
+        @property
+        def rowcount(self) -> int:
+            return -1
+
         def fetchone(self):
             return None
 
@@ -246,8 +250,8 @@ def sqlite_connect(path: PathLike, timeout: float = 30.0) -> sqlite3.Connection:
 
 def postgres_connect(url: str, timeout: float = 30.0) -> ManagedPostgresConnection:
     try:
-        import psycopg
-        from psycopg.rows import dict_row
+        import psycopg  # type: ignore
+        from psycopg.rows import dict_row  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
             "PostgreSQL support requires psycopg. Install dependencies from requirements.txt."

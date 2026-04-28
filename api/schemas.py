@@ -227,15 +227,15 @@ class UsageSummaryResponse(BaseModel):
     max_jobs: int
     remaining_this_minute: int
     remaining_today: int
-    estimated_cost_last_day_usd: float = 0.0
-    estimated_cost_total_usd: float = 0.0
+    estimated_cost_last_day_inr: float = 0.0
+    estimated_cost_total_inr: float = 0.0
 
 class BillingTierInfo(BaseModel):
     method: str
     route_template: str
     billing_tier: str
     unit_name: str
-    unit_price_usd: float
+    unit_price_inr: float
     description: str
 
 class BillingTiersResponse(BaseModel):
@@ -253,14 +253,79 @@ class UsageExportRow(BaseModel):
     duration_ms: float
     job_id: Optional[str] = None
     billing_tier: str
-    billed_units: int
-    unit_price_usd: float
-    estimated_cost_usd: float
+    billed_tokens: int
+    unit_price_inr: float
+    estimated_cost_inr: float
 
 class UsageExportResponse(BaseModel):
     tenant_id: str
     count: int
     items: List[UsageExportRow]
+
+class BillingAccountResponse(BaseModel):
+    tenant_id: str
+    currency: str = "INR"
+    available_credit_inr: float = 0.0
+    outstanding_amount_inr: float = 0.0
+    total_credited_inr: float = 0.0
+    total_debited_inr: float = 0.0
+    prepaid_required: bool = False
+
+class BillingLedgerEntry(BaseModel):
+    entry_id: int
+    tenant_id: str
+    entry_type: str
+    amount_inr: float
+    balance_after_inr: float
+    currency: str = "INR"
+    description: str
+    reference_type: Optional[str] = None
+    reference_id: Optional[str] = None
+    created_at: str
+
+class BillingLedgerResponse(BaseModel):
+    tenant_id: str
+    count: int
+    items: List[BillingLedgerEntry]
+
+class BillingTopupRequest(BaseModel):
+    amount_inr: float = Field(
+        ...,
+        ge=10.0,
+        description="Prepaid credit purchase amount in INR",
+    )
+    description: Optional[str] = Field(
+        default=None,
+        max_length=120,
+        description="Optional display text for the top-up",
+    )
+
+class BillingTopupResponse(BaseModel):
+    tenant_id: str
+    topup_id: str
+    provider: str
+    status: str
+    amount_inr: float
+    currency: str = "INR"
+    receipt: str
+    provider_order_id: str
+    checkout_key_id: str
+    created_at: str
+
+class BillingTopupConfirmRequest(BaseModel):
+    razorpay_order_id: str = Field(..., min_length=6)
+    razorpay_payment_id: str = Field(..., min_length=6)
+    razorpay_signature: str = Field(..., min_length=16)
+
+class BillingTopupConfirmResponse(BaseModel):
+    tenant_id: str
+    topup_id: str
+    provider: str
+    status: str
+    amount_inr: float
+    payment_id: Optional[str] = None
+    balance_inr: float
+    credited: bool
 
 class JobEvent(BaseModel):
     event_id: str
