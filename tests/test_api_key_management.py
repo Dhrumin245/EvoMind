@@ -188,6 +188,49 @@ class APIKeyManagementTests(unittest.TestCase):
         assert cleared is not None
         self.assertIsNone(cleared.expires_at)
 
+    def test_log_usage_records_token_pricing_in_inr(self) -> None:
+        self.store.log_usage(
+            tenant_id="tenant-a",
+            key_id="key-1",
+            method="POST",
+            path="/agent/action",
+            route_template="/agent/action",
+            status_code=200,
+            duration_ms=12.5,
+            billed_tokens=1000,
+        )
+
+        summary = self.store.get_usage_summary("tenant-a")
+        rows = self.store.export_usage("tenant-a", days=7, limit=10)
+
+        self.assertEqual(summary["requests_total"], 1)
+        self.assertAlmostEqual(summary["estimated_cost_total_inr"], 2.79, places=6)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["billing_tier"], "inference_single")
+        self.assertEqual(rows[0]["billed_tokens"], 1000)
+        self.assertAlmostEqual(rows[0]["unit_price_inr"], 0.00279, places=6)
+        self.assertAlmostEqual(rows[0]["estimated_cost_inr"], 2.79, places=6)
+
+    def test_log_usage_does_not_charge_failed_request(self) -> None:
+        self.store.log_usage(
+            tenant_id="tenant-a",
+            key_id="key-1",
+            method="POST",
+            path="/agent/action",
+            route_template="/agent/action",
+            status_code=500,
+            duration_ms=8.0,
+            billed_tokens=1000,
+        )
+
+        summary = self.store.get_usage_summary("tenant-a")
+        rows = self.store.export_usage("tenant-a", days=7, limit=10)
+
+        self.assertEqual(summary["requests_total"], 1)
+        self.assertAlmostEqual(summary["estimated_cost_total_inr"], 0.0, places=6)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["estimated_cost_inr"], 0.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

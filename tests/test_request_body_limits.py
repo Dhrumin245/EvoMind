@@ -95,6 +95,25 @@ class RequestBodyLimitTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), {"size": 6})
 
+    def test_usage_logging_middleware_bills_combined_request_and_response_tokens(self) -> None:
+        request = _build_request([b"1234"])
+        original_usage_log_queue = server.usage_log_queue
+        server.usage_log_queue = asyncio.Queue()
+
+        async def call_next(req: Request) -> JSONResponse:
+            req.state.principal = type("Principal", (), {"tenant_id": "tenant-a", "key_id": "key-1"})()
+            await req.body()
+            return JSONResponse({"ok": True})
+
+        try:
+            response = asyncio.run(server.usage_logging_middleware(request, call_next))
+            payload = server.usage_log_queue.get_nowait()
+        finally:
+            server.usage_log_queue = original_usage_log_queue
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["billed_tokens"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
