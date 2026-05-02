@@ -1,45 +1,65 @@
-FROM python:3.13-slim AS base
+# escape=`
+ARG PYTHON_IMAGE=python:3.13.3-windowsservercore-ltsc2022
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    MPLBACKEND=Agg \
-    SDL_VIDEODRIVER=dummy \
+FROM ${PYTHON_IMAGE} AS build
+
+SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+ENV PYTHONDONTWRITEBYTECODE=1 `
+    PYTHONUNBUFFERED=1 `
+    PIP_NO_CACHE_DIR=1 `
+    MPLBACKEND=Agg `
+    SDL_VIDEODRIVER=dummy `
     SDL_AUDIODRIVER=dummy
 
-WORKDIR /app
+WORKDIR C:\app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        gcc \
-        libgl1 \
-        libglib2.0-0 \
-        libgomp1 \
-        libsm6 \
-        libsdl2-2.0-0 \
-        libxext6 \
-        libxrender1 \
-    && rm -rf /var/lib/apt/lists/*
+RUN python -m venv C:\venv
 
-COPY requirements.txt ./
+COPY requirements.txt .
 
-RUN python -m pip install --upgrade pip \
-    && python -m pip install -r requirements.txt
+RUN C:\venv\Scripts\python.exe -m pip wheel --wheel-dir C:\wheels -r requirements.txt
+
+FROM ${PYTHON_IMAGE} AS runtime
+
+SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+ENV PYTHONDONTWRITEBYTECODE=1 `
+    PYTHONUNBUFFERED=1 `
+    PIP_NO_CACHE_DIR=1 `
+    MPLBACKEND=Agg `
+    SDL_VIDEODRIVER=dummy `
+    SDL_AUDIODRIVER=dummy
+
+WORKDIR C:\app
+
+RUN python -m venv C:\venv
+
+COPY --from=build C:\wheels C:\wheels
+COPY requirements.txt .
+
+RUN C:\venv\Scripts\python.exe -m pip install --no-index --find-links=C:\wheels -r requirements.txt; `
+    Remove-Item -Recurse -Force C:\wheels
 
 COPY . .
 
-RUN mkdir -p /app/data /app/artifacts
+RUN New-Item -ItemType Directory -Force C:\app\data, C:\app\artifacts, C:\app\backups | Out-Null; `
+    icacls C:\app /grant 'Users:(OI)(CI)F' /T | Out-Null
 
-FROM base AS api
+USER ContainerUser
+
+FROM runtime AS api
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/readiness').status == 200 else 1)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 `
+  CMD ["powershell", "-NoProfile", "-Command", "try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/health/readiness' -TimeoutSec 5; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1"]
 
-CMD ["python", "-m", "uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["C:\\venv\\Scripts\\python.exe", "-m", "uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "8000"]
 
-FROM base AS worker
+FROM runtime AS worker
 
-CMD ["python", "-m", "api.worker"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 `
+  CMD ["C:\\venv\\Scripts\\python.exe", "-m", "api.worker_healthcheck"]
+
+CMD ["C:\\venv\\Scripts\\python.exe", "-m", "api.worker"]
