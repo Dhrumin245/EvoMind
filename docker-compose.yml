@@ -1,63 +1,89 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: evomind
-      POSTGRES_USER: evomind
-      POSTGRES_PASSWORD: evomind
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U evomind -d evomind"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-
   worker:
     build:
       context: .
       target: worker
-    image: evomind-worker:local
+    image: ${EVOMIND_WORKER_IMAGE:-evomind-worker:windows-local}
     environment:
-      EVOMIND_DATA_DIR: /app/data
-      EVOMIND_BACKUP_DIR: /app/backups
-      EVOMIND_CONTROL_PLANE_DB_URL: postgresql://evomind:evomind@postgres:5432/evomind
-      EVOMIND_ENV: production
+      EVOMIND_BACKUP_DIR: C:\app\backups
+      EVOMIND_CONTROL_PLANE_DB_URL_FILE: C:\run\secrets\control_plane_db_url.txt
+      EVOMIND_CORS_ALLOW_ORIGINS: ${EVOMIND_CORS_ALLOW_ORIGINS:-}
+      EVOMIND_DATA_DIR: C:\app\data
       EVOMIND_ENABLE_API_DOCS: "false"
+      EVOMIND_ENV: production
+      EVOMIND_LOG_LEVEL: ${EVOMIND_LOG_LEVEL:-INFO}
+      EVOMIND_TENANT_ROOT_DIR: C:\app\data\tenants
+      EVOMIND_WEBHOOK_SECRET_KEY_FILE: C:\run\secrets\webhook_secret_key.txt
       MPLBACKEND: Agg
-      SDL_VIDEODRIVER: dummy
       SDL_AUDIODRIVER: dummy
+      SDL_VIDEODRIVER: dummy
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     volumes:
-      - ./data:/app/data
-      - ./backups:/app/backups
+      - type: volume
+        source: evomind_data
+        target: C:\app\data
+      - type: volume
+        source: evomind_backups
+        target: C:\app\backups
+      - type: bind
+        source: ${EVOMIND_CONTROL_PLANE_DB_URL_FILE:?set in env file}
+        target: C:\run\secrets\control_plane_db_url.txt
+        read_only: true
+      - type: bind
+        source: ${EVOMIND_WEBHOOK_SECRET_KEY_FILE:?set in env file}
+        target: C:\run\secrets\webhook_secret_key.txt
+        read_only: true
+    networks:
+      - control_plane
 
   api:
     build:
       context: .
       target: api
-    image: evomind-api:local
+    image: ${EVOMIND_API_IMAGE:-evomind-api:windows-local}
     environment:
-      EVOMIND_DATA_DIR: /app/data
-      EVOMIND_BACKUP_DIR: /app/backups
-      EVOMIND_CONTROL_PLANE_DB_URL: postgresql://evomind:evomind@postgres:5432/evomind
-      EVOMIND_ENV: production
+      EVOMIND_BACKUP_DIR: C:\app\backups
+      EVOMIND_CONTROL_PLANE_DB_URL_FILE: C:\run\secrets\control_plane_db_url.txt
+      EVOMIND_CORS_ALLOW_ORIGINS: ${EVOMIND_CORS_ALLOW_ORIGINS:?set in env file}
+      EVOMIND_DATA_DIR: C:\app\data
       EVOMIND_ENABLE_API_DOCS: "false"
+      EVOMIND_ENV: production
+      EVOMIND_LOG_LEVEL: ${EVOMIND_LOG_LEVEL:-INFO}
+      EVOMIND_TENANT_ROOT_DIR: C:\app\data\tenants
+      EVOMIND_WEBHOOK_SECRET_KEY_FILE: C:\run\secrets\webhook_secret_key.txt
       MPLBACKEND: Agg
-      SDL_VIDEODRIVER: dummy
       SDL_AUDIODRIVER: dummy
+      SDL_VIDEODRIVER: dummy
     ports:
       - "8000:8000"
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
       worker:
-        condition: service_started
+        condition: service_healthy
     volumes:
-      - ./data:/app/data
-      - ./backups:/app/backups
+      - type: volume
+        source: evomind_data
+        target: C:\app\data
+      - type: volume
+        source: evomind_backups
+        target: C:\app\backups
+      - type: bind
+        source: ${EVOMIND_CONTROL_PLANE_DB_URL_FILE:?set in env file}
+        target: C:\run\secrets\control_plane_db_url.txt
+        read_only: true
+      - type: bind
+        source: ${EVOMIND_WEBHOOK_SECRET_KEY_FILE:?set in env file}
+        target: C:\run\secrets\webhook_secret_key.txt
+        read_only: true
+    networks:
+      - edge
+      - control_plane
+
+volumes:
+  evomind_data:
+  evomind_backups:
+
+networks:
+  edge:
+  control_plane:
+    internal: true
