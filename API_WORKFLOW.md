@@ -39,29 +39,61 @@ It currently runs:
 - the full `unittest` suite under `tests/`
 
 
-## Container Deployment
+## Windows Deployment
 
-The repo now includes container packaging for both long-running processes:
+The production deployment path is Windows-native. The API and worker run from a Python virtual environment on the Windows host, and deployment automation is handled by PowerShell plus Windows Scheduled Tasks.
 
-- `Dockerfile` multi-target build for the API and the training worker
-- `docker-compose.yml` to run the API and worker against PostgreSQL for control-plane state
-- `.dockerignore` to keep local artifacts and runtime state out of the image build context
+The repo includes:
 
-Build and run locally with:
+- `deploy/windows/deploy.ps1` to mirror the repository into the production directory, create or update `.venv`, install dependencies, register the API and worker scheduled tasks, start them, and wait for readiness
+- `deploy/windows/run-service.ps1` as the long-running task entrypoint for the API and worker
+- `deploy/windows/backup.ps1` to run production backups from the Windows host
+- `deploy/Caddyfile` for a Windows Caddy reverse proxy in front of `127.0.0.1:8000`
+- `.env.production.example` showing Windows-style production settings
 
-```bash
-docker compose up --build
+Production host prerequisites:
+
+- Windows Server or Windows 11 with PowerShell 5.1+ or PowerShell 7+
+- Python 3.13 installed and available as `python`, or configured with `PYTHON_EXE`
+- a reachable PostgreSQL database, either managed or installed on Windows
+- a GitHub Actions self-hosted runner installed on the production host with labels `Windows` and `production`
+- optional Caddy for TLS termination, installed as a Windows service or managed separately
+
+Prepare the deployment directory on the Windows host:
+
+```powershell
+New-Item -ItemType Directory -Force C:\EvoMind
+Copy-Item .env.production.example C:\EvoMind\.env.production
+New-Item -ItemType Directory -Force C:\EvoMind\secrets
+Set-Content -NoNewline C:\EvoMind\secrets\control_plane_db_url.txt "postgresql://evomind:replace-with-password@db.example.com:5432/evomind?sslmode=require"
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" | Set-Content -NoNewline C:\EvoMind\secrets\webhook_secret_key.txt
 ```
 
-This starts:
+Edit `C:\EvoMind\.env.production` for the real hostname, CORS origins, storage paths, and secret file paths.
 
-- `postgres` for control-plane state
-- `api` on port `8000`
-- `worker` as the external training executor required by API readiness
+Manual deployment from a checkout:
+
+```powershell
+.\deploy\windows\deploy.ps1 -SourcePath $PWD -DeployPath C:\EvoMind
+```
+
+This creates or updates:
+
+- `EvoMindWorker`, a Windows Scheduled Task running `python -m api.worker`
+- `EvoMindApi`, a Windows Scheduled Task running `python -m uvicorn api.server:app --host 127.0.0.1 --port 8000`
+- runtime logs under `C:\EvoMind\output_logs`
 
 Control-plane storage is now configurable with environment variables:
 
 - `EVOMIND_CONTROL_PLANE_DB_URL`
+- `EVOMIND_CONTROL_PLANE_DB_URL_FILE`
+- `EVOMIND_CONTROL_PLANE_DB_HOST`
+- `EVOMIND_CONTROL_PLANE_DB_PORT`
+- `EVOMIND_CONTROL_PLANE_DB_NAME`
+- `EVOMIND_CONTROL_PLANE_DB_USER`
+- `EVOMIND_CONTROL_PLANE_DB_PASSWORD`
+- `EVOMIND_CONTROL_PLANE_DB_PASSWORD_FILE`
+- `EVOMIND_CONTROL_PLANE_DB_SSLMODE`
 - `EVOMIND_API_AUTH_DB_URL`
 - `EVOMIND_API_EVENTS_DB_URL`
 - `EVOMIND_API_JOBS_DB_URL`
@@ -82,12 +114,43 @@ Artifact and local fallback storage are still configurable with:
 For production, the intended model is:
 
 - PostgreSQL for auth, events, usage, and runtime coordination
+- Windows filesystem directories for tenant artifacts and backups
 - tenant job directories under `EVOMIND_TENANT_ROOT_DIR` for checkpoints and artifacts
-- periodic backups created with `python -m api.backup create`
+- `EVOMIND_SITE_ADDRESS` set to the public hostname handled by Caddy or another Windows reverse proxy
+- webhook secrets encrypted at rest via `EVOMIND_WEBHOOK_SECRET_KEY` or `EVOMIND_WEBHOOK_SECRET_KEY_FILE`
+- periodic backups created with `deploy/windows/backup.ps1` or `python -m api.backup create`
+
+## Operations Automation
+
+The repo now includes production automation under `.github/workflows/`:
+
+- `windows-release.yml` packages a Windows deployment archive on `main`, tags, or manual dispatch
+- `deploy-production.yml` deploys a chosen Git ref on the self-hosted Windows production runner, then waits for `/health/readiness`
+- `auto-deploy-production.yml` deploys automatically after a successful Windows release from `main`
+- `production-backup.yml` runs a scheduled backup job on the self-hosted Windows production runner and prunes old archives
+- `backup-restore-drill.yml` runs a weekly Windows restore drill without Linux service containers
+
+The production backup job uses:
+
+- `python scripts/backup_job.py` for archive creation, manifest verification, and retention pruning
+- `python scripts/backup_restore_drill.py` for a full create-mutate-restore verification path
+
+Required GitHub Actions secrets for deployment and backups:
+
+- `DEPLOY_PATH`
+
+`DEPLOY_PATH` should point to the persistent production directory on the Windows host, for example `C:\EvoMind`.
+
+Recommended release sequence:
+
+1. Merge to `main` and let `Windows Release` produce the deployment archive.
+2. Run `Deploy Production` with the target ref, or let `Auto Deploy Production` run after the release workflow.
+3. Confirm readiness and scheduled backups on the host.
+4. Review the weekly `Backup Restore Drill` workflow to confirm restore integrity.
 
 The backup CLI stores tenant artifacts plus SQLite snapshots when SQLite is in use locally:
 
-```bash
+```powershell
 python -m api.backup create
 python -m api.backup restore --input backups/evomind-backup-<timestamp>.tar.gz --force
 ```

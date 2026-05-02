@@ -1,0 +1,40 @@
+name: Windows Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create Windows deployment archive
+        shell: pwsh
+        run: |
+          $archiveRoot = Join-Path $env:RUNNER_TEMP "evomind-windows"
+          New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
+          robocopy $env:GITHUB_WORKSPACE $archiveRoot /MIR /R:2 /W:2 /NP /XD .git .venv venv __pycache__ .pytest_cache artifacts backups data models output_logs secrets tests\.tmp /XF .env .env.production *.pyc *.pyo *.pyd *.db *.sqlite *.sqlite3 *.log
+          if ($LASTEXITCODE -gt 7) {
+            throw "Robocopy failed with exit code $LASTEXITCODE"
+          }
+          Compress-Archive -Path (Join-Path $archiveRoot "*") -DestinationPath evomind-windows.zip -Force
+
+      - name: Upload Windows deployment archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: evomind-windows-${{ github.sha }}
+          path: evomind-windows.zip

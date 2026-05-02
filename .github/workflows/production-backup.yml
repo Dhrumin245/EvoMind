@@ -1,0 +1,36 @@
+name: Production Backup
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      keep_last:
+        description: Number of recent archives to retain
+        required: true
+        default: "14"
+      max_age_days:
+        description: Delete archives older than this age in days
+        required: true
+        default: "30"
+
+concurrency:
+  group: production-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: [self-hosted, Windows, production]
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run backup job on production host
+        shell: pwsh
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          KEEP_LAST: ${{ github.event.inputs.keep_last || '14' }}
+          MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days || '30' }}
+        run: |
+          .\deploy\windows\backup.ps1 -DeployPath $env:DEPLOY_PATH -KeepLast ([int]$env:KEEP_LAST) -MaxAgeDays ([int]$env:MAX_AGE_DAYS)

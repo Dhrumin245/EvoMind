@@ -1,0 +1,45 @@
+name: Backup Restore Drill
+
+on:
+  schedule:
+    - cron: "43 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: backup-restore-drill
+  cancel-in-progress: true
+
+jobs:
+  drill:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      EVOMIND_ALLOW_SQLITE_IN_PRODUCTION: "true"
+      EVOMIND_BACKUP_DIR: ${{ github.workspace }}\.tmp\evomind-backups
+      EVOMIND_DATA_DIR: ${{ github.workspace }}\.tmp\evomind-data
+      EVOMIND_ENV: production
+      EVOMIND_WEBHOOK_SECRET_KEY: Lpq32Pk49O2LHAK0AtuZofejmoAu7wP-Mg6FJqhtM6E=
+      MPLBACKEND: Agg
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      SDL_AUDIODRIVER: dummy
+      SDL_VIDEODRIVER: dummy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.3"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+
+      - name: Run backup restore drill
+        shell: pwsh
+        run: |
+          python scripts/backup_restore_drill.py
