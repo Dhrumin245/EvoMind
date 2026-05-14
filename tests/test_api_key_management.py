@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,10 @@ from api.auth import (
     APIKeyStore,
 )
 from tests.tmp_utils import cleanup_path
+
+
+def _future_expiry(days: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _build_request(method: str, path: str, route_template: str) -> Request:
@@ -47,6 +52,8 @@ class APIKeyManagementTests(unittest.TestCase):
         self.db_path = Path(f"tests/.tmp/api-key-management-{uuid.uuid4().hex}.db")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.store = APIKeyStore(db_path=str(self.db_path))
+        self.future_expiry = _future_expiry(365)
+        self.later_future_expiry = _future_expiry(395)
 
     def tearDown(self) -> None:
         cleanup_path(self.db_path)
@@ -57,7 +64,7 @@ class APIKeyManagementTests(unittest.TestCase):
             tenant_id="tenant-a",
             role=API_KEY_ROLE_READER,
             scopes=[API_KEY_SCOPE_JOBS_READ, API_KEY_SCOPE_TRAINING_READ],
-            expires_at="2026-05-01T00:00:00Z",
+            expires_at=self.future_expiry,
         )
 
         resolved = self.store.resolve_key(raw_key)
@@ -67,7 +74,7 @@ class APIKeyManagementTests(unittest.TestCase):
         assert resolved is not None
         self.assertEqual(resolved.role, API_KEY_ROLE_READER)
         self.assertEqual(resolved.scopes, [API_KEY_SCOPE_JOBS_READ, API_KEY_SCOPE_TRAINING_READ])
-        self.assertEqual(resolved.expires_at, "2026-05-01T00:00:00Z")
+        self.assertEqual(resolved.expires_at, self.future_expiry)
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0].key_id, principal.key_id)
         self.assertEqual(listed[0].role, API_KEY_ROLE_READER)
@@ -76,7 +83,7 @@ class APIKeyManagementTests(unittest.TestCase):
         principal, raw_key = self.store.create_key(
             name="expiring-key",
             tenant_id="tenant-a",
-            expires_at="2026-05-01T00:00:00Z",
+            expires_at=self.future_expiry,
         )
 
         with self.store._connect() as conn:
@@ -118,7 +125,7 @@ class APIKeyManagementTests(unittest.TestCase):
             tenant_id="tenant-a",
             role=API_KEY_ROLE_OPERATOR,
             scopes=[API_KEY_SCOPE_TRAINING_WRITE],
-            expires_at="2026-05-01T00:00:00Z",
+            expires_at=self.future_expiry,
         )
         request = _build_request("POST", "/jobs/job-1/train/start", "/jobs/{job_id}/train/start")
 
@@ -138,7 +145,7 @@ class APIKeyManagementTests(unittest.TestCase):
             tenant_id="tenant-a",
             role=API_KEY_ROLE_OPERATOR,
             scopes=[API_KEY_SCOPE_TRAINING_WRITE],
-            expires_at="2026-05-01T00:00:00Z",
+            expires_at=self.future_expiry,
         )
 
         rotated = self.store.rotate_key(original.key_id, name="rotated-key")
@@ -164,21 +171,21 @@ class APIKeyManagementTests(unittest.TestCase):
             name="operator-key",
             tenant_id="tenant-a",
             role=API_KEY_ROLE_OPERATOR,
-            expires_at="2026-05-01T00:00:00Z",
+            expires_at=self.future_expiry,
         )
 
         updated = self.store.update_key(
             principal.key_id,
             role=API_KEY_ROLE_READER,
             scopes=[API_KEY_SCOPE_JOBS_READ],
-            expires_at="2026-06-01T00:00:00Z",
+            expires_at=self.later_future_expiry,
         )
 
         self.assertIsNotNone(updated)
         assert updated is not None
         self.assertEqual(updated.role, API_KEY_ROLE_READER)
         self.assertEqual(updated.scopes, [API_KEY_SCOPE_JOBS_READ])
-        self.assertEqual(updated.expires_at, "2026-06-01T00:00:00Z")
+        self.assertEqual(updated.expires_at, self.later_future_expiry)
         with self.assertRaises(HTTPException) as exc_info:
             self.store.require_permission(updated, "POST", "/jobs/{job_id}/train/start")
         self.assertEqual(exc_info.exception.status_code, 403)
