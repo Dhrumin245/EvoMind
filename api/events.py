@@ -205,7 +205,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         try:
             raw_socket.settimeout(self.timeout)
             raw_socket.connect(self._target.sockaddr)
-            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)  # type: ignore[attr-defined]
         except Exception:
             raw_socket.close()
             raise
@@ -1203,7 +1203,7 @@ class EventManager:
                     webhook.url,
                     status_code,
                     "Webhook redirect responses are not allowed",
-                    None,
+                    {},  # type: ignore[arg-type]
                     None,
                 )
             if status_code >= 400:
@@ -1211,7 +1211,7 @@ class EventManager:
                     webhook.url,
                     status_code,
                     f"Webhook returned status {status_code}",
-                    None,
+                    {},  # type: ignore[arg-type]
                     None,
                 )
             return status_code

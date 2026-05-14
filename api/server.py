@@ -5,6 +5,7 @@ import os
 import secrets
 import re
 import time
+from dataclasses import asdict, is_dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -170,6 +171,14 @@ def _internal_server_error(log_message: str, exc: Optional[Exception] = None) ->
 def _model_dump(model: Any) -> Dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump()  # type: ignore[no-any-return]
+    if is_dataclass(model):
+        # is_dataclass() is True for both dataclass instances and dataclass types.
+        # asdict() expects an instance; if a dataclass type is passed, convert
+        # its fields to a dict of attribute values from the class.
+        if isinstance(model, type):
+            fields = getattr(model, "__dataclass_fields__", {}) or {}
+            return {k: getattr(model, k) for k in fields}
+        return asdict(model)
     return model.dict()  # type: ignore[no-any-return]
 
 

@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 from api.job_manager import JobManager
+from api.server import _model_dump
 from tests.tmp_utils import cleanup_path
 
 
@@ -75,6 +76,16 @@ class JobCommandQueueTests(unittest.TestCase):
 
         self.assertEqual(overlay["status"], "queued")
         self.assertEqual(overlay["system"]["status"], "queued")
+
+    def test_model_dump_supports_job_command_dataclass(self) -> None:
+        command = self.manager.enqueue_job_command("tenant1", "job1", "start")
+
+        payload = _model_dump(command)
+
+        self.assertEqual(payload["command_id"], command.command_id)
+        self.assertEqual(payload["tenant_id"], "tenant1")
+        self.assertEqual(payload["job_id"], "job1")
+        self.assertEqual(payload["command_type"], "start")
 
 
 if __name__ == "__main__":
