@@ -38,3 +38,4 @@ evolution/coevolution_state.json
 evolution/final_coevolution_state.json
 
 diagnostics/*.png
+md_files/*.md
