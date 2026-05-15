@@ -28,7 +28,6 @@ def main() -> int:
     parser = _build_parser()
     parser.parse_args()
 
-    _require_env("EVOMIND_CONTROL_PLANE_DB_URL")
     data_dir = Path(_require_env("EVOMIND_DATA_DIR"))
     backups_dir = Path(_require_env("EVOMIND_BACKUP_DIR"))
     data_dir.mkdir(parents=True, exist_ok=True)

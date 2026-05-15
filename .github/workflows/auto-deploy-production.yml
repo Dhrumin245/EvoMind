@@ -3,7 +3,7 @@ name: Auto Deploy Production
 on:
   workflow_run:
     workflows:
-      - Windows Release
+      - API CI
     types:
       - completed
     branches:
