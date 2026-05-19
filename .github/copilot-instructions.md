@@ -1,6 +1,6 @@
 **AI Coding Guide**
 
-- Threading guard rails live at [main.py](main.py#L1-L36); keep these env caps (OMP/MKL/NUMEXPR/OPENBLAS) when adding new entrypoints to avoid Windows oversubscription.
+- Threading guard rails live at [main.py](main.py#L1-L36); keep these env caps (OMP/MKL/NUMEXPR/OPENBLAS) when adding new entrypoints to avoid CPU oversubscription.
 - Default run is multi-agent co-evolution; CLI wiring and config overrides sit in [main.py](main.py#L930-L1070). Use `python main.py --mode async --evolution-type multi` and `MAX_GENERATIONS=1` for quick loops; state auto-load toggles via `AUTO_LOAD_COEVOLUTION_STATE`.
 - Training loop seeds populations, runs async evaluation, updates hall-of-fame, and evolves via `EvolutionEngine` in [main.py](main.py#L930-L1035); stagnation bumps mutation rates before evolution happens.
 - Evaluation is deterministic: `AsyncDeterministicEvaluator` seeds every genome/opponent combo without time offsets, forces CPU, and uses thread pools in [async_evaluator.py](async_evaluator.py#L1-L120). Prefer this path over ad-hoc evaluators.

@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from api.db_init import initialize_database
 from api.interface import AgentInterface
-from api.storage import api_jobs_db_path, connect_database, resolve_db_target, tenant_root_dir
+from api.storage import connect_database, resolve_db_target, tenant_root_dir
 from api.trainer import EvoTrainer
 
 
@@ -141,7 +142,6 @@ class JobManager:
     def __init__(
         self,
         root_dir: Optional[str] = None,
-        runtime_db_path: Optional[str] = None,
         runtime_db_url: Optional[str] = None,
         instance_id: Optional[str] = None,
         lease_seconds: int = DEFAULT_JOB_LEASE_SECONDS,
@@ -151,12 +151,11 @@ class JobManager:
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_db_target = resolve_db_target(
             context="API jobs",
-            explicit_path=Path(runtime_db_path) if runtime_db_path is not None else None,
+            explicit_path=None,
             explicit_url=runtime_db_url,
             env_url_names=("EVOMIND_API_JOBS_DB_URL",),
-            default_path=api_jobs_db_path(),
+            default_path=None,
         )
-        self.runtime_db_path = self.runtime_db_target.path
         self.runtime_db_url = self.runtime_db_target.url
         self.runtime_db_backend = self.runtime_db_target.backend
         self.instance_id = instance_id or self._build_instance_id()
@@ -176,87 +175,7 @@ class JobManager:
         return connect_database(self.runtime_db_target, timeout=30.0)
 
     def _init_runtime_db(self) -> None:
-        with self._runtime_connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS job_runtime_claims (
-                    tenant_id TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    owner_id TEXT NOT NULL,
-                    lease_expires_at TEXT NOT NULL,
-                    last_heartbeat_at TEXT NOT NULL,
-                    acquired_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, job_id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_job_runtime_claims_lease
-                ON job_runtime_claims (lease_expires_at, updated_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS job_commands (
-                    command_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    command_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    worker_id TEXT,
-                    error_message TEXT,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    completed_at TEXT,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_job_commands_status_created
-                ON job_commands (status, created_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS job_runtime_status (
-                    tenant_id TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    worker_id TEXT,
-                    status_payload_json TEXT NOT NULL DEFAULT '{}',
-                    last_error TEXT,
-                    active_command_id TEXT,
-                    command_type TEXT,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, job_id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS runtime_workers (
-                    worker_id TEXT NOT NULL,
-                    worker_type TEXT NOT NULL,
-                    lease_expires_at TEXT NOT NULL,
-                    last_heartbeat_at TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (worker_id, worker_type)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_runtime_workers_type_lease
-                ON runtime_workers (worker_type, lease_expires_at, updated_at)
-                """
-            )
-            conn.commit()
+        initialize_database(self.runtime_db_target)
 
     def _tenant_dir(self, tenant_id: str) -> Path:
         tenant = _sanitize_identifier(tenant_id, "tenant_id")
@@ -945,17 +864,60 @@ class JobManager:
     def _write_job(self, record: JobRecord) -> None:
         job_dir = Path(record.base_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
-        self._job_file(record.tenant_id, record.job_id).write_text(
-            json.dumps(record.to_dict(), indent=2),
-            encoding="utf-8",
-        )
+        with self._runtime_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    tenant_id, job_id, name, base_dir, created_at, updated_at, status, generation
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, job_id) DO UPDATE SET
+                    name = excluded.name,
+                    base_dir = excluded.base_dir,
+                    updated_at = excluded.updated_at,
+                    status = excluded.status,
+                    generation = excluded.generation
+                """,
+                (
+                    record.tenant_id,
+                    record.job_id,
+                    record.name,
+                    record.base_dir,
+                    record.created_at,
+                    record.updated_at,
+                    record.status,
+                    record.generation,
+                ),
+            )
+            conn.commit()
 
     def _read_job(self, tenant_id: str, job_id: str) -> Optional[JobRecord]:
+        with self._runtime_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM jobs
+                WHERE tenant_id = ? AND job_id = ?
+                """,
+                (tenant_id, job_id),
+            ).fetchone()
+        if row is not None:
+            return JobRecord(
+                job_id=str(row["job_id"]),
+                tenant_id=str(row["tenant_id"]),
+                name=str(row["name"]),
+                base_dir=str(row["base_dir"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+                status=str(row["status"]),
+                generation=int(row["generation"] or 0),
+            )
+
         job_path = self._job_file(tenant_id, job_id)
         if not job_path.exists():
             return None
         payload = json.loads(job_path.read_text(encoding="utf-8"))
-        return JobRecord(
+        record = JobRecord(
             job_id=str(payload["job_id"]),
             tenant_id=str(payload["tenant_id"]),
             name=str(payload.get("name", payload["job_id"])),
@@ -965,6 +927,8 @@ class JobManager:
             status=str(payload.get("status", "created")),
             generation=int(payload.get("generation", 0) or 0),
         )
+        self._write_job(record)
+        return record
 
     def create_job(
         self,
@@ -1003,16 +967,44 @@ class JobManager:
         return self.create_job(tenant_id=tenant_id, name="Default Job", job_id="default")
 
     def list_jobs(self, tenant_id: str) -> List[JobRecord]:
-        tenant_jobs_dir = self._tenant_dir(tenant_id)
-        if not tenant_jobs_dir.exists():
-            return []
-
         items: List[JobRecord] = []
-        for job_path in sorted(tenant_jobs_dir.glob("*/job.json")):
-            payload = json.loads(job_path.read_text(encoding="utf-8"))
+        with self._runtime_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM jobs
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC
+                """,
+                (tenant_id,),
+            ).fetchall()
+
+        seen_job_ids = set()
+        for row in rows:
+            job_id = str(row["job_id"])
+            seen_job_ids.add(job_id)
             items.append(
                 JobRecord(
-                    job_id=str(payload["job_id"]),
+                    job_id=job_id,
+                    tenant_id=str(row["tenant_id"]),
+                    name=str(row["name"]),
+                    base_dir=str(row["base_dir"]),
+                    created_at=str(row["created_at"]),
+                    updated_at=str(row["updated_at"]),
+                    status=str(row["status"]),
+                    generation=int(row["generation"] or 0),
+                )
+            )
+
+        tenant_jobs_dir = self._tenant_dir(tenant_id)
+        if tenant_jobs_dir.exists():
+            for job_path in sorted(tenant_jobs_dir.glob("*/job.json")):
+                payload = json.loads(job_path.read_text(encoding="utf-8"))
+                job_id = str(payload["job_id"])
+                if job_id in seen_job_ids:
+                    continue
+                record = JobRecord(
+                    job_id=job_id,
                     tenant_id=str(payload["tenant_id"]),
                     name=str(payload.get("name", payload["job_id"])),
                     base_dir=str(payload["base_dir"]),
@@ -1021,7 +1013,8 @@ class JobManager:
                     status=str(payload.get("status", "created")),
                     generation=int(payload.get("generation", 0) or 0),
                 )
-            )
+                self._write_job(record)
+                items.append(record)
 
         for item in items:
             runtime_status = self.get_runtime_status(item.tenant_id, item.job_id)

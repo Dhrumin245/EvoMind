@@ -1,12 +1,10 @@
 import ipaddress
 import unittest
-import uuid
-from pathlib import Path
 from unittest.mock import patch
 from urllib import error as urllib_error
 
 from api.events import EventManager, JobEventRecord, ResolvedWebhookTarget, WebhookRecord
-from tests.tmp_utils import cleanup_path
+from tests.postgres_utils import postgres_url, reset_tables
 
 
 class _FakeResponse:
@@ -50,12 +48,12 @@ class _FakeConnection:
 
 class WebhookDeliverySecurityTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_path = Path(f"tests/.tmp/webhook-security-{uuid.uuid4().hex}.db")
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.manager = EventManager(db_path=str(self.db_path))
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
+        self.manager = EventManager(db_url=self.db_url)
 
     def tearDown(self) -> None:
-        cleanup_path(self.db_path)
+        reset_tables(self.db_url)
 
     @staticmethod
     def _build_webhook(url: str) -> WebhookRecord:

@@ -10,7 +10,8 @@ from api.auth import APIKeyStore
 from api.backup import create_backup, restore_backup
 from api.events import EventManager
 from api.job_manager import JobManager
-from api.storage import api_auth_db_path, tenant_root_dir
+from api.storage import tenant_root_dir
+from tests.postgres_utils import postgres_url, reset_tables
 from tests.tmp_utils import cleanup_path
 
 
@@ -21,15 +22,19 @@ class BackupRestoreTests(unittest.TestCase):
         self.backups_dir = self.base_dir / "backups"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.backups_dir.mkdir(parents=True, exist_ok=True)
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
 
     def tearDown(self) -> None:
+        reset_tables(self.db_url)
         cleanup_path(self.base_dir)
 
-    def test_round_trip_restores_sqlite_state_and_tenant_artifacts(self) -> None:
+    def test_round_trip_restores_control_plane_state_and_tenant_artifacts(self) -> None:
         env = {
             "EVOMIND_ENV": "development",
             "EVOMIND_DATA_DIR": str(self.data_dir),
             "EVOMIND_BACKUP_DIR": str(self.backups_dir),
+            "EVOMIND_CONTROL_PLANE_DB_URL": self.db_url,
         }
         with patch.dict(os.environ, env, clear=False):
             auth_store = APIKeyStore()
@@ -87,7 +92,6 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].event_type, "job.created")
 
-            self.assertTrue(api_auth_db_path().exists())
             self.assertTrue(tenant_root_dir().exists())
 
 

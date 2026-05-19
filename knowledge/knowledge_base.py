@@ -1,5 +1,4 @@
 import json
-import sqlite3
 import os
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
@@ -182,138 +181,14 @@ class TheoryBuilder:
 class KnowledgeBase:
     """Persistent learning about learning"""
 
-    def __init__(self, storage_path: str = "knowledge_base.db", use_sqlite: bool = True):
+    def __init__(self, storage_path: str = "knowledge_base.json"):
         self.theories: List[Theory] = []
         self.principles: List[Principle] = []
         self.strategies: List[Dict[str, Any]] = []
         self.counter_examples: List[Dict[str, Any]] = []
 
         self.storage_path = storage_path
-        self.use_sqlite = use_sqlite
-
-        if use_sqlite:
-            self._init_sqlite()
-        else:
-            self._load_json()
-
-    def _init_sqlite(self):
-        """Initialize SQLite database"""
-        self.conn = sqlite3.connect(self.storage_path)
-        self.conn.execute('PRAGMA foreign_keys = ON')
-
-        # Create tables
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS theories (
-                id INTEGER PRIMARY KEY,
-                statement TEXT NOT NULL,
-                evidence TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                domain TEXT NOT NULL,
-                date_discovered TEXT NOT NULL,
-                validation_count INTEGER DEFAULT 0,
-                counter_examples TEXT DEFAULT '[]'
-            )
-        ''')
-
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS principles (
-                id INTEGER PRIMARY KEY,
-                rule TEXT NOT NULL,
-                conditions TEXT NOT NULL,
-                effectiveness REAL NOT NULL,
-                domain TEXT NOT NULL,
-                date_extracted TEXT NOT NULL,
-                supporting_experiments TEXT DEFAULT '[]',
-                confidence REAL DEFAULT 0.0
-            )
-        ''')
-
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS strategies (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                parameters TEXT NOT NULL,
-                performance REAL NOT NULL,
-                domain TEXT NOT NULL,
-                date_created TEXT NOT NULL
-            )
-        ''')
-
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS counter_examples (
-                id INTEGER PRIMARY KEY,
-                theory_id INTEGER,
-                description TEXT NOT NULL,
-                evidence TEXT NOT NULL,
-                date_found TEXT NOT NULL,
-                FOREIGN KEY (theory_id) REFERENCES theories (id)
-            )
-        ''')
-
-        self.conn.commit()
-        self._load_from_sqlite()
-
-    def _load_from_sqlite(self):
-        """Load data from SQLite database"""
-        # Load theories
-        cursor = self.conn.execute('SELECT * FROM theories')
-        for row in cursor:
-            evidence = json.loads(row[2])
-            counter_examples = json.loads(row[7])
-            theory = Theory(
-                statement=row[1],
-                evidence=evidence,
-                confidence=row[3],
-                domain=row[4],
-                date_discovered=datetime.fromisoformat(row[5]),
-                validation_count=row[6],
-                counter_examples=counter_examples
-            )
-            self.theories.append(theory)
-
-        # Load principles
-        cursor = self.conn.execute('SELECT * FROM principles')
-        for row in cursor:
-            conditions = json.loads(row[2])
-            supporting_experiments = json.loads(row[6])
-            principle = Principle(
-                rule=row[1],
-                conditions=conditions,
-                effectiveness=row[3],
-                domain=row[4],
-                date_extracted=datetime.fromisoformat(row[5]),
-                supporting_experiments=supporting_experiments,
-                confidence=row[7]
-            )
-            self.principles.append(principle)
-
-        # Load strategies
-        cursor = self.conn.execute('SELECT * FROM strategies')
-        for row in cursor:
-            parameters = json.loads(row[3])
-            strategy = {
-                'id': row[0],
-                'name': row[1],
-                'description': row[2],
-                'parameters': parameters,
-                'performance': row[4],
-                'domain': row[5],
-                'date_created': datetime.fromisoformat(row[6])
-            }
-            self.strategies.append(strategy)
-
-        # Load counter examples
-        cursor = self.conn.execute('SELECT * FROM counter_examples')
-        for row in cursor:
-            counter_example = {
-                'id': row[0],
-                'theory_id': row[1],
-                'description': row[2],
-                'evidence': json.loads(row[3]),
-                'date_found': datetime.fromisoformat(row[4])
-            }
-            self.counter_examples.append(counter_example)
+        self._load_json()
 
     def _load_json(self):
         """Load data from JSON file"""
@@ -324,72 +199,6 @@ class KnowledgeBase:
                 self.principles = [Principle(**p) for p in data.get('principles', [])]
                 self.strategies = data.get('strategies', [])
                 self.counter_examples = data.get('counter_examples', [])
-
-    def _save_sqlite(self):
-        """Save data to SQLite database"""
-        # Clear existing data
-        self.conn.execute('DELETE FROM theories')
-        self.conn.execute('DELETE FROM principles')
-        self.conn.execute('DELETE FROM strategies')
-        self.conn.execute('DELETE FROM counter_examples')
-
-        # Save theories
-        for theory in self.theories:
-            self.conn.execute('''
-                INSERT INTO theories (statement, evidence, confidence, domain, date_discovered, validation_count, counter_examples)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                theory.statement,
-                json.dumps(theory.evidence),
-                theory.confidence,
-                theory.domain,
-                theory.date_discovered.isoformat(),
-                theory.validation_count,
-                json.dumps(theory.counter_examples)
-            ))
-
-        # Save principles
-        for principle in self.principles:
-            self.conn.execute('''
-                INSERT INTO principles (rule, conditions, effectiveness, domain, date_extracted, supporting_experiments, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                principle.rule,
-                json.dumps(principle.conditions),
-                principle.effectiveness,
-                principle.domain,
-                principle.date_extracted.isoformat(),
-                json.dumps(principle.supporting_experiments),
-                principle.confidence
-            ))
-
-        # Save strategies
-        for strategy in self.strategies:
-            self.conn.execute('''
-                INSERT INTO strategies (name, description, parameters, performance, domain, date_created)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                strategy['name'],
-                strategy['description'],
-                json.dumps(strategy['parameters']),
-                strategy['performance'],
-                strategy['domain'],
-                strategy['date_created'].isoformat()
-            ))
-
-        # Save counter examples
-        for counter_example in self.counter_examples:
-            self.conn.execute('''
-                INSERT INTO counter_examples (theory_id, description, evidence, date_found)
-                VALUES (?, ?, ?, ?)
-            ''', (
-                counter_example['theory_id'],
-                counter_example['description'],
-                json.dumps(counter_example['evidence']),
-                counter_example['date_found'].isoformat()
-            ))
-
-        self.conn.commit()
 
     def _save_json(self):
         """Save data to JSON file"""
@@ -404,10 +213,7 @@ class KnowledgeBase:
 
     def save(self):
         """Save knowledge base to storage"""
-        if self.use_sqlite:
-            self._save_sqlite()
-        else:
-            self._save_json()
+        self._save_json()
 
     def add_theory(self, theory: Dict[str, Any]):
         """Add validated theory"""
@@ -673,6 +479,5 @@ class KnowledgeBase:
         }
 
     def close(self):
-        """Close database connections"""
-        if self.use_sqlite and hasattr(self, 'conn'):
-            self.conn.close()
+        """Release knowledge-base resources."""
+        return None

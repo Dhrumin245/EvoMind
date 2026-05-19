@@ -3,9 +3,7 @@ import hmac
 import json
 import os
 import unittest
-import uuid
 from hashlib import sha256
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,7 +12,7 @@ from fastapi import HTTPException, Request
 from api import auth
 from api.auth import APIKeyStore
 from api.payments import RazorpayClient
-from tests.tmp_utils import cleanup_path
+from tests.postgres_utils import postgres_url, reset_tables
 
 
 def _build_request(method: str, path: str, route_template: str) -> Request:
@@ -42,12 +40,12 @@ def _build_request(method: str, path: str, route_template: str) -> Request:
 
 class BillingPaymentsTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_path = Path(f"tests/.tmp/billing-payments-{uuid.uuid4().hex}.db")
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.store = APIKeyStore(db_path=str(self.db_path))
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
+        self.store = APIKeyStore(db_url=self.db_url)
 
     def tearDown(self) -> None:
-        cleanup_path(self.db_path)
+        reset_tables(self.db_url)
 
     def test_log_usage_debits_prepaid_balance_and_records_ledger(self) -> None:
         self.store.add_credit(

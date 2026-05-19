@@ -10,6 +10,9 @@ secrets
 venv
 .venv
 __pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
 *.pyc
 *.pyo
 *.pyd
@@ -28,7 +31,6 @@ tests/.tmp
 *.md
 docker-compose*.yml
 Dockerfile
-Dockerfile.linux
 coevolution_state.json
 seed_registry.json
 scripts/__pycache__

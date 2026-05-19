@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from api.auth import APIKeyPrincipal, api_key_store, require_api_key
+from api.db_init import initialize_control_plane_database
 from api.events import EventManager
 from api.interface import AgentInterface
 from api.job_manager import JobControlConflictError, JobManager, JobRecord
@@ -24,6 +25,15 @@ from api.payments import RazorpayClient
 from api.schemas import (
     AgentQuery,
     AgentResponse,
+    AuthLoginRequest,
+    AuthRegisterRequest,
+    AuthSessionResponse,
+    AuthUserResponse,
+    ApiKeyCreateRequest,
+    ApiKeyCreateResponse,
+    ApiKeyDeleteResponse,
+    ApiKeyListResponse,
+    ApiKeySummary,
     BillingAccountResponse,
     BillingLedgerEntry,
     BillingLedgerResponse,
@@ -486,6 +496,43 @@ def _job_summary(record: JobRecord) -> JobSummary:
     return JobSummary(**record.to_dict())  # type: ignore
 
 
+def _api_key_summary(principal: APIKeyPrincipal) -> ApiKeySummary:
+    return ApiKeySummary(
+        key_id=principal.key_id,
+        name=principal.name,
+        tenant_id=principal.tenant_id,
+        status=principal.status,
+        role=principal.role,
+        scopes=list(principal.scopes),
+        created_at=principal.created_at,
+        updated_at=principal.updated_at,
+        last_used_at=principal.last_used_at,
+        expires_at=principal.expires_at,
+        revoked_at=principal.revoked_at,
+        expired_at=principal.expired_at,
+        rotated_at=principal.rotated_at,
+        rotated_from_key_id=principal.rotated_from_key_id,
+        replaced_by_key_id=principal.replaced_by_key_id,
+    )
+
+
+def _auth_user_response(user: Dict[str, Any]) -> AuthUserResponse:
+    return AuthUserResponse(
+        user_id=str(user["user_id"]),
+        email=str(user["email"]),
+        name=str(user["name"]),
+        tenant_id=str(user["tenant_id"]),
+        role=str(user["role"]),
+        scopes=list(user.get("scopes") or []),
+        created_at=str(user["created_at"]),
+        last_login_at=user.get("last_login_at"),
+    )
+
+
+def _auth_session_response(user: Dict[str, Any], token: str) -> AuthSessionResponse:
+    return AuthSessionResponse(token=token, user=_auth_user_response(user))
+
+
 def _serialize_train_status(status: TrainStatus) -> Dict[str, Any]:
     if hasattr(status, "model_dump"):
         return status.model_dump()  # type: ignore[no-any-return]
@@ -699,6 +746,8 @@ async def _run_agent_batch_action(
 @app.on_event("startup")
 async def startup_event():
     global event_manager, job_manager, usage_log_queue, usage_log_worker_task
+    await asyncio.to_thread(initialize_control_plane_database)
+    await asyncio.to_thread(api_key_store.initialize)
     job_manager = JobManager()
     event_manager = EventManager()
     usage_log_queue = asyncio.Queue(maxsize=USAGE_LOG_QUEUE_SIZE)
@@ -780,6 +829,112 @@ async def readiness_check():
     if all_healthy:
         return payload
     return JSONResponse(status_code=503, content=_model_dump(payload))
+
+
+@app.post("/auth/register", response_model=AuthSessionResponse)
+async def register_user(request: AuthRegisterRequest):
+    try:
+        user, token = await asyncio.to_thread(
+            api_key_store.register_user,
+            email=request.email,
+            password=request.password,
+            tenant_id=request.tenant_id,
+            name=request.name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _auth_session_response(user, token)
+
+
+@app.post("/auth/login", response_model=AuthSessionResponse)
+async def login_user(request: AuthLoginRequest):
+    try:
+        user, token = await asyncio.to_thread(
+            api_key_store.login_user,
+            email=request.email,
+            password=request.password,
+        )
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return _auth_session_response(user, token)
+
+
+@app.get("/auth/me", response_model=AuthUserResponse)
+async def current_user(principal: APIKeyPrincipal = Depends(require_api_key)):
+    if principal.user_id:
+        user = await asyncio.to_thread(api_key_store.get_user_by_id, principal.user_id)
+        if user is not None:
+            return _auth_user_response(user)
+    return AuthUserResponse(
+        user_id=principal.key_id,
+        email=principal.email or "",
+        name=principal.name,
+        tenant_id=principal.tenant_id,
+        role=principal.role,
+        scopes=principal.scopes,
+        created_at=principal.created_at or "",
+        last_login_at=principal.last_used_at,
+    )
+
+
+@app.post("/auth/logout")
+async def logout_user(request: Request):
+    authorization = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return {"logged_out": False}
+    token = authorization[len(prefix) :].strip()
+    logged_out = await asyncio.to_thread(api_key_store.revoke_session_token, token)
+    return {"logged_out": logged_out}
+
+
+@app.get("/auth/keys", response_model=ApiKeyListResponse)
+async def list_api_keys(principal: APIKeyPrincipal = Depends(require_api_key)):
+    items = await asyncio.to_thread(api_key_store.list_keys, principal.tenant_id)
+    summaries = [_api_key_summary(item) for item in items]
+    return ApiKeyListResponse(
+        tenant_id=principal.tenant_id,
+        count=len(summaries),
+        items=summaries,
+    )
+
+
+@app.post("/auth/keys", response_model=ApiKeyCreateResponse)
+async def create_api_key(
+    request: ApiKeyCreateRequest,
+    principal: APIKeyPrincipal = Depends(require_api_key),
+):
+    try:
+        created, raw_key = await asyncio.to_thread(
+            api_key_store.create_key,
+            name=request.name,
+            tenant_id=principal.tenant_id,
+            role=request.role or "admin",
+            scopes=request.scopes,
+            expires_at=request.expires_at,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return ApiKeyCreateResponse(
+        key=_api_key_summary(created),
+        api_key=raw_key,
+    )
+
+
+@app.delete("/auth/keys/{key_id}", response_model=ApiKeyDeleteResponse)
+async def delete_api_key(
+    key_id: str,
+    principal: APIKeyPrincipal = Depends(require_api_key),
+):
+    existing = await asyncio.to_thread(api_key_store.get_key, key_id)
+    if existing is None or existing.tenant_id != principal.tenant_id:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    deleted = await asyncio.to_thread(api_key_store.revoke_key, key_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="API key not found or already inactive")
+    return ApiKeyDeleteResponse(key_id=key_id, deleted=True)
 
 
 @app.post("/jobs", response_model=JobSummary)

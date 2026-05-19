@@ -1,65 +1,45 @@
-# escape=`
-ARG PYTHON_IMAGE=python:3.13.3-windowsservercore-ltsc2022
+FROM python:3.13-slim-bookworm AS runtime
 
-FROM ${PYTHON_IMAGE} AS build
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
-SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
-
-ENV PYTHONDONTWRITEBYTECODE=1 `
-    PYTHONUNBUFFERED=1 `
-    PIP_NO_CACHE_DIR=1 `
-    MPLBACKEND=Agg `
-    SDL_VIDEODRIVER=dummy `
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MPLBACKEND=Agg \
+    SDL_VIDEODRIVER=dummy \
     SDL_AUDIODRIVER=dummy
 
-WORKDIR C:\app
+WORKDIR /app
 
-RUN python -m venv C:\venv
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
-RUN C:\venv\Scripts\python.exe -m pip wheel --wheel-dir C:\wheels -r requirements.txt
-
-FROM ${PYTHON_IMAGE} AS runtime
-
-SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
-
-ENV PYTHONDONTWRITEBYTECODE=1 `
-    PYTHONUNBUFFERED=1 `
-    PIP_NO_CACHE_DIR=1 `
-    MPLBACKEND=Agg `
-    SDL_VIDEODRIVER=dummy `
-    SDL_AUDIODRIVER=dummy
-
-WORKDIR C:\app
-
-RUN python -m venv C:\venv
-
-COPY --from=build C:\wheels C:\wheels
-COPY requirements.txt .
-
-RUN C:\venv\Scripts\python.exe -m pip install --no-index --find-links=C:\wheels -r requirements.txt; `
-    Remove-Item -Recurse -Force C:\wheels
+RUN python -m pip install --no-compile --root-user-action=ignore --index-url "${PYTORCH_INDEX_URL}" torch==2.11.0 \
+    && python -m pip install --no-compile --root-user-action=ignore -r requirements.txt
 
 COPY . .
 
-RUN New-Item -ItemType Directory -Force C:\app\data, C:\app\artifacts, C:\app\backups | Out-Null; `
-    icacls C:\app /grant 'Users:(OI)(CI)F' /T | Out-Null
+RUN mkdir -p /app/data /app/artifacts /app/backups \
+    && useradd --create-home --shell /usr/sbin/nologin evomind \
+    && chown -R evomind:evomind /app
 
-USER ContainerUser
+USER evomind
 
 FROM runtime AS api
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 `
-  CMD ["powershell", "-NoProfile", "-Command", "try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/health/readiness' -TimeoutSec 5; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/readiness', timeout=5).read()"]
 
-CMD ["C:\\venv\\Scripts\\python.exe", "-m", "uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "8000"]
 
 FROM runtime AS worker
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 `
-  CMD ["C:\\venv\\Scripts\\python.exe", "-m", "api.worker_healthcheck"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-m", "api.worker_healthcheck"]
 
-CMD ["C:\\venv\\Scripts\\python.exe", "-m", "api.worker"]
+CMD ["python", "-m", "api.worker"]

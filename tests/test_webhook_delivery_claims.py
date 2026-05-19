@@ -1,19 +1,17 @@
 import unittest
-import uuid
-from pathlib import Path
 
 from api.events import EventManager
-from tests.tmp_utils import cleanup_path
+from tests.postgres_utils import postgres_url, reset_tables
 
 
 class WebhookDeliveryClaimTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_path = Path(f"tests/.tmp/webhook-claim-tests-{uuid.uuid4().hex}.db")
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.manager = EventManager(db_path=str(self.db_path))
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
+        self.manager = EventManager(db_url=self.db_url)
 
     def tearDown(self) -> None:
-        cleanup_path(self.db_path)
+        reset_tables(self.db_url)
 
     def _insert_delivery(
         self,

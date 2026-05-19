@@ -5,20 +5,18 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from api.logging_utils import merge_log_context
+from api.db_init import initialize_database
 from api.storage import (
-    api_auth_db_path,
-    auto_increment_primary_key_sql,
-    column_names,
     connect_database,
     resolve_db_target,
 )
@@ -52,6 +50,8 @@ API_KEY_SCOPE_CHECKPOINTS_WRITE = "checkpoints:write"
 API_KEY_SCOPE_AGENT_READ = "agent:read"
 API_KEY_SCOPE_AGENT_INVOKE = "agent:invoke"
 API_KEY_SCOPE_GENOMES_READ = "genomes:read"
+API_KEY_SCOPE_AUTH_READ = "auth:read"
+API_KEY_SCOPE_AUTH_WRITE = "auth:write"
 
 API_KEY_PERMISSION_RULES: Dict[tuple[str, str], tuple[str, ...]] = {}
 for route_template in (
@@ -71,6 +71,9 @@ for method, route_template, scope in (
     ("POST", "/webhooks", API_KEY_SCOPE_WEBHOOKS_WRITE),
     ("DELETE", "/webhooks/{webhook_id}", API_KEY_SCOPE_WEBHOOKS_WRITE),
     ("GET", "/webhooks/{webhook_id}/deliveries", API_KEY_SCOPE_WEBHOOKS_READ),
+    ("GET", "/auth/keys", API_KEY_SCOPE_AUTH_READ),
+    ("POST", "/auth/keys", API_KEY_SCOPE_AUTH_WRITE),
+    ("DELETE", "/auth/keys/{key_id}", API_KEY_SCOPE_AUTH_WRITE),
     ("POST", "/jobs", API_KEY_SCOPE_JOBS_WRITE),
     ("GET", "/jobs", API_KEY_SCOPE_JOBS_READ),
     ("GET", "/jobs/{job_id}", API_KEY_SCOPE_JOBS_READ),
@@ -120,6 +123,8 @@ ALL_API_KEY_SCOPES = {
     API_KEY_SCOPE_AGENT_READ,
     API_KEY_SCOPE_AGENT_INVOKE,
     API_KEY_SCOPE_GENOMES_READ,
+    API_KEY_SCOPE_AUTH_READ,
+    API_KEY_SCOPE_AUTH_WRITE,
 }
 ROLE_DEFAULT_SCOPES = {
     API_KEY_ROLE_ADMIN: [API_KEY_SCOPE_ALL],
@@ -289,6 +294,24 @@ ROUTE_BILLING_CATALOG = [
         "route_template": "/webhooks/{webhook_id}/deliveries",
         "billing_tier": "admin_free",
         "description": "Inspect webhook delivery history",
+    },
+    {
+        "method": "GET",
+        "route_template": "/auth/keys",
+        "billing_tier": "admin_free",
+        "description": "List tenant API keys",
+    },
+    {
+        "method": "POST",
+        "route_template": "/auth/keys",
+        "billing_tier": "admin_free",
+        "description": "Create a tenant API key",
+    },
+    {
+        "method": "DELETE",
+        "route_template": "/auth/keys/{key_id}",
+        "billing_tier": "admin_free",
+        "description": "Revoke a tenant API key",
     },
     {
         "method": "POST",
@@ -512,23 +535,48 @@ class APIKeyPrincipal:
     rotated_at: Optional[str] = None
     rotated_from_key_id: Optional[str] = None
     replaced_by_key_id: Optional[str] = None
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    auth_type: str = "api_key"
 
 
 class APIKeyStore:
-    def __init__(self, db_path: Optional[str] = None, db_url: Optional[str] = None):
+    def __init__(
+        self,
+        db_url: Optional[str] = None,
+        *,
+        initialize: bool = True,
+        allow_unconfigured: bool = False,
+    ):
         self.db_target = resolve_db_target(
             context="API auth",
-            explicit_path=Path(db_path) if db_path is not None else None,
+            explicit_path=None,
             explicit_url=db_url,
             env_url_names=("EVOMIND_API_AUTH_DB_URL",),
-            default_path=api_auth_db_path(),
+            default_path=None,
+            allow_unconfigured=allow_unconfigured,
         )
-        self.db_path = self.db_target.path
         self.db_url = self.db_target.url
         self.db_backend = self.db_target.backend
+        if initialize:
+            self._init_db()
+
+    def initialize(self) -> None:
+        if self.db_target.url is None:
+            self.db_target = resolve_db_target(
+                context="API auth",
+                explicit_path=None,
+                explicit_url=None,
+                env_url_names=("EVOMIND_API_AUTH_DB_URL",),
+                default_path=None,
+            )
+            self.db_url = self.db_target.url
+            self.db_backend = self.db_target.backend
         self._init_db()
 
     def _connect(self):
+        if self.db_target.url is None:
+            self.initialize()
         return connect_database(self.db_target, timeout=30.0)
 
     @staticmethod
@@ -682,175 +730,8 @@ class APIKeyStore:
             return False
 
     def _init_db(self) -> None:
+        initialize_database(self.db_target)
         with self._connect() as conn:
-            id_column_sql = auto_increment_primary_key_sql(self.db_backend)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    key_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    salt TEXT NOT NULL,
-                    key_hash TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL,
-                    last_used_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tenant_limits (
-                    tenant_id TEXT PRIMARY KEY,
-                    requests_per_minute INTEGER NOT NULL,
-                    requests_per_day INTEGER NOT NULL,
-                    max_jobs INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS usage_logs (
-                    id {id_column_sql},
-                    tenant_id TEXT NOT NULL,
-                    key_id TEXT NOT NULL,
-                    method TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    route_template TEXT,
-                    status_code INTEGER NOT NULL,
-                    duration_ms REAL NOT NULL DEFAULT 0,
-                    job_id TEXT,
-                    billing_tier TEXT NOT NULL DEFAULT 'unclassified',
-                    billed_tokens INTEGER NOT NULL DEFAULT 0,
-                    unit_price_inr REAL NOT NULL DEFAULT 0,
-                    estimated_cost_inr REAL NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS rate_limit_counters (
-                    tenant_id TEXT PRIMARY KEY,
-                    minute_window TEXT NOT NULL,
-                    minute_count INTEGER NOT NULL DEFAULT 0,
-                    day_window TEXT NOT NULL,
-                    day_count INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tenant_billing_accounts (
-                    tenant_id TEXT PRIMARY KEY,
-                    currency TEXT NOT NULL DEFAULT 'INR',
-                    balance_inr REAL NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS billing_ledger (
-                    id {id_column_sql},
-                    tenant_id TEXT NOT NULL,
-                    entry_type TEXT NOT NULL,
-                    amount_inr REAL NOT NULL,
-                    balance_after_inr REAL NOT NULL,
-                    currency TEXT NOT NULL DEFAULT 'INR',
-                    description TEXT NOT NULL DEFAULT '',
-                    reference_type TEXT,
-                    reference_id TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{{}}',
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS billing_topups (
-                    topup_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    amount_inr REAL NOT NULL,
-                    currency TEXT NOT NULL DEFAULT 'INR',
-                    receipt TEXT NOT NULL,
-                    provider_order_id TEXT NOT NULL,
-                    provider_payment_id TEXT,
-                    description TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    paid_at TEXT
-                )
-                """
-            )
-
-            usage_log_columns = column_names(conn, "usage_logs")
-            usage_log_migrations = {
-                "route_template": "TEXT",
-                "billing_tier": "TEXT NOT NULL DEFAULT 'unclassified'",
-                "billed_tokens": "INTEGER NOT NULL DEFAULT 0",
-                "unit_price_inr": "REAL NOT NULL DEFAULT 0",
-                "estimated_cost_inr": "REAL NOT NULL DEFAULT 0",
-            }
-            for column_name, column_definition in usage_log_migrations.items():
-                if column_name not in usage_log_columns:
-                    try:
-                        conn.execute(
-                            f"ALTER TABLE usage_logs ADD COLUMN {column_name} {column_definition}"
-                        )
-                    except Exception as exc:
-                        if "duplicate column" not in str(exc).lower():
-                            raise
-
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_usage_logs_tenant_created
-                ON usage_logs (tenant_id, created_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_billing_ledger_tenant_created
-                ON billing_ledger (tenant_id, created_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_topups_provider_order
-                ON billing_topups (provider, provider_order_id)
-                """
-            )
-            conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_topups_provider_payment
-                ON billing_topups (provider, provider_payment_id)
-                """
-            )
-            api_key_columns = column_names(conn, "api_keys")
-            api_key_migrations = {
-                "role": "TEXT NOT NULL DEFAULT 'admin'",
-                "scopes_json": """TEXT NOT NULL DEFAULT '["*"]'""",
-                "expires_at": "TEXT",
-                "updated_at": "TEXT",
-                "revoked_at": "TEXT",
-                "expired_at": "TEXT",
-                "rotated_at": "TEXT",
-                "rotated_from_key_id": "TEXT",
-                "replaced_by_key_id": "TEXT",
-            }
-            for column_name, column_definition in api_key_migrations.items():
-                if column_name not in api_key_columns:
-                    conn.execute(
-                        f"ALTER TABLE api_keys ADD COLUMN {column_name} {column_definition}"
-                    )
-
             conn.execute(
                 """
                 UPDATE api_keys
@@ -858,12 +739,6 @@ class APIKeyStore:
                     role = COALESCE(NULLIF(role, ''), 'admin'),
                     scopes_json = COALESCE(NULLIF(scopes_json, ''), '["*"]'),
                     updated_at = COALESCE(NULLIF(updated_at, ''), created_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_status
-                ON api_keys (tenant_id, status)
                 """
             )
             conn.commit()
@@ -901,11 +776,57 @@ class APIKeyStore:
         return digest.hex()
 
     @staticmethod
+    def _normalize_email(email: str) -> str:
+        normalized = str(email or "").strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+            raise ValueError("Email address is invalid")
+        return normalized
+
+    @staticmethod
+    def _normalize_tenant_id(tenant_id: Optional[str], email: str) -> str:
+        raw_value = str(tenant_id or "").strip().lower()
+        if not raw_value:
+            local_part = email.split("@", 1)[0]
+            raw_value = re.sub(r"[^a-z0-9_-]+", "-", local_part.lower()).strip("-_")
+            if not raw_value:
+                raw_value = "tenant"
+        if not re.fullmatch(r"[a-z0-9_-]{1,80}", raw_value):
+            raise ValueError("tenant_id must contain only lowercase letters, numbers, '_' or '-'")
+        return raw_value
+
+    @staticmethod
+    def _hash_secret(raw_value: str, salt_hex: str) -> str:
+        salt = bytes.fromhex(salt_hex)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            raw_value.encode("utf-8"),
+            salt,
+            200_000,
+        )
+        return digest.hex()
+
+    @staticmethod
     def _generate_key_material() -> tuple[str, str]:
         key_id = secrets.token_hex(8)
         secret = secrets.token_urlsafe(32)
         raw_key = f"evm_{key_id}_{secret}"
         return key_id, raw_key
+
+    @staticmethod
+    def _generate_session_material() -> tuple[str, str]:
+        session_id = secrets.token_hex(8)
+        secret = secrets.token_urlsafe(32)
+        raw_token = f"evs_{session_id}_{secret}"
+        return session_id, raw_token
+
+    @staticmethod
+    def _extract_session_id(raw_token: str) -> Optional[str]:
+        if not raw_token.startswith("evs_"):
+            return None
+        parts = raw_token.split("_", 2)
+        if len(parts) != 3 or not parts[1]:
+            return None
+        return parts[1]
 
     @staticmethod
     def _extract_key_id(raw_key: str) -> Optional[str]:
@@ -950,6 +871,205 @@ class APIKeyStore:
         with self._connect() as conn:
             self._ensure_tenant_billing_conn(conn, tenant_id)
             conn.commit()
+
+    def _user_row_to_dict(self, row: Any) -> Dict[str, Any]:
+        role = self._normalize_role(row["role"] if row["role"] is not None else API_KEY_ROLE_ADMIN)
+        return {
+            "user_id": str(row["user_id"]),
+            "email": str(row["email"]),
+            "name": str(row["name"] or row["email"]),
+            "tenant_id": str(row["tenant_id"]),
+            "role": role,
+            "scopes": self._load_scopes(row["scopes_json"], role),
+            "status": str(row["status"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "last_login_at": row["last_login_at"],
+        }
+
+    def register_user(
+        self,
+        *,
+        email: str,
+        password: str,
+        tenant_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> tuple[Dict[str, Any], str]:
+        normalized_email = self._normalize_email(email)
+        if len(str(password or "")) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        normalized_tenant = self._normalize_tenant_id(tenant_id, normalized_email)
+        display_name = str(name or normalized_email.split("@", 1)[0]).strip()[:120] or normalized_email
+        role = API_KEY_ROLE_ADMIN
+        scopes = self._default_scopes_for_role(role)
+        user_id = secrets.token_hex(8)
+        salt_hex = secrets.token_hex(16)
+        password_hash = self._hash_secret(password, salt_hex)
+        now = _utc_now()
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT user_id FROM user_accounts WHERE email = ?",
+                (normalized_email,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("A user with this email already exists")
+
+            self._ensure_tenant_limits_conn(conn, normalized_tenant)
+            self._ensure_tenant_billing_conn(conn, normalized_tenant)
+            conn.execute(
+                """
+                INSERT INTO user_accounts (
+                    user_id, email, name, tenant_id, password_salt, password_hash,
+                    role, scopes_json, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    user_id,
+                    normalized_email,
+                    display_name,
+                    normalized_tenant,
+                    salt_hex,
+                    password_hash,
+                    role,
+                    self._scopes_json(scopes),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+        return self.login_user(email=normalized_email, password=password)
+
+    def login_user(self, *, email: str, password: str) -> tuple[Dict[str, Any], str]:
+        normalized_email = self._normalize_email(email)
+        now = _utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM user_accounts
+                WHERE email = ? AND status = 'active'
+                """,
+                (normalized_email,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Invalid email or password")
+
+            expected = self._hash_secret(password, str(row["password_salt"]))
+            if not hmac.compare_digest(expected, str(row["password_hash"])):
+                raise ValueError("Invalid email or password")
+
+            session_id, raw_token = self._generate_session_material()
+            token_salt = secrets.token_hex(16)
+            token_hash = self._hash_secret(raw_token, token_salt)
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                """
+                INSERT INTO user_sessions (
+                    session_id, user_id, token_salt, token_hash, status,
+                    created_at, last_used_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (session_id, row["user_id"], token_salt, token_hash, now, now, expires_at),
+            )
+            conn.execute(
+                """
+                UPDATE user_accounts
+                SET last_login_at = ?, updated_at = ?
+                WHERE user_id = ?
+                """,
+                (now, now, row["user_id"]),
+            )
+            conn.commit()
+
+        user = self.get_user_by_id(str(row["user_id"]))
+        if user is None:
+            raise RuntimeError("User session could not be created")
+        return user, raw_token
+
+    def get_user_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM user_accounts WHERE user_id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._user_row_to_dict(row)
+
+    def resolve_session_token(self, raw_token: str) -> Optional[APIKeyPrincipal]:
+        session_id = self._extract_session_id(raw_token)
+        if not session_id:
+            return None
+        now = _utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    s.session_id,
+                    s.token_salt,
+                    s.token_hash,
+                    s.expires_at,
+                    u.*
+                FROM user_sessions s
+                JOIN user_accounts u ON u.user_id = s.user_id
+                WHERE s.session_id = ? AND s.status = 'active' AND u.status = 'active'
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if self._is_expired_timestamp(row["expires_at"]):
+                conn.execute(
+                    "UPDATE user_sessions SET status = 'expired', last_used_at = ? WHERE session_id = ?",
+                    (now, session_id),
+                )
+                conn.commit()
+                return None
+            expected = self._hash_secret(raw_token, str(row["token_salt"]))
+            if not hmac.compare_digest(expected, str(row["token_hash"])):
+                return None
+            conn.execute(
+                "UPDATE user_sessions SET last_used_at = ? WHERE session_id = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        role = self._normalize_role(row["role"])
+        return APIKeyPrincipal(
+            key_id=f"session:{row['session_id']}",
+            name=str(row["name"] or row["email"]),
+            tenant_id=str(row["tenant_id"]),
+            status=API_KEY_STATUS_ACTIVE,
+            role=role,
+            scopes=self._load_scopes(row["scopes_json"], role),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            last_used_at=now,
+            expires_at=row["expires_at"],
+            user_id=str(row["user_id"]),
+            email=str(row["email"]),
+            auth_type="session",
+        )
+
+    def revoke_session_token(self, raw_token: str) -> bool:
+        session_id = self._extract_session_id(raw_token)
+        if not session_id:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE user_sessions
+                SET status = 'revoked', last_used_at = ?
+                WHERE session_id = ? AND status = 'active'
+                """,
+                (_utc_now(), session_id),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
 
     @staticmethod
     def _coerce_amount_inr(amount_inr: float) -> float:
@@ -2204,7 +2324,7 @@ class APIKeyStore:
         return items
 
 
-api_key_store = APIKeyStore()
+api_key_store = APIKeyStore(initialize=False, allow_unconfigured=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -2224,11 +2344,15 @@ async def require_api_key(
             detail="Missing API key",
         )
 
-    principal = await asyncio.to_thread(api_key_store.resolve_key, raw_key)
+    principal = None
+    if header_key is None and bearer is not None:
+        principal = await asyncio.to_thread(api_key_store.resolve_session_token, raw_key)
+    if principal is None:
+        principal = await asyncio.to_thread(api_key_store.resolve_key, raw_key)
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid, expired, rotated, or revoked API key",
+            detail="Invalid, expired, rotated, or revoked credential",
         )
 
     route = request.scope.get("route")

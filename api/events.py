@@ -11,14 +11,14 @@ import socket
 import ssl
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from cryptography.fernet import Fernet, InvalidToken
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 
 from api.env_utils import read_env_value
-from api.storage import api_events_db_path, column_names, connect_database, resolve_db_target
+from api.db_init import initialize_database
+from api.storage import connect_database, resolve_db_target
 
 logger = logging.getLogger(__name__)
 
@@ -212,15 +212,14 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class EventManager:
-    def __init__(self, db_path: Optional[str] = None, db_url: Optional[str] = None):
+    def __init__(self, db_url: Optional[str] = None):
         self.db_target = resolve_db_target(
             context="API events",
-            explicit_path=Path(db_path) if db_path is not None else None,
+            explicit_path=None,
             explicit_url=db_url,
             env_url_names=("EVOMIND_API_EVENTS_DB_URL",),
-            default_path=api_events_db_path(),
+            default_path=None,
         )
-        self.db_path = self.db_target.path
         self.db_url = self.db_target.url
         self.db_backend = self.db_target.backend
         self._webhook_secret_cipher = self._load_webhook_secret_cipher()
@@ -244,113 +243,8 @@ class EventManager:
         return task is not None and not task.done()
 
     def _init_db(self) -> None:
+        initialize_database(self.db_target)
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS job_events (
-                    event_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS webhooks (
-                    webhook_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '',
-                    secret TEXT,
-                    subscribed_events_json TEXT NOT NULL DEFAULT '[]',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    last_delivery_at TEXT,
-                    last_delivery_status TEXT,
-                    last_delivery_error TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                    delivery_id TEXT PRIMARY KEY,
-                    webhook_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    job_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    max_attempts INTEGER NOT NULL DEFAULT 5,
-                    next_retry_at TEXT,
-                    delivered_at TEXT,
-                    last_error TEXT,
-                    processing_started_at TEXT,
-                    claim_token TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
-                    attempt_id TEXT PRIMARY KEY,
-                    delivery_id TEXT NOT NULL,
-                    attempt_number INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    response_status_code INTEGER,
-                    error_message TEXT,
-                    created_at TEXT NOT NULL,
-                    completed_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_job_events_tenant_job_created
-                ON job_events (tenant_id, job_id, created_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_webhooks_tenant_status
-                ON webhooks (tenant_id, status)
-                """
-            )
-            conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook_event
-                ON webhook_deliveries (webhook_id, event_id)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
-                ON webhook_deliveries (status, next_retry_at, updated_at)
-                """
-            )
-            delivery_columns = column_names(conn, "webhook_deliveries")
-            delivery_migrations = {
-                "processing_started_at": "TEXT",
-                "claim_token": "TEXT",
-            }
-            for column_name, column_definition in delivery_migrations.items():
-                if column_name not in delivery_columns:
-                    conn.execute(
-                        f"ALTER TABLE webhook_deliveries ADD COLUMN {column_name} {column_definition}"
-                    )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery
-                ON webhook_delivery_attempts (delivery_id, attempt_number)
-                """
-            )
             self._migrate_webhook_secret_storage(conn)
             conn.commit()
 

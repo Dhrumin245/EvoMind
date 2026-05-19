@@ -11,12 +11,26 @@ concurrency:
 
 jobs:
   drill:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: evomind
+          POSTGRES_USER: evomind
+          POSTGRES_PASSWORD: evomind_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evomind -d evomind"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     env:
-      EVOMIND_ALLOW_SQLITE_IN_PRODUCTION: "true"
-      EVOMIND_BACKUP_DIR: ${{ github.workspace }}\.tmp\evomind-backups
-      EVOMIND_DATA_DIR: ${{ github.workspace }}\.tmp\evomind-data
+      EVOMIND_BACKUP_DIR: ${{ github.workspace }}/.tmp/evomind-backups
+      EVOMIND_CONTROL_PLANE_DB_URL: postgresql://evomind:evomind_test_password@127.0.0.1:5432/evomind
+      EVOMIND_DATA_DIR: ${{ github.workspace }}/.tmp/evomind-data
       EVOMIND_ENV: production
       MPLBACKEND: Agg
       PYTHONDONTWRITEBYTECODE: "1"
@@ -39,12 +53,10 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Generate drill webhook secret
-        shell: pwsh
         run: |
-          $key = python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-          Add-Content -Path $env:GITHUB_ENV -Value "EVOMIND_WEBHOOK_SECRET_KEY=$key"
+          key="$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")"
+          echo "EVOMIND_WEBHOOK_SECRET_KEY=$key" >> "$GITHUB_ENV"
 
       - name: Run backup restore drill
-        shell: pwsh
         run: |
           python scripts/backup_restore_drill.py

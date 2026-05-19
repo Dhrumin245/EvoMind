@@ -1,8 +1,6 @@
 import asyncio
 import unittest
-import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,7 +15,7 @@ from api.auth import (
     API_KEY_SCOPE_TRAINING_WRITE,
     APIKeyStore,
 )
-from tests.tmp_utils import cleanup_path
+from tests.postgres_utils import postgres_url, reset_tables
 
 
 def _future_expiry(days: int) -> str:
@@ -49,14 +47,14 @@ def _build_request(method: str, path: str, route_template: str) -> Request:
 
 class APIKeyManagementTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_path = Path(f"tests/.tmp/api-key-management-{uuid.uuid4().hex}.db")
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.store = APIKeyStore(db_path=str(self.db_path))
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
+        self.store = APIKeyStore(db_url=self.db_url)
         self.future_expiry = _future_expiry(365)
         self.later_future_expiry = _future_expiry(395)
 
     def tearDown(self) -> None:
-        cleanup_path(self.db_path)
+        reset_tables(self.db_url)
 
     def test_create_key_persists_role_scopes_and_expiry(self) -> None:
         principal, raw_key = self.store.create_key(

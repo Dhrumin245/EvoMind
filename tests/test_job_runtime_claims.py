@@ -5,27 +5,28 @@ from pathlib import Path
 from typing import Any, cast
 
 from api.job_manager import JobControlConflictError, JobManager
+from tests.postgres_utils import postgres_url, reset_tables
 from tests.tmp_utils import cleanup_path
 
 
 class JobRuntimeClaimTests(unittest.TestCase):
     def setUp(self) -> None:
         suffix = uuid.uuid4().hex
-        self.runtime_db_path = Path(f"tests/.tmp/job-runtime-{suffix}.db")
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
         self.root_dir = Path(f"tests/.tmp/job-runtime-root-{suffix}")
-        self.runtime_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
         self.manager_a = JobManager(
             root_dir=str(self.root_dir),
-            runtime_db_path=str(self.runtime_db_path),
+            runtime_db_url=self.db_url,
             instance_id="instance-a",
             lease_seconds=30,
             heartbeat_interval_seconds=1,
         )
         self.manager_b = JobManager(
             root_dir=str(self.root_dir),
-            runtime_db_path=str(self.runtime_db_path),
+            runtime_db_url=self.db_url,
             instance_id="instance-b",
             lease_seconds=30,
             heartbeat_interval_seconds=1,
@@ -36,7 +37,7 @@ class JobRuntimeClaimTests(unittest.TestCase):
     def tearDown(self) -> None:
         asyncio.run(self.manager_a.shutdown())
         asyncio.run(self.manager_b.shutdown())
-        cleanup_path(self.runtime_db_path)
+        reset_tables(self.db_url)
         cleanup_path(self.root_dir)
 
     def test_second_instance_cannot_claim_active_job(self) -> None:

@@ -217,6 +217,66 @@ class TenantLimitsResponse(BaseModel):
     requests_per_day: int
     max_jobs: int
 
+class AuthRegisterRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=8, max_length=256)
+    tenant_id: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    name: Optional[str] = Field(default=None, max_length=120)
+
+class AuthLoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=256)
+
+class AuthUserResponse(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    tenant_id: str
+    role: str
+    scopes: List[str]
+    created_at: str
+    last_login_at: Optional[str] = None
+
+class AuthSessionResponse(BaseModel):
+    token: str
+    user: AuthUserResponse
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    role: Optional[str] = Field(default=None, description="API key role: admin, operator, or reader")
+    scopes: Optional[List[str]] = Field(default=None, description="Optional scope override")
+    expires_at: Optional[str] = Field(default=None, description="Optional UTC expiry timestamp")
+
+class ApiKeySummary(BaseModel):
+    key_id: str
+    name: str
+    tenant_id: str
+    status: str
+    role: str
+    scopes: List[str] = Field(default_factory=list)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    last_used_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    revoked_at: Optional[str] = None
+    expired_at: Optional[str] = None
+    rotated_at: Optional[str] = None
+    rotated_from_key_id: Optional[str] = None
+    replaced_by_key_id: Optional[str] = None
+
+class ApiKeyListResponse(BaseModel):
+    tenant_id: str
+    count: int
+    items: List[ApiKeySummary]
+
+class ApiKeyCreateResponse(BaseModel):
+    key: ApiKeySummary
+    api_key: str = Field(..., description="Raw API key. Only returned once at creation time.")
+
+class ApiKeyDeleteResponse(BaseModel):
+    key_id: str
+    deleted: bool
+
 class UsageSummaryResponse(BaseModel):
     tenant_id: str
     requests_last_minute: int

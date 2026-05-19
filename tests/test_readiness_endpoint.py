@@ -13,25 +13,25 @@ from api import server
 from api.events import EventManager
 from api.job_manager import JobManager
 from api.schemas import ReadinessCheck
+from tests.postgres_utils import postgres_url, reset_tables
 from tests.tmp_utils import cleanup_path
 
 
 class ReadinessEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
         suffix = uuid.uuid4().hex
-        self.runtime_db_path = Path(f"tests/.tmp/readiness-runtime-{suffix}.db")
-        self.events_db_path = Path(f"tests/.tmp/readiness-events-{suffix}.db")
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
         self.root_dir = Path(f"tests/.tmp/readiness-root-{suffix}")
-        self.runtime_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.manager = JobManager(
             root_dir=str(self.root_dir),
-            runtime_db_path=str(self.runtime_db_path),
+            runtime_db_url=self.db_url,
             instance_id="api-instance",
             lease_seconds=30,
             heartbeat_interval_seconds=1,
         )
-        self.event_manager = EventManager(db_path=str(self.events_db_path))
+        self.event_manager = EventManager(db_url=self.db_url)
         self.original_job_manager = server.job_manager
         self.original_event_manager = server.event_manager
         server.job_manager = self.manager
@@ -41,8 +41,7 @@ class ReadinessEndpointTests(unittest.TestCase):
         server.job_manager = self.original_job_manager
         server.event_manager = self.original_event_manager
         asyncio.run(self.manager.shutdown())
-        cleanup_path(self.runtime_db_path)
-        cleanup_path(self.events_db_path)
+        reset_tables(self.db_url)
         cleanup_path(self.root_dir)
 
     def _run_readiness_check(self) -> ReadinessCheck | JSONResponse:

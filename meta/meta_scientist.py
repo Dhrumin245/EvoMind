@@ -429,7 +429,7 @@ class ExperimentDesigner:
 class MetaScientist:
     """Orchestrates the complete meta-scientific pipeline"""
 
-    def __init__(self, knowledge_base_path: str = "meta_scientist_kb.db"):
+    def __init__(self, knowledge_base_path: str = "meta_scientist_kb.json"):
         self.failure_analyzer = FailureAnalyzer()
         self.hypothesis_engine = HypothesisEngine()
         self.experiment_designer = ExperimentDesigner()

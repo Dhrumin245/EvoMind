@@ -5,19 +5,20 @@ from pathlib import Path
 
 from api.job_manager import JobManager
 from api.server import _model_dump
+from tests.postgres_utils import postgres_url, reset_tables
 from tests.tmp_utils import cleanup_path
 
 
 class JobCommandQueueTests(unittest.TestCase):
     def setUp(self) -> None:
         suffix = uuid.uuid4().hex
-        self.runtime_db_path = Path(f"tests/.tmp/job-commands-{suffix}.db")
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
         self.root_dir = Path(f"tests/.tmp/job-commands-root-{suffix}")
-        self.runtime_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.manager = JobManager(
             root_dir=str(self.root_dir),
-            runtime_db_path=str(self.runtime_db_path),
+            runtime_db_url=self.db_url,
             instance_id="worker-a",
             lease_seconds=30,
             heartbeat_interval_seconds=1,
@@ -25,7 +26,7 @@ class JobCommandQueueTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         asyncio.run(self.manager.shutdown())
-        cleanup_path(self.runtime_db_path)
+        reset_tables(self.db_url)
         cleanup_path(self.root_dir)
 
     def test_start_command_is_claimed_when_job_is_unowned(self) -> None:

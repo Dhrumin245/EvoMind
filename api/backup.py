@@ -12,14 +12,10 @@ import uuid
 
 from api.storage import (
     DatabaseTarget,
-    api_auth_db_path,
-    api_events_db_path,
-    api_jobs_db_path,
     backup_dir,
     connect_database,
     copytree_overwrite,
     resolve_db_target,
-    snapshot_sqlite_database,
     tenant_root_dir,
 )
 
@@ -63,21 +59,21 @@ def _resolve_control_plane_targets() -> Dict[str, DatabaseTarget]:
             explicit_path=None,
             explicit_url=None,
             env_url_names=("EVOMIND_API_AUTH_DB_URL",),
-            default_path=api_auth_db_path(),
+            default_path=None,
         ),
         "events": resolve_db_target(
             context="API events",
             explicit_path=None,
             explicit_url=None,
             env_url_names=("EVOMIND_API_EVENTS_DB_URL",),
-            default_path=api_events_db_path(),
+            default_path=None,
         ),
         "jobs": resolve_db_target(
             context="API jobs",
             explicit_path=None,
             explicit_url=None,
             env_url_names=("EVOMIND_API_JOBS_DB_URL",),
-            default_path=api_jobs_db_path(),
+            default_path=None,
         ),
     }
 
@@ -128,18 +124,6 @@ def _postgres_column_names(connection: Any, table_name: str) -> List[str]:
         (table_name,),
     ).fetchall()
     return [str(row["column_name"]) for row in rows]
-
-
-def _stage_sqlite_snapshot(source_path: Path, staged_root: Path, archive_path: str) -> Optional[Dict[str, Any]]:
-    if not source_path.exists():
-        return None
-    staged_path = staged_root / archive_path
-    snapshot_sqlite_database(source_path, staged_path)
-    return {
-        "archive_path": archive_path,
-        "size": staged_path.stat().st_size,
-        "sha256": _sha256(staged_path),
-    }
 
 
 def _stage_postgres_snapshot(target: DatabaseTarget, staged_root: Path, archive_path: str) -> Dict[str, Any]:
@@ -233,21 +217,10 @@ def create_backup(output_path: Optional[str] = None) -> Path:
         entries: List[Dict[str, Any]] = []
 
         resolved_targets = _resolve_control_plane_targets()
-        sqlite_sources = {
-            "auth": api_auth_db_path(),
-            "events": api_events_db_path(),
-            "jobs": api_jobs_db_path(),
-        }
         for name, target in resolved_targets.items():
             target_manifest = control_plane_targets[name]
             entry: Optional[Dict[str, Any]] = None
-            if target.backend == "sqlite":
-                entry = _stage_sqlite_snapshot(
-                    source_path=sqlite_sources[name],
-                    staged_root=staging_root,
-                    archive_path=f"control_plane/{name}.sqlite3",
-                )
-            elif target.backend == "postgres":
+            if target.backend == "postgres":
                 entry = _stage_postgres_snapshot(
                     target=target,
                     staged_root=staging_root,
@@ -403,26 +376,6 @@ def restore_backup(archive_path: str, force: bool = False) -> None:
                     f"Cannot restore {snapshot_backend or 'unknown'} backup for {name} while current storage backend is {current_backend or 'unknown'}"
                 )
 
-            if current_backend == "sqlite":
-                destination = {
-                    "auth": api_auth_db_path(),
-                    "events": api_events_db_path(),
-                    "jobs": api_jobs_db_path(),
-                }[name]
-                if destination.exists() and not force:
-                    raise ValueError(f"Refusing to overwrite existing database without force=True: {destination}")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if force:
-                    for sidecar in (
-                        destination,
-                        destination.with_name(f"{destination.name}-wal"),
-                        destination.with_name(f"{destination.name}-shm"),
-                    ):
-                        if sidecar.exists():
-                            sidecar.unlink()
-                shutil.copy2(extracted_root / snapshot_name, destination)
-                continue
-
             if current_backend == "postgres":
                 _restore_postgres_snapshot(
                     target=resolved_targets[name],
@@ -457,7 +410,7 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing SQLite databases and tenant artifacts",
+        help="Overwrite existing PostgreSQL data and tenant artifacts",
     )
     return parser
 

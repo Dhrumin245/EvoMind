@@ -21,6 +21,8 @@ tests/.tmp/
 .env
 .env.*
 !.env.production.example
+!frontend/.env.example
+!frontend/.env.production.example
 secrets/
 
 artifacts/
@@ -28,6 +30,10 @@ backups/
 data/
 output_logs/
 models/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+frontend/*.log
 
 coevolution_state.json
 seed_registry.json

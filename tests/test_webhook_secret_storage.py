@@ -11,16 +11,16 @@ from api.events import (
     WEBHOOK_SECRET_ENCRYPTION_ENV_VAR,
     WEBHOOK_SECRET_ENCRYPTION_PREFIX,
 )
-from tests.tmp_utils import cleanup_path
+from tests.postgres_utils import postgres_url, reset_tables
 
 
 class WebhookSecretStorageTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_path = Path(f"tests/.tmp/webhook-secret-storage-{uuid.uuid4().hex}.db")
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_url = postgres_url()
+        reset_tables(self.db_url)
 
     def tearDown(self) -> None:
-        cleanup_path(self.db_path)
+        reset_tables(self.db_url)
 
     @staticmethod
     def _encryption_env(key: bytes) -> dict[str, str]:
@@ -29,7 +29,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
     def test_create_webhook_encrypts_secret_at_rest(self) -> None:
         key = Fernet.generate_key()
         with patch.dict(os.environ, self._encryption_env(key), clear=False):
-            manager = EventManager(db_path=str(self.db_path))
+            manager = EventManager(db_url=self.db_url)
             created = manager.create_webhook(
                 tenant_id="tenant-1",
                 url="https://93.184.216.34/incoming",
@@ -56,7 +56,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
     def test_manager_migrates_plaintext_webhook_secret_on_startup(self) -> None:
         key = Fernet.generate_key()
         with patch.dict(os.environ, self._encryption_env(key), clear=False):
-            initial_manager = EventManager(db_path=str(self.db_path))
+            initial_manager = EventManager(db_url=self.db_url)
             with initial_manager._connect() as conn:
                 conn.execute(
                     """
@@ -85,7 +85,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
                 )
                 conn.commit()
 
-            migrated_manager = EventManager(db_path=str(self.db_path))
+            migrated_manager = EventManager(db_url=self.db_url)
             loaded = migrated_manager._get_webhook("webhook-legacy")
             with migrated_manager._connect() as conn:
                 row = conn.execute(
@@ -102,7 +102,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
 
     def test_creating_secret_without_encryption_key_is_rejected(self) -> None:
         with patch.dict(os.environ, {WEBHOOK_SECRET_ENCRYPTION_ENV_VAR: ""}, clear=False):
-            manager = EventManager(db_path=str(self.db_path))
+            manager = EventManager(db_url=self.db_url)
             with self.assertRaisesRegex(RuntimeError, "Webhook secret encryption is not configured"):
                 manager.create_webhook(
                     tenant_id="tenant-1",
@@ -113,7 +113,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
     def test_startup_fails_if_stored_secrets_exist_without_key(self) -> None:
         key = Fernet.generate_key()
         with patch.dict(os.environ, self._encryption_env(key), clear=False):
-            manager = EventManager(db_path=str(self.db_path))
+            manager = EventManager(db_url=self.db_url)
             manager.create_webhook(
                 tenant_id="tenant-1",
                 url="https://93.184.216.34/incoming",
@@ -122,11 +122,12 @@ class WebhookSecretStorageTests(unittest.TestCase):
 
         with patch.dict(os.environ, {WEBHOOK_SECRET_ENCRYPTION_ENV_VAR: ""}, clear=False):
             with self.assertRaisesRegex(RuntimeError, "Stored webhook secrets require encryption at rest"):
-                EventManager(db_path=str(self.db_path))
+                EventManager(db_url=self.db_url)
 
     def test_file_based_encryption_key_is_supported(self) -> None:
         key = Fernet.generate_key()
-        secret_file = self.db_path.with_suffix(".key")
+        secret_file = Path(f"tests/.tmp/webhook-secret-key-{uuid.uuid4().hex}.key")
+        secret_file.parent.mkdir(parents=True, exist_ok=True)
         secret_file.write_text(key.decode("utf-8") + "\n", encoding="utf-8")
 
         with patch.dict(
@@ -137,7 +138,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
             },
             clear=False,
         ):
-            manager = EventManager(db_path=str(self.db_path))
+            manager = EventManager(db_url=self.db_url)
             created = manager.create_webhook(
                 tenant_id="tenant-1",
                 url="https://93.184.216.34/incoming",
@@ -149,6 +150,7 @@ class WebhookSecretStorageTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         assert loaded is not None
         self.assertEqual(loaded.secret, "from-file-secret")
+        secret_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

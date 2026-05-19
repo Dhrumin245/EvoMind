@@ -9,7 +9,7 @@ from api.events import EventManager
 from api.job_manager import JobCommandRecord, JobManager
 from api.logging_utils import configure_logging, push_log_context, reset_log_context
 from api.trainer import EvoTrainer
-from api.storage import api_events_db_path, api_jobs_db_path, tenant_root_dir
+from api.storage import tenant_root_dir
 from api.schemas import TrainStatus
 
 
@@ -26,9 +26,7 @@ class TrainingWorker:
     def __init__(
         self,
         root_dir: Optional[str] = None,
-        runtime_db_path: Optional[str] = None,
         runtime_db_url: Optional[str] = None,
-        events_db_path: Optional[str] = None,
         events_db_url: Optional[str] = None,
         poll_interval_seconds: float = 2.0,
         status_interval_seconds: float = 2.0,
@@ -36,14 +34,11 @@ class TrainingWorker:
         worker_heartbeat_ttl_seconds: int = 30,
     ):
         resolved_root_dir = str(Path(root_dir) if root_dir is not None else tenant_root_dir())
-        resolved_runtime_db = str(Path(runtime_db_path)) if runtime_db_path is not None else None
-        resolved_events_db = str(Path(events_db_path)) if events_db_path is not None else None
         self.job_manager = JobManager(
             root_dir=resolved_root_dir,
-            runtime_db_path=resolved_runtime_db,
             runtime_db_url=runtime_db_url,
         )
-        self.event_manager = EventManager(db_path=resolved_events_db, db_url=events_db_url)
+        self.event_manager = EventManager(db_url=events_db_url)
         self.poll_interval_seconds = max(0.2, float(poll_interval_seconds))
         self.status_interval_seconds = max(0.2, float(status_interval_seconds))
         self.worker_heartbeat_interval_seconds = max(1.0, float(worker_heartbeat_interval_seconds))
@@ -60,9 +55,7 @@ class TrainingWorker:
         self.worker_metadata = {
             "pid": os.getpid(),
             "root_dir": resolved_root_dir,
-            "runtime_db_path": resolved_runtime_db or str(api_jobs_db_path()),
             "runtime_db_url": runtime_db_url,
-            "events_db_path": resolved_events_db or str(api_events_db_path()),
             "events_db_url": events_db_url,
         }
         self._active_trainers: Dict[Tuple[str, str], EvoTrainer] = {}
@@ -403,9 +396,7 @@ class TrainingWorker:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the EvoMind training worker")
     parser.add_argument("--root-dir", default=str(tenant_root_dir()), help="Tenant job root directory")
-    parser.add_argument("--runtime-db", default=None, help="Optional runtime coordination SQLite path")
     parser.add_argument("--runtime-db-url", default=None, help="Optional PostgreSQL runtime coordination DB URL")
-    parser.add_argument("--events-db", default=None, help="Optional event SQLite path")
     parser.add_argument("--events-db-url", default=None, help="Optional PostgreSQL event DB URL")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Command poll interval in seconds")
     parser.add_argument("--status-interval", type=float, default=2.0, help="Status publish interval in seconds")
@@ -431,9 +422,7 @@ async def _async_main() -> int:
     configure_logging(service_name="evomind", component="training_worker")
     worker = TrainingWorker(
         root_dir=args.root_dir,
-        runtime_db_path=args.runtime_db,
         runtime_db_url=args.runtime_db_url,
-        events_db_path=args.events_db,
         events_db_url=args.events_db_url,
         poll_interval_seconds=args.poll_interval,
         status_interval_seconds=args.status_interval,

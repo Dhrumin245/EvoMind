@@ -20,17 +20,15 @@ concurrency:
 
 jobs:
   backup:
-    runs-on: [self-hosted, Windows, production]
+    runs-on: [self-hosted, Linux, production]
     environment: production
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Run backup job on production host
-        shell: pwsh
         env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           KEEP_LAST: ${{ github.event.inputs.keep_last || '14' }}
           MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days || '30' }}
         run: |
-          .\deploy\windows\backup.ps1 -DeployPath $env:DEPLOY_PATH -KeepLast ([int]$env:KEEP_LAST) -MaxAgeDays ([int]$env:MAX_AGE_DAYS)
+          python scripts/backup_job.py --keep-last "$KEEP_LAST" --max-age-days "$MAX_AGE_DAYS"
