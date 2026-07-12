@@ -14,6 +14,7 @@ const OperationsDashboard = lazy(() => import('./components/pages/OperationsDash
 const TrainingControl = lazy(() => import('./components/pages/TrainingControl').then((module) => ({ default: module.TrainingControl })));
 const WebhookManager = lazy(() => import('./components/pages/WebhookManager').then((module) => ({ default: module.WebhookManager })));
 const Website = lazy(() => import('./components/pages/Website').then((module) => ({ default: module.Website })));
+const CampaignDashboard = lazy(() => import('./CampaignDashboard'));
 
 function PageLoader() {
   return (
@@ -29,6 +30,7 @@ function withSuspense(element: ReactNode) {
 
 const router = createBrowserRouter([
   { path: '/', element: withSuspense(<Website />), errorElement: <RouteErrorBoundary /> },
+  { path: '/campaign', element: withSuspense(<CampaignDashboard />), errorElement: <RouteErrorBoundary /> },
   { path: '/login', element: withSuspense(<AuthPage />), errorElement: <RouteErrorBoundary /> },
   {
     path: '/console',
